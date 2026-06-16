@@ -156,7 +156,7 @@ def get_matrix(cam, name):
             for c in range(4):
                 m[r, c] = float(obj[f"e{r}{c}"])
 
-        # 기존 코드의 convention 유지
+        # 기존 코드의 matrix convention 유지
         return m.T
 
     m = np.array(obj, dtype=np.float32)
@@ -168,7 +168,129 @@ def get_matrix(cam, name):
 
 
 # ============================================================
-# Intrinsic / RT
+# Matrix utility
+# ============================================================
+
+def invert_rigid_4x4(T):
+    """
+    Rigid transform inverse.
+
+    T:
+        X_b = R * X_a + t
+
+    return:
+        X_a = R^T * X_b - R^T * t
+    """
+    R = T[:3, :3]
+    t = T[:3, 3]
+
+    Ti = np.eye(4, dtype=np.float32)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+
+    return Ti
+
+
+def extrinsic_from_w2c_matrix(W2C):
+    """
+    W2C matrix -> Rodrigues rvec/tvec.
+
+    X_cam = R * X_world + t
+    """
+    R = W2C[:3, :3].astype(np.float32)
+    t = W2C[:3, 3].astype(np.float32)
+
+    rvec, _ = cv2.Rodrigues(R)
+
+    return {
+        "rvec": rvec.reshape(3).astype(float).tolist(),
+        "tvec": t.reshape(3).astype(float).tolist(),
+    }
+
+
+def build_rebased_w2c_lookup(cams, max_poc):
+    """
+    POC 0 camera coordinate를 새로운 world coordinate로 둔다.
+
+    원래:
+        X_cam_i = W2C_i * X_world
+
+    새 좌표계:
+        X_world_rebased = X_cam_0
+
+    따라서:
+        X_cam_i = W2C_i * C2W_0 * X_world_rebased
+
+    즉:
+        W2C_rebased_i = W2C_i @ C2W_0
+
+    그러면:
+        W2C_rebased_0 = I
+    """
+    C2W_0 = get_matrix(cams[0], "CameraToWorldMatrix")
+
+    rebased_w2c = {}
+    rebased_ext = {}
+
+    for poc in range(max_poc):
+        if poc not in cams:
+            raise RuntimeError(f"POC {poc} not found in camera parameters")
+
+        W2C = get_matrix(cams[poc], "WorldToCameraMatrix")
+        W2C_rebased = W2C @ C2W_0
+
+        # POC 0은 수치 오차 없이 정확히 identity로 강제
+        if poc == 0:
+            W2C_rebased = np.eye(4, dtype=np.float32)
+
+        W2C_rebased = W2C_rebased.astype(np.float32)
+
+        rebased_w2c[poc] = W2C_rebased
+        rebased_ext[poc] = extrinsic_from_w2c_matrix(W2C_rebased)
+
+        # POC 0은 수치 오차 없이 정확히 zero rvec/tvec로 강제
+        if poc == 0:
+            rebased_ext[poc] = {
+                "rvec": [0.0, 0.0, 0.0],
+                "tvec": [0.0, 0.0, 0.0],
+            }
+
+    return rebased_w2c, rebased_ext
+
+
+def derive_rt_cur_to_prev_from_w2c(W2C_cur, W2C_prev):
+    """
+    Rebased absolute W2C matrix 두 개로 cur -> prev relative transform 생성.
+
+    W2C_cur:
+        X_cur = W2C_cur * X_world_rebased
+
+    W2C_prev:
+        X_prev = W2C_prev * X_world_rebased
+
+    필요한 변환:
+        X_prev = T_cur_to_prev * X_cur
+
+    따라서:
+        T_cur_to_prev = W2C_prev @ C2W_cur
+    """
+    C2W_cur = invert_rigid_4x4(W2C_cur)
+
+    T = W2C_prev @ C2W_cur
+
+    R = T[:3, :3].astype(np.float32)
+    t = T[:3, 3].astype(np.float32)
+
+    rvec, _ = cv2.Rodrigues(R)
+
+    return {
+        "rvec": rvec.reshape(3).astype(float).tolist(),
+        "tvec": t.reshape(3).astype(float).tolist(),
+    }
+
+
+# ============================================================
+# Intrinsic
 # ============================================================
 
 def make_grid(w, h):
@@ -225,48 +347,6 @@ def derive_intrinsic_4(cam, w, h):
         "cx": float(cx),
         "cy": float(cy),
         "z_sign": z_sign,
-    }
-
-
-def derive_rt_cur_to_prev(cam_cur, cam_prev):
-    """
-    Relative extrinsic for warping.
-
-    X_prev = R * X_cur + t
-    """
-    C2W_cur = get_matrix(cam_cur, "CameraToWorldMatrix")
-    W2C_prev = get_matrix(cam_prev, "WorldToCameraMatrix")
-
-    T = W2C_prev @ C2W_cur
-
-    R = T[:3, :3].astype(np.float32)
-    t = T[:3, 3].astype(np.float32)
-
-    rvec, _ = cv2.Rodrigues(R)
-
-    return {
-        "rvec": rvec.reshape(3).astype(float).tolist(),
-        "tvec": t.reshape(3).astype(float).tolist(),
-    }
-
-
-def derive_absolute_extrinsic(cam):
-    """
-    Absolute extrinsic for JSONL saving.
-
-    WorldToCamera 기준:
-        X_cam = R * X_world + t
-    """
-    W2C = get_matrix(cam, "WorldToCameraMatrix")
-
-    R = W2C[:3, :3].astype(np.float32)
-    t = W2C[:3, 3].astype(np.float32)
-
-    rvec, _ = cv2.Rodrigues(R)
-
-    return {
-        "rvec": rvec.reshape(3).astype(float).tolist(),
-        "tvec": t.reshape(3).astype(float).tolist(),
     }
 
 
@@ -417,19 +497,37 @@ def main():
 
     max_poc = min(seq_count, depth_count, max(camera_pocs) + 1)
 
-    # intrinsic은 첫 frame 기준으로 1번만 사용
+    if 0 not in cams:
+        raise RuntimeError("POC 0 camera parameter not found")
+
+    # intrinsic은 POC 0 기준으로 1번만 사용
     intr = derive_intrinsic_4(cams[0], w, h)
 
     depth_scale = get_near(cams[0])
+
+    # ------------------------------------------------------------
+    # Rebase all absolute extrinsics to POC 0 camera coordinate
+    # ------------------------------------------------------------
+    rebased_w2c, rebased_ext = build_rebased_w2c_lookup(
+        cams=cams,
+        max_poc=max_poc,
+    )
 
     with open(out_param, "w", encoding="utf-8") as fp:
         fp.write(json.dumps({
             "type": "header",
             "depth_scale": depth_scale,
             "intrinsic": intr,
-            "extrinsic_type": "absolute_world_to_camera",
+
+            # 핵심 metadata
+            "extrinsic_type": "absolute_world_to_camera_rebased_to_poc0",
             "extrinsic_rotation": "rodrigues_rvec",
             "extrinsic_translation": "tvec",
+            "anchor_poc": 0,
+            "anchor_pose": "identity",
+            "rebase_rule": "W2C_rebased[poc] = W2C[poc] @ C2W[0]",
+            "poc0_rvec": [0.0, 0.0, 0.0],
+            "poc0_tvec": [0.0, 0.0, 0.0],
         }) + "\n")
 
         for poc in range(max_poc):
@@ -441,8 +539,8 @@ def main():
                 bit_depth,
             )
 
-            # JSONL 저장용 absolute extrinsic
-            abs_ext = derive_absolute_extrinsic(cams[poc])
+            # JSONL 저장용: POC0 기준 rebased absolute extrinsic
+            abs_ext = rebased_ext[poc]
 
             # 첫 frame은 그대로 copy
             if poc == 0:
@@ -450,11 +548,11 @@ def main():
 
                 fp.write(json.dumps({
                     "poc": poc,
-                    "rvec": abs_ext["rvec"],
-                    "tvec": abs_ext["tvec"],
+                    "rvec": [0.0, 0.0, 0.0],
+                    "tvec": [0.0, 0.0, 0.0],
                 }) + "\n")
 
-                print(f"[{poc:04d}/{max_poc - 1:04d}] copy original")
+                print(f"[{poc:04d}/{max_poc - 1:04d}] copy original, rebased Rt=0")
                 continue
 
             depth_y, _, _ = read_yuv420(
@@ -468,7 +566,12 @@ def main():
             depth_linear = depth_y.astype(np.float32) * get_near(cams[poc])
 
             # warp 계산용 상대변환
-            rt_rel = derive_rt_cur_to_prev(cams[poc], cams[poc - 1])
+            # rebased absolute pose끼리 cur -> prev를 계산한다.
+            # 수학적으로 원래 world 기준에서 계산한 상대변환과 동일하다.
+            rt_rel = derive_rt_cur_to_prev_from_w2c(
+                W2C_cur=rebased_w2c[poc],
+                W2C_prev=rebased_w2c[poc - 1],
+            )
 
             map_x, map_y = backward_map_from_depth_and_params(
                 depth_linear=depth_linear,
@@ -506,7 +609,8 @@ def main():
                 )
             )
 
-            # JSONL에는 absolute extrinsic 저장
+            # JSONL에는 frame 간 차이값이 아니라,
+            # POC0 기준 rebased absolute extrinsic 저장
             fp.write(json.dumps({
                 "poc": poc,
                 "rvec": abs_ext["rvec"],
