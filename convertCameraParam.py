@@ -22,6 +22,7 @@ def count_frames(path, w, h, bit_depth):
 
 def read_yuv420(path, idx, w, h, bit_depth):
     dtype = np.uint8 if bit_depth <= 8 else np.uint16
+
     y_size = w * h
     uv_size = (w // 2) * (h // 2)
     fs = frame_size_yuv420(w, h, bit_depth)
@@ -35,7 +36,11 @@ def read_yuv420(path, idx, w, h, bit_depth):
     if y.size != y_size or u.size != uv_size or v.size != uv_size:
         raise RuntimeError(f"Cannot read frame {idx}: {path}")
 
-    return y.reshape(h, w), u.reshape(h // 2, w // 2), v.reshape(h // 2, w // 2)
+    return (
+        y.reshape(h, w),
+        u.reshape(h // 2, w // 2),
+        v.reshape(h // 2, w // 2),
+    )
 
 
 def write_yuv420(path, y, u, v):
@@ -51,6 +56,7 @@ def write_yuv420(path, y, u, v):
 
 def load_camera_file(path):
     text = Path(path).read_text(encoding="utf-8")
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -76,22 +82,29 @@ def has_mats(x):
 def build_camera_lookup(obj):
     if isinstance(obj, list):
         entries = obj
+
     elif isinstance(obj, dict) and "frames" in obj and isinstance(obj["frames"], list):
         entries = obj["frames"]
+
     elif isinstance(obj, dict) and has_mats(obj):
         entries = [obj]
-    else:
+
+    elif isinstance(obj, dict):
         items = []
         for k, v in obj.items():
             if isinstance(v, dict) and has_mats(v):
                 items.append((int(k), v))
         entries = [v for _, v in sorted(items)]
 
+    else:
+        raise RuntimeError("Unsupported camera parameter format")
+
     lookup = {}
     pocs = []
 
     for i, e in enumerate(entries):
         poc = i
+
         for k in ["frames", "frame", "frameIdx", "frame_idx", "poc", "POC"]:
             if k in e:
                 poc = int(e[k])
@@ -108,6 +121,7 @@ def get_alias(cam, names):
     for n in names:
         if n in cam:
             return cam[n]
+
     raise KeyError(names)
 
 
@@ -117,8 +131,14 @@ def get_near(cam):
 
 def get_matrix(cam, name):
     aliases = {
-        "InvProjectionMatrix": ["InvProjectionMatrix", "invProjectionMatrix"],
-        "WorldToCameraMatrix": ["WorldToCameraMatrix", "worldToCameraMatrix"],
+        "InvProjectionMatrix": [
+            "InvProjectionMatrix",
+            "invProjectionMatrix",
+        ],
+        "WorldToCameraMatrix": [
+            "WorldToCameraMatrix",
+            "worldToCameraMatrix",
+        ],
         "CameraToWorldMatrix": [
             "CameraToWorldMatrix",
             "cameraToWorldMatrix",
@@ -131,12 +151,16 @@ def get_matrix(cam, name):
 
     if isinstance(obj, dict):
         m = np.zeros((4, 4), dtype=np.float32)
+
         for r in range(4):
             for c in range(4):
                 m[r, c] = float(obj[f"e{r}{c}"])
+
+        # 기존 코드의 convention 유지
         return m.T
 
     m = np.array(obj, dtype=np.float32)
+
     if m.shape == (16,):
         m = m.reshape(4, 4)
 
@@ -174,6 +198,7 @@ def derive_intrinsic_4(cam, w, h):
     q = q[:, :3] / np.maximum(q[:, 3:4], 1e-8)
 
     zabs = np.maximum(np.abs(q[:, 2]), 1e-8)
+
     rx = q[:, 0] / zabs
     ry = q[:, 1] / zabs
 
@@ -190,6 +215,7 @@ def derive_intrinsic_4(cam, w, h):
     )[0]
 
     z_sign = float(np.sign(np.median(q[:, 2])))
+
     if z_sign == 0:
         z_sign = -1.0
 
@@ -204,6 +230,8 @@ def derive_intrinsic_4(cam, w, h):
 
 def derive_rt_cur_to_prev(cam_cur, cam_prev):
     """
+    Relative extrinsic for warping.
+
     X_prev = R * X_cur + t
     """
     C2W_cur = get_matrix(cam_cur, "CameraToWorldMatrix")
@@ -213,6 +241,26 @@ def derive_rt_cur_to_prev(cam_cur, cam_prev):
 
     R = T[:3, :3].astype(np.float32)
     t = T[:3, 3].astype(np.float32)
+
+    rvec, _ = cv2.Rodrigues(R)
+
+    return {
+        "rvec": rvec.reshape(3).astype(float).tolist(),
+        "tvec": t.reshape(3).astype(float).tolist(),
+    }
+
+
+def derive_absolute_extrinsic(cam):
+    """
+    Absolute extrinsic for JSONL saving.
+
+    WorldToCamera 기준:
+        X_cam = R * X_world + t
+    """
+    W2C = get_matrix(cam, "WorldToCameraMatrix")
+
+    R = W2C[:3, :3].astype(np.float32)
+    t = W2C[:3, 3].astype(np.float32)
 
     rvec, _ = cv2.Rodrigues(R)
 
@@ -290,18 +338,29 @@ def remap_plane(src, map_x, map_y, bit_depth, border_value):
 
     if bit_depth <= 8:
         return dst.astype(np.uint8)
+
     return dst.astype(np.uint16)
 
 
 def backward_warp_yuv420(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
     h, w = prev_y.shape
+
     uv_w = w // 2
     uv_h = h // 2
 
     y = remap_plane(prev_y, map_x, map_y, bit_depth, 0)
 
-    map_x_uv = cv2.resize(map_x, (uv_w, uv_h), interpolation=cv2.INTER_LINEAR) * 0.5
-    map_y_uv = cv2.resize(map_y, (uv_w, uv_h), interpolation=cv2.INTER_LINEAR) * 0.5
+    map_x_uv = cv2.resize(
+        map_x,
+        (uv_w, uv_h),
+        interpolation=cv2.INTER_LINEAR,
+    ) * 0.5
+
+    map_y_uv = cv2.resize(
+        map_y,
+        (uv_w, uv_h),
+        interpolation=cv2.INTER_LINEAR,
+    ) * 0.5
 
     neutral = 128 if bit_depth <= 8 else 512
 
@@ -358,47 +417,74 @@ def main():
 
     max_poc = min(seq_count, depth_count, max(camera_pocs) + 1)
 
-    # intrinsic은 일단 첫 frame 기준으로 1번만 사용
+    # intrinsic은 첫 frame 기준으로 1번만 사용
     intr = derive_intrinsic_4(cams[0], w, h)
 
-depth_scale = get_near(cams[0])
+    depth_scale = get_near(cams[0])
 
-with open(out_param, "w", encoding="utf-8") as fp:
-    fp.write(json.dumps({
-        "type": "header",
-        "depth_scale": depth_scale,
-        "intrinsic": intr,
-    }) + "\n")
+    with open(out_param, "w", encoding="utf-8") as fp:
+        fp.write(json.dumps({
+            "type": "header",
+            "depth_scale": depth_scale,
+            "intrinsic": intr,
+            "extrinsic_type": "absolute_world_to_camera",
+            "extrinsic_rotation": "rodrigues_rvec",
+            "extrinsic_translation": "tvec",
+        }) + "\n")
 
         for poc in range(max_poc):
-            cur_y, cur_u, cur_v = read_yuv420(seq_yuv, poc, w, h, bit_depth)
+            cur_y, cur_u, cur_v = read_yuv420(
+                seq_yuv,
+                poc,
+                w,
+                h,
+                bit_depth,
+            )
+
+            # JSONL 저장용 absolute extrinsic
+            abs_ext = derive_absolute_extrinsic(cams[poc])
 
             # 첫 frame은 그대로 copy
             if poc == 0:
                 write_yuv420(out_yuv, cur_y, cur_u, cur_v)
 
                 fp.write(json.dumps({
-                    "poc": 0,
-                    "rvec": [0.0, 0.0, 0.0],
-                    "tvec": [0.0, 0.0, 0.0],
+                    "poc": poc,
+                    "rvec": abs_ext["rvec"],
+                    "tvec": abs_ext["tvec"],
                 }) + "\n")
+
+                print(f"[{poc:04d}/{max_poc - 1:04d}] copy original")
                 continue
 
-            depth_y, _, _ = read_yuv420(depth_yuv, poc, w, h, 10)
+            depth_y, _, _ = read_yuv420(
+                depth_yuv,
+                poc,
+                w,
+                h,
+                10,
+            )
+
             depth_linear = depth_y.astype(np.float32) * get_near(cams[poc])
 
-            rt = derive_rt_cur_to_prev(cams[poc], cams[poc - 1])
+            # warp 계산용 상대변환
+            rt_rel = derive_rt_cur_to_prev(cams[poc], cams[poc - 1])
 
-            # 여기서 matrix가 아니라 변환된 intrinsic + rvec/tvec만 사용해서 inverse projection
             map_x, map_y = backward_map_from_depth_and_params(
                 depth_linear=depth_linear,
                 intr=intr,
-                rt=rt,
+                rt=rt_rel,
                 w=w,
                 h=h,
             )
 
-            prev_y, prev_u, prev_v = read_yuv420(seq_yuv, poc - 1, w, h, bit_depth)
+            prev_y, prev_u, prev_v = read_yuv420(
+                seq_yuv,
+                poc - 1,
+                w,
+                h,
+                bit_depth,
+            )
 
             wy, wu, wv = backward_warp_yuv420(
                 prev_y,
@@ -411,12 +497,20 @@ with open(out_param, "w", encoding="utf-8") as fp:
 
             write_yuv420(out_yuv, wy, wu, wv)
 
-            mae_y = float(np.mean(np.abs(wy.astype(np.float32) - cur_y.astype(np.float32))))
+            mae_y = float(
+                np.mean(
+                    np.abs(
+                        wy.astype(np.float32)
+                        - cur_y.astype(np.float32)
+                    )
+                )
+            )
 
+            # JSONL에는 absolute extrinsic 저장
             fp.write(json.dumps({
                 "poc": poc,
-                "rvec": rt["rvec"],
-                "tvec": rt["tvec"],
+                "rvec": abs_ext["rvec"],
+                "tvec": abs_ext["tvec"],
                 "mae_y": mae_y,
             }) + "\n")
 
