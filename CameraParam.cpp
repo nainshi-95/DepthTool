@@ -1088,3 +1088,115 @@ bool DepthCamParamDecoder::set(int poc, const DepthCamQResidual& q)
 }
 
 } // namespace depthcam
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+void DepthCamParamBase::storeQResidual(int poc, const DepthCamQResidual& q)
+{
+  m_qResidualStore[poc] = q;
+}
+
+void DepthCamParamBase::clearQResidualStore()
+{
+  m_qResidualStore.clear();
+}
+
+bool DepthCamParamBase::hasQResidual(int poc) const
+{
+  return m_qResidualStore.find(poc) != m_qResidualStore.end();
+}
+
+bool DepthCamParamBase::getQResidual(int poc, DepthCamQResidual& out) const
+{
+  auto it = m_qResidualStore.find(poc);
+  if (it == m_qResidualStore.end())
+  {
+    return false;
+  }
+
+  out = it->second;
+  return true;
+}
+
+const DepthCamQResidual& DepthCamParamBase::getQResidualRef(int poc) const
+{
+  auto it = m_qResidualStore.find(poc);
+  if (it == m_qResidualStore.end())
+  {
+    throw std::runtime_error("DepthCam q residual not found");
+  }
+
+  return it->second;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bool DepthCamParamDecoder::set(int poc, const DepthCamQResidual& q)
+{
+  // 1. q residual 먼저 저장
+  storeQResidual(poc, q);
+
+  // 2. predictor 생성
+  DepthCamParam6 pred = predictFromHistory();
+
+  // 3. q inverse scale
+  DepthCamParam6 decResidual;
+  for (int i = 0; i < 3; ++i)
+  {
+    decResidual.v[i] = q.q[i] * m_cfg.rStep;
+  }
+  for (int i = 3; i < 6; ++i)
+  {
+    decResidual.v[i] = q.q[i] * m_cfg.tStepNorm;
+  }
+
+  // 4. decoded param 생성
+  DepthCamParam6 dec;
+  for (int i = 0; i < 6; ++i)
+  {
+    dec.v[i] = pred.v[i] + decResidual.v[i];
+  }
+
+  // 5. history/store 등록
+  storeDecodedParam(poc, dec);
+
+  return true;
+}
+
+
+
+
+
+
+
+
+
+
+
