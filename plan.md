@@ -741,3 +741,32 @@ Final report must include:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Do not treat PicHeader bundle as the long-term parameter storage.
+After parsing a bundle, immediately copy all parsed extrinsic params into DepthCamParam manager by display POC.
+All later parameter access must go through DepthCamParam::getExtrinsicParam(poc), not through PicHeader.
+The manager may provide any stored POC parameter, including current POC and reference POC, as long as the parameter has already been loaded/parsed and has not been pruned.
+
