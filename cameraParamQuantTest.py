@@ -83,10 +83,13 @@ def load_param_jsonl(path):
 
 def quant_u(value, lo, hi, bits):
     qmax = (1 << bits) - 1
+
     q = np.round((value - lo) / (hi - lo) * qmax)
     q = np.clip(q, 0, qmax).astype(np.int32)
+
     dec = q.astype(np.float32) / qmax * (hi - lo) + lo
     clipped = (value < lo) | (value > hi)
+
     return q, dec, clipped
 
 
@@ -97,13 +100,14 @@ def signed_q_abs_max(bits):
     """
     if bits < 2:
         raise ValueError("ext-bits must be >= 2")
+
     return (1 << (bits - 1)) - 1
 
 
 def quant_s(value, step, bits):
     q_abs_max = signed_q_abs_max(bits)
     qmin = -q_abs_max
-    qmax =  q_abs_max
+    qmax = q_abs_max
 
     q = np.round(value / step)
     clipped = (q < qmin) | (q > qmax)
@@ -150,16 +154,91 @@ def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
     return intr_q, intr_dec, clipped
 
 
+# ============================================================
+# Rebased absolute extrinsic param6
+# ============================================================
+
 def param6_from_frame(frame, depth_scale):
+    """
+    입력 JSONL의 rvec/tvec는 POC0 기준 rebased absolute W2C라고 가정.
+
+    W2C_rebased[poc] = W2C[poc] @ C2W[0]
+
+    param6 order:
+        rx, ry, rz,
+        tx / depth_scale,
+        ty / depth_scale,
+        tz / depth_scale
+    """
     r = np.array(frame["rvec"], dtype=np.float32)
     t = np.array(frame["tvec"], dtype=np.float32) / depth_scale
-    return np.concatenate([r, t], axis=0)
+
+    return np.concatenate([r, t], axis=0).astype(np.float32)
 
 
-def rt_from_param6(p, depth_scale):
+def abs_w2c_matrix_from_param6(p_abs, depth_scale):
+    """
+    Rebased absolute param6 -> W2C 4x4 matrix.
+
+    X_cam = R * X_world_rebased + t
+    """
+    rvec = np.array(p_abs[:3], dtype=np.float32).reshape(3, 1)
+    tvec = np.array(p_abs[3:], dtype=np.float32) * depth_scale
+
+    R, _ = cv2.Rodrigues(rvec)
+
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = R.astype(np.float32)
+    T[:3, 3] = tvec.astype(np.float32)
+
+    return T
+
+
+def invert_rigid_4x4(T):
+    """
+    Rigid transform inverse.
+    """
+    R = T[:3, :3]
+    t = T[:3, 3]
+
+    Ti = np.eye(4, dtype=np.float32)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+
+    return Ti
+
+
+def derive_rt_cur_to_prev_from_abs_param6(p_abs_cur, p_abs_prev, depth_scale):
+    """
+    Rebased absolute W2C 두 개로 cur -> prev relative transform 생성.
+
+    W2C_cur:
+        X_cur = W2C_cur * X_world_rebased
+
+    W2C_prev:
+        X_prev = W2C_prev * X_world_rebased
+
+    필요한 backward warp 변환:
+        X_prev = T_cur_to_prev * X_cur
+
+    따라서:
+        T_cur_to_prev = W2C_prev @ C2W_cur
+    """
+    W2C_cur = abs_w2c_matrix_from_param6(p_abs_cur, depth_scale)
+    W2C_prev = abs_w2c_matrix_from_param6(p_abs_prev, depth_scale)
+
+    C2W_cur = invert_rigid_4x4(W2C_cur)
+
+    T = W2C_prev @ C2W_cur
+
+    R_rel = T[:3, :3].astype(np.float32)
+    t_rel = T[:3, 3].astype(np.float32)
+
+    rvec_rel, _ = cv2.Rodrigues(R_rel)
+
     return {
-        "rvec": p[:3].astype(float).tolist(),
-        "tvec": (p[3:] * depth_scale).astype(float).tolist(),
+        "rvec": rvec_rel.reshape(3).astype(float).tolist(),
+        "tvec": t_rel.reshape(3).astype(float).tolist(),
     }
 
 
@@ -178,6 +257,7 @@ def signed_to_code_num(x):
       ...
     """
     x = int(x)
+
     if x == 0:
         return 0
     if x > 0:
@@ -193,6 +273,7 @@ def ue_exp_golomb_bits(code_num):
     code_num=3~6 -> 5 bits
     """
     code_num = int(code_num)
+
     if code_num < 0:
         raise ValueError("code_num must be non-negative")
 
@@ -229,6 +310,7 @@ def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
         signed_truncated_exp_golomb_bits(int(v), q_abs_max)
         for v in q_residual
     ]
+
     return bits_each, int(sum(bits_each))
 
 
@@ -238,8 +320,8 @@ def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
 
 def predict_from_history(decoded_hist, pred_n, pred_degree):
     """
-    decoded_hist에는 이미 복원된 param6만 저장됨.
-    predictor도 반드시 decoded 값만 사용.
+    decoded_hist에는 이미 복원된 rebased absolute param6만 저장됨.
+    predictor도 반드시 decoded absolute 값만 사용.
     """
     if not decoded_hist:
         return np.zeros(6, dtype=np.float32)
@@ -339,6 +421,7 @@ def remap_plane(src, map_x, map_y, bit_depth, border_value):
 
     if bit_depth <= 8:
         return dst.astype(np.uint8)
+
     return dst.astype(np.uint16)
 
 
@@ -349,8 +432,17 @@ def backward_warp_yuv420(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
 
     y = remap_plane(prev_y, map_x, map_y, bit_depth, 0)
 
-    map_x_uv = cv2.resize(map_x, (uv_w, uv_h), interpolation=cv2.INTER_LINEAR) * 0.5
-    map_y_uv = cv2.resize(map_y, (uv_w, uv_h), interpolation=cv2.INTER_LINEAR) * 0.5
+    map_x_uv = cv2.resize(
+        map_x,
+        (uv_w, uv_h),
+        interpolation=cv2.INTER_LINEAR,
+    ) * 0.5
+
+    map_y_uv = cv2.resize(
+        map_y,
+        (uv_w, uv_h),
+        interpolation=cv2.INTER_LINEAR,
+    ) * 0.5
 
     neutral = 128 if bit_depth <= 8 else 512
 
@@ -416,6 +508,17 @@ def main():
     depth_scale = float(header["depth_scale"])
     intr_gt = header["intrinsic"]
 
+    input_extrinsic_type = header.get(
+        "extrinsic_type",
+        "absolute_world_to_camera_rebased_to_poc0",
+    )
+
+    if input_extrinsic_type != "absolute_world_to_camera_rebased_to_poc0":
+        print(
+            "[WARN] input extrinsic_type is not "
+            f"'absolute_world_to_camera_rebased_to_poc0': {input_extrinsic_type}"
+        )
+
     intr_q, intr_dec, intr_clip = quantize_intrinsic_16(
         intr_gt,
         w,
@@ -427,6 +530,13 @@ def main():
 
     seq_count = count_frames(seq_yuv, w, h, bit_depth)
     depth_count = count_frames(depth_yuv, w, h, 10)
+
+    if not frames:
+        raise RuntimeError("no frame parameters found in param jsonl")
+
+    if 0 not in frames:
+        raise RuntimeError("POC 0 not found in param jsonl")
+
     max_poc = min(seq_count, depth_count, max(frames.keys()) + 1)
 
     decoded_hist = []
@@ -451,11 +561,20 @@ def main():
     with open(out_q_jsonl, "w", encoding="utf-8") as fq:
         fq.write(json.dumps({
             "type": "header",
+
+            "input_extrinsic_type": "absolute_world_to_camera_rebased_to_poc0",
+            "coded_extrinsic_type": "absolute_world_to_camera_rebased_to_poc0",
+            "extrinsic_rotation": "rodrigues_rvec",
+            "extrinsic_translation": "tvec",
+            "anchor_poc": 0,
+            "anchor_pose": "identity",
+
             "depth_scale": depth_scale,
             "intrinsic_q16": intr_q,
             "intrinsic_dec": intr_dec,
             "intrinsic_gt": intr_gt,
             "intrinsic_clipped": intr_clip,
+
             "extrinsic_bits": args.ext_bits,
             "extrinsic_q_abs_max": q_abs_max,
             "extrinsic_q_range": [-q_abs_max, q_abs_max],
@@ -463,49 +582,64 @@ def main():
             "t_step_norm": args.t_step_norm,
             "pred_n": args.pred_n,
             "pred_degree": args.pred_degree,
+
             "bit_count": {
                 "intrinsic_bits": intrinsic_bits,
                 "depth_scale_bits": depth_scale_bits,
                 "z_sign_bits": z_sign_bits,
                 "header_bits": header_bits,
                 "extrinsic_code": "signed_truncated_exp_golomb",
+                "poc0_extrinsic_bits": 0,
             },
+
             "param6_order": [
-                "rx",
-                "ry",
-                "rz",
-                "tx_over_depth_scale",
-                "ty_over_depth_scale",
-                "tz_over_depth_scale",
+                "rebased_abs_rx",
+                "rebased_abs_ry",
+                "rebased_abs_rz",
+                "rebased_abs_tx_over_depth_scale",
+                "rebased_abs_ty_over_depth_scale",
+                "rebased_abs_tz_over_depth_scale",
             ],
         }) + "\n")
 
         for poc in range(max_poc):
             cur_y, cur_u, cur_v = read_yuv420(seq_yuv, poc, w, h, bit_depth)
 
+            if poc not in frames:
+                raise RuntimeError(f"POC {poc} not found in param jsonl")
+
+            # GT rebased absolute camera parameter
+            p_gt = param6_from_frame(frames[poc], depth_scale)
+
+            # ----------------------------------------------------
+            # POC 0: rebased absolute anchor
+            # ----------------------------------------------------
             if poc == 0:
                 write_yuv420(out_yuv, cur_y, cur_u, cur_v)
 
-                p0_dec = np.zeros(6, dtype=np.float32)
+                # 입력 JSONL이 정상이라면 이 값은 거의 [0,0,0,0,0,0]
+                p0_dec = p_gt.copy()
                 decoded_hist.append(p0_dec)
 
                 fq.write(json.dumps({
                     "poc": 0,
+                    "mode": "rebased_absolute_anchor_uncoded",
                     "q_residual": [0, 0, 0, 0, 0, 0],
                     "q_residual_bits": [0, 0, 0, 0, 0, 0],
                     "q_residual_total_bits": 0,
                     "param6_dec": p0_dec.astype(float).tolist(),
+                    "param6_gt": p_gt.astype(float).tolist(),
                     "mae_y": 0.0,
                 }) + "\n")
+
+                print(f"[{poc:04d}/{max_poc - 1:04d}] copy original, rebased absolute anchor")
                 continue
 
-            if poc not in frames:
-                raise RuntimeError(f"POC {poc} not found in param jsonl")
+            # ----------------------------------------------------
+            # Predict rebased absolute parameter
+            # ----------------------------------------------------
+            p_prev_dec = decoded_hist[-1]
 
-            # GT camera parameter
-            p_gt = param6_from_frame(frames[poc], depth_scale)
-
-            # predictor uses decoded parameters only
             p_pred = predict_from_history(
                 decoded_hist,
                 pred_n=args.pred_n,
@@ -543,9 +677,14 @@ def main():
             p_dec[:3] += d_r
             p_dec[3:] += d_t
 
-            decoded_hist.append(p_dec)
-
-            rt_dec = rt_from_param6(p_dec, depth_scale)
+            # ----------------------------------------------------
+            # Warp 직전에 decoded absolute cur/prev로 relative RT 생성
+            # ----------------------------------------------------
+            rt_dec = derive_rt_cur_to_prev_from_abs_param6(
+                p_abs_cur=p_dec,
+                p_abs_prev=p_prev_dec,
+                depth_scale=depth_scale,
+            )
 
             # depth는 현재 frame depth를 그대로 사용
             depth_y, _, _ = read_yuv420(depth_yuv, poc, w, h, 10)
@@ -560,7 +699,13 @@ def main():
             )
 
             # 영상 참조는 항상 이전 GT frame 사용
-            prev_y, prev_u, prev_v = read_yuv420(seq_yuv, poc - 1, w, h, bit_depth)
+            prev_y, prev_u, prev_v = read_yuv420(
+                seq_yuv,
+                poc - 1,
+                w,
+                h,
+                bit_depth,
+            )
 
             wy, wu, wv = backward_warp_yuv420(
                 prev_y,
@@ -578,17 +723,25 @@ def main():
             )))
 
             clipped = bool(np.any(clip_r) or np.any(clip_t))
+
             if clipped:
                 total_clipped_frames += 1
 
+            decoded_hist.append(p_dec)
+
             fq.write(json.dumps({
                 "poc": poc,
+                "mode": "rebased_absolute_predictive",
                 "q_residual": q_residual.astype(int).tolist(),
                 "q_residual_bits": q_bits_each,
                 "q_residual_total_bits": q_bits_total,
+
                 "param6_pred": p_pred.astype(float).tolist(),
                 "param6_dec": p_dec.astype(float).tolist(),
                 "param6_gt": p_gt.astype(float).tolist(),
+
+                "rt_cur_to_prev_dec": rt_dec,
+
                 "clipped": clipped,
                 "mae_y": mae_y,
             }) + "\n")
@@ -611,6 +764,9 @@ def main():
     print(f"z_sign bits           : {z_sign_bits} bits")
     print(f"header bits           : {header_bits} bits")
     print("------------------------------------------------------------")
+    print("extrinsic type        : rebased absolute WorldToCamera")
+    print("anchor POC            : 0")
+    print("anchor pose           : identity")
     print(f"extrinsic code        : signed truncated Exp-Golomb")
     print(f"extrinsic q range     : [-{q_abs_max}, {q_abs_max}]")
     print(f"coded frames          : {total_coded_frames}")
