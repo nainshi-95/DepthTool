@@ -1,854 +1,1090 @@
-#include "CameraParam.h"
+#include "DepthCamParam.h"
 
 #include <algorithm>
-#include <cctype>
+#include <cassert>
+#include <cerrno>
 #include <cmath>
-#include <fstream>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
 
-CameraMatrix4x4::CameraMatrix4x4()
+namespace depthcam
 {
-  setIdentity();
-}
+namespace
+{
+constexpr double kEps = 1e-12;
 
-void CameraMatrix4x4::setIdentity()
+bool isBlankLine(const std::string& s)
 {
-  m.fill(0.0);
-  for (int i = 0; i < 4; i++)
+  for (char c : s)
   {
-    (*this)(i, i) = 1.0;
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+    {
+      return false;
+    }
   }
+  return true;
 }
 
-CameraRelativeParam::CameraRelativeParam()
+bool findKey(const std::string& line, const std::string& key, std::size_t& keyPos)
 {
-  r.fill(0.0);
-  t.fill(0.0);
-  r[0] = r[4] = r[8] = 1.0;
+  const std::string pat = "\"" + key + "\"";
+  keyPos = line.find(pat);
+  return keyPos != std::string::npos;
 }
 
-CameraParamManager::CameraParamManager(int maxStoredParams)
-  : m_maxStoredParams(std::max(1, maxStoredParams))
+bool parseDoubleAfterKey(const std::string& line, const std::string& key, double& value)
 {
-}
-
-void CameraParamManager::clear()
-{
-  m_jsonFrameTextByPoc.clear();
-  m_frameParamByPoc.clear();
-  m_lruPocs.clear();
-  m_jsonText.clear();
-  m_jsonIndexed = false;
-}
-
-void CameraParamManager::setMaxStoredParams(int maxStoredParams)
-{
-  m_maxStoredParams = std::max(1, maxStoredParams);
-  while ((int)m_lruPocs.size() > m_maxStoredParams)
+  std::size_t keyPos = 0;
+  if (!findKey(line, key, keyPos))
   {
-    const int oldPoc = m_lruPocs.front();
-    m_lruPocs.pop_front();
-    m_frameParamByPoc.erase(oldPoc);
-  }
-}
-
-void CameraParamManager::setFrameSize(int width, int height)
-{
-  m_width  = width;
-  m_height = height;
-}
-
-void CameraParamManager::setJsonFileName(const std::string &jsonFileName)
-{
-  m_jsonFileName = jsonFileName;
-  m_jsonText.clear();
-  m_jsonIndexed = false;
-  m_jsonFrameTextByPoc.clear();
-}
-
-void CameraParamManager::loadJsonFile(const std::string &jsonFileName)
-{
-  setJsonFileName(jsonFileName);
-
-  std::ifstream ifs(jsonFileName.c_str(), std::ios::in | std::ios::binary);
-  if (!ifs.good())
-  {
-    THROW("CameraParamManager: cannot open camera json file: " << jsonFileName);
+    return false;
   }
 
+  std::size_t colon = line.find(':', keyPos);
+  if (colon == std::string::npos)
+  {
+    return false;
+  }
+
+  const char* begin = line.c_str() + colon + 1;
+  char* end = nullptr;
+  errno = 0;
+  const double v = std::strtod(begin, &end);
+  if (begin == end || errno == ERANGE)
+  {
+    return false;
+  }
+
+  value = v;
+  return true;
+}
+
+bool parseIntAfterKey(const std::string& line, const std::string& key, int& value)
+{
+  double d = 0.0;
+  if (!parseDoubleAfterKey(line, key, d))
+  {
+    return false;
+  }
+  value = static_cast<int>(std::llround(d));
+  return true;
+}
+
+bool parseStringAfterKey(const std::string& line, const std::string& key, std::string& value)
+{
+  std::size_t keyPos = 0;
+  if (!findKey(line, key, keyPos))
+  {
+    return false;
+  }
+
+  std::size_t colon = line.find(':', keyPos);
+  if (colon == std::string::npos)
+  {
+    return false;
+  }
+
+  std::size_t q0 = line.find('"', colon + 1);
+  if (q0 == std::string::npos)
+  {
+    return false;
+  }
+
+  std::size_t q1 = line.find('"', q0 + 1);
+  if (q1 == std::string::npos || q1 <= q0)
+  {
+    return false;
+  }
+
+  value = line.substr(q0 + 1, q1 - q0 - 1);
+  return true;
+}
+
+bool parseArray3AfterKey(const std::string& line, const std::string& key, std::array<double, 3>& value)
+{
+  std::size_t keyPos = 0;
+  if (!findKey(line, key, keyPos))
+  {
+    return false;
+  }
+
+  std::size_t lb = line.find('[', keyPos);
+  std::size_t rb = line.find(']', lb == std::string::npos ? keyPos : lb);
+  if (lb == std::string::npos || rb == std::string::npos || rb <= lb)
+  {
+    return false;
+  }
+
+  const char* p = line.c_str() + lb + 1;
+  const char* endLimit = line.c_str() + rb;
+
+  for (int i = 0; i < 3; ++i)
+  {
+    while (p < endLimit && (*p == ' ' || *p == '\t' || *p == ','))
+    {
+      ++p;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const double v = std::strtod(p, &end);
+    if (p == end || errno == ERANGE || end > endLimit)
+    {
+      return false;
+    }
+
+    value[i] = v;
+    p = end;
+  }
+
+  return true;
+}
+
+std::string makeRangeError(const char* name, int q, int qAbsMax)
+{
   std::ostringstream oss;
-  oss << ifs.rdbuf();
-  m_jsonText = oss.str();
-  if (m_jsonText.empty())
-  {
-    THROW("CameraParamManager: empty camera json file: " << jsonFileName);
-  }
-
-  m_jsonIndexed = false;
-  indexJsonIfNeeded();
+  oss << name << " q=" << q << " outside signed range [-" << qAbsMax << ", " << qAbsMax << "]";
+  return oss.str();
 }
 
-void CameraParamManager::setFrameParam(const CameraFrameParam &param)
+} // unnamed namespace
+
+// ============================================================================
+// Base
+// ============================================================================
+
+DepthCamParamBase::DepthCamParamBase(int width, int height, const DepthCamParamConfig& cfg)
+  : m_width(width), m_height(height), m_cfg(cfg)
 {
-  if (!param.valid)
-  {
-    THROW("CameraParamManager: trying to set invalid camera parameter for POC " << param.poc);
-  }
-  storeFrameParam(param);
+  if (m_cfg.predN < 1)         { m_cfg.predN = 1; }
+  if (m_cfg.predDegree < 0)    { m_cfg.predDegree = 0; }
+  if (m_cfg.predDegree > 2)    { m_cfg.predDegree = 2; }
+  if (m_cfg.extBits < 2)       { m_cfg.extBits = 2; }
+  if (m_cfg.maxPredHist < 1)   { m_cfg.maxPredHist = 1; }
+  if (m_cfg.maxFrameStore < 1) { m_cfg.maxFrameStore = 1; }
 }
 
-void CameraParamManager::setFrameParams(const std::vector<CameraFrameParam> &params)
+void DepthCamParamBase::setError(const std::string& err) const
 {
-  for (const CameraFrameParam &param : params)
-  {
-    setFrameParam(param);
-  }
+  m_lastError = err;
 }
 
-bool CameraParamManager::hasFrameParam(int poc) const
+int DepthCamParamBase::signedQAbsMax(int bits)
 {
-  return m_frameParamByPoc.find(poc) != m_frameParamByPoc.end();
+  if (bits < 2)
+  {
+    return 0;
+  }
+  return (1 << (bits - 1)) - 1;
 }
 
-const CameraFrameParam &CameraParamManager::loadFrameParam(int poc)
+void DepthCamParamBase::clearHistory()
 {
-  auto it = m_frameParamByPoc.find(poc);
-  if (it != m_frameParamByPoc.end())
+  m_predHist.clear();
+  m_frameStore.clear();
+}
+
+bool DepthCamParamBase::initHeaderFromIntrinsic(double depthScale, const DepthCamIntrinsic& intrinsicGt)
+{
+  if (m_width <= 0 || m_height <= 0)
   {
-    touchLru(poc);
-    return it->second;
+    setError("invalid picture size");
+    return false;
+  }
+  if (!(depthScale > 0.0) || !std::isfinite(depthScale))
+  {
+    setError("invalid depthScale");
+    return false;
   }
 
-  if (!m_jsonFileName.empty())
+  bool clipped = false;
+  bool c = false;
+
+  const double fxN = intrinsicGt.fx / static_cast<double>(m_width);
+  const double fyN = intrinsicGt.fy / static_cast<double>(m_height);
+  const double cxN = intrinsicGt.cx / static_cast<double>(m_width);
+  const double cyN = intrinsicGt.cy / static_cast<double>(m_height);
+
+  const uint16_t qFx = quantU16(fxN, -m_cfg.intrFMax, m_cfg.intrFMax, c); clipped = clipped || c;
+  const uint16_t qFy = quantU16(fyN, -m_cfg.intrFMax, m_cfg.intrFMax, c); clipped = clipped || c;
+  const uint16_t qCx = quantU16(cxN,  m_cfg.intrCMin, m_cfg.intrCMax, c); clipped = clipped || c;
+  const uint16_t qCy = quantU16(cyN,  m_cfg.intrCMin, m_cfg.intrCMax, c); clipped = clipped || c;
+
+  DepthCamHeader h;
+  h.depthScale = depthScale;
+  h.qFx = qFx;
+  h.qFy = qFy;
+  h.qCx = qCx;
+  h.qCy = qCy;
+  h.zSign = intrinsicGt.zSign;
+  h.intrinsicGt = intrinsicGt;
+  h.intrinsicClipped = clipped;
+
+  if (!initHeaderFromQuant(h))
   {
-    indexJsonIfNeeded();
-    auto jt = m_jsonFrameTextByPoc.find(poc);
-    if (jt == m_jsonFrameTextByPoc.end())
+    return false;
+  }
+
+  m_header.intrinsicGt = intrinsicGt;
+  m_header.intrinsicClipped = clipped;
+  return true;
+}
+
+bool DepthCamParamBase::initHeaderFromQuant(const DepthCamHeader& headerWithQuant)
+{
+  if (m_width <= 0 || m_height <= 0)
+  {
+    setError("invalid picture size");
+    return false;
+  }
+  if (!(headerWithQuant.depthScale > 0.0) || !std::isfinite(headerWithQuant.depthScale))
+  {
+    setError("invalid depthScale in header");
+    return false;
+  }
+
+  m_header = headerWithQuant;
+
+  const double fxN = dequantU16(m_header.qFx, -m_cfg.intrFMax, m_cfg.intrFMax);
+  const double fyN = dequantU16(m_header.qFy, -m_cfg.intrFMax, m_cfg.intrFMax);
+  const double cxN = dequantU16(m_header.qCx,  m_cfg.intrCMin, m_cfg.intrCMax);
+  const double cyN = dequantU16(m_header.qCy,  m_cfg.intrCMin, m_cfg.intrCMax);
+
+  m_header.intrinsicDec.fx = fxN * static_cast<double>(m_width);
+  m_header.intrinsicDec.fy = fyN * static_cast<double>(m_height);
+  m_header.intrinsicDec.cx = cxN * static_cast<double>(m_width);
+  m_header.intrinsicDec.cy = cyN * static_cast<double>(m_height);
+  m_header.intrinsicDec.zSign = (m_header.zSign >= 0.0) ? 1.0 : -1.0;
+  m_header.zSign = m_header.intrinsicDec.zSign;
+
+  m_valid = true;
+  return true;
+}
+
+uint16_t DepthCamParamBase::quantU16(double value, double lo, double hi, bool& clipped)
+{
+  clipped = false;
+  if (hi <= lo)
+  {
+    clipped = true;
+    return 0;
+  }
+
+  if (value < lo)
+  {
+    value = lo;
+    clipped = true;
+  }
+  else if (value > hi)
+  {
+    value = hi;
+    clipped = true;
+  }
+
+  const double qMax = 65535.0;
+  double q = std::round((value - lo) / (hi - lo) * qMax);
+  if (q < 0.0)     { q = 0.0; }
+  if (q > qMax)    { q = qMax; }
+  return static_cast<uint16_t>(q);
+}
+
+double DepthCamParamBase::dequantU16(uint16_t q, double lo, double hi)
+{
+  const double qMax = 65535.0;
+  return static_cast<double>(q) / qMax * (hi - lo) + lo;
+}
+
+int DepthCamParamBase::quantS(double value, double step, int bits, bool& clipped)
+{
+  clipped = false;
+  const int qAbsMax = signedQAbsMax(bits);
+  if (!(step > 0.0) || qAbsMax <= 0)
+  {
+    clipped = true;
+    return 0;
+  }
+
+  long long q64 = std::llround(value / step);
+  if (q64 < -qAbsMax)
+  {
+    q64 = -qAbsMax;
+    clipped = true;
+  }
+  else if (q64 > qAbsMax)
+  {
+    q64 = qAbsMax;
+    clipped = true;
+  }
+
+  return static_cast<int>(q64);
+}
+
+double DepthCamParamBase::dequantS(int q, double step)
+{
+  return static_cast<double>(q) * step;
+}
+
+bool DepthCamParamBase::validateQResidual(const DepthCamQResidual& q) const
+{
+  const int qAbsMax = signedQAbsMax(m_cfg.extBits);
+  for (int i = 0; i < 6; ++i)
+  {
+    if (q.q[i] < -qAbsMax || q.q[i] > qAbsMax)
     {
-      THROW("CameraParamManager: camera parameter for POC " << poc << " is not found in json");
+      setError(makeRangeError("extrinsic residual", q.q[i], qAbsMax));
+      return false;
+    }
+  }
+  return true;
+}
+
+bool DepthCamParamBase::encodeAndStore(int poc, const DepthCamParam6& gtParam, DepthCamQResidual& outQ)
+{
+  if (!m_valid)
+  {
+    setError("DepthCamParamBase is not initialized");
+    return false;
+  }
+
+  const DepthCamParam6 pred = predictFromHistory();
+  DepthCamQResidual q;
+  q.clipped = false;
+
+  for (int i = 0; i < 3; ++i)
+  {
+    bool clipped = false;
+    q.q[i] = quantS(gtParam.v[i] - pred.v[i], m_cfg.rStep, m_cfg.extBits, clipped);
+    q.clipped = q.clipped || clipped;
+  }
+  for (int i = 3; i < 6; ++i)
+  {
+    bool clipped = false;
+    q.q[i] = quantS(gtParam.v[i] - pred.v[i], m_cfg.tStepNorm, m_cfg.extBits, clipped);
+    q.clipped = q.clipped || clipped;
+  }
+
+  if (!setAndStore(poc, q))
+  {
+    return false;
+  }
+
+  outQ = q;
+  return true;
+}
+
+bool DepthCamParamBase::setAndStore(int poc, const DepthCamQResidual& q)
+{
+  if (!m_valid)
+  {
+    setError("DepthCamParamBase is not initialized");
+    return false;
+  }
+  if (!validateQResidual(q))
+  {
+    return false;
+  }
+  if (!m_frameStore.empty() && poc <= m_frameStore.back().poc)
+  {
+    std::ostringstream oss;
+    oss << "POC must be inserted in strictly increasing order. requested=" << poc
+        << ", last=" << m_frameStore.back().poc;
+    setError(oss.str());
+    return false;
+  }
+
+  const DepthCamParam6 pred = predictFromHistory();
+
+  DepthCamParam6 dec;
+  for (int i = 0; i < 3; ++i)
+  {
+    dec.v[i] = pred.v[i] + dequantS(q.q[i], m_cfg.rStep);
+  }
+  for (int i = 3; i < 6; ++i)
+  {
+    dec.v[i] = pred.v[i] + dequantS(q.q[i], m_cfg.tStepNorm);
+  }
+
+  FrameRecord rec = makeRecord(poc, dec);
+  return pushRecord(rec);
+}
+
+DepthCamParam6 DepthCamParamBase::predictFromHistory() const
+{
+  DepthCamParam6 pred;
+
+  if (m_predHist.empty())
+  {
+    return pred;
+  }
+
+  const int available = static_cast<int>(m_predHist.size());
+  const int m = std::min(available, std::max(1, m_cfg.predN));
+
+  if (m == 1)
+  {
+    return m_predHist.back().decParam;
+  }
+
+  const int degree = std::min(std::min(m_cfg.predDegree, m - 1), 2);
+
+  if (degree <= 0)
+  {
+    for (int d = 0; d < 6; ++d)
+    {
+      double sum = 0.0;
+      for (int i = available - m; i < available; ++i)
+      {
+        sum += m_predHist[i].decParam.v[d];
+      }
+      pred.v[d] = sum / static_cast<double>(m);
+    }
+    return pred;
+  }
+
+  const int nCoef = degree + 1;
+
+  // Normal equation: (A^T A)c = A^T y, A=[1,x,x^2], x=0..m-1.
+  double ATA[9] = {0.0}; // max 3x3, row-major
+  for (int row = 0; row < nCoef; ++row)
+  {
+    for (int col = 0; col < nCoef; ++col)
+    {
+      double s = 0.0;
+      for (int i = 0; i < m; ++i)
+      {
+        s += std::pow(static_cast<double>(i), row + col);
+      }
+      ATA[row * nCoef + col] = s;
+    }
+  }
+
+  const double xNext = static_cast<double>(m);
+
+  for (int d = 0; d < 6; ++d)
+  {
+    double ATy[3] = {0.0, 0.0, 0.0};
+
+    for (int row = 0; row < nCoef; ++row)
+    {
+      double s = 0.0;
+      for (int i = 0; i < m; ++i)
+      {
+        const int histIdx = available - m + i;
+        s += std::pow(static_cast<double>(i), row) * m_predHist[histIdx].decParam.v[d];
+      }
+      ATy[row] = s;
     }
 
-    CameraFrameParam param = parseFrameParamFromJsonText(poc, jt->second);
-    storeFrameParam(param);
-
-    auto kt = m_frameParamByPoc.find(poc);
-    if (kt == m_frameParamByPoc.end())
+    double coef[3] = {0.0, 0.0, 0.0};
+    if (!solveSmallLinearSystem(ATA, ATy, nCoef, coef))
     {
-      THROW("CameraParamManager: internal error after loading POC " << poc);
+      pred.v[d] = m_predHist.back().decParam.v[d];
+      continue;
     }
-    return kt->second;
-  }
 
-  THROW("CameraParamManager: camera parameter for POC " << poc << " is not available");
-}
-
-CameraRelativeParam CameraParamManager::loadCameraParam(int poc)
-{
-  if (poc == 0)
-  {
-    const CameraFrameParam &cur = loadFrameParam(0);
-    CameraRelativeParam rel;
-    rel.curPoc     = 0;
-    rel.refPoc     = 0;
-    rel.intrinsic  = cur.intrinsic;
-    rel.depthScale = cur.depthScale;
-    rel.valid      = true;
-    return rel;
-  }
-  return loadRelativeParam(poc, poc - 1);
-}
-
-CameraRelativeParam CameraParamManager::loadRelativeParam(int curPoc, int refPoc)
-{
-  const CameraFrameParam &cur = loadFrameParam(curPoc);
-  const CameraFrameParam &ref = loadFrameParam(refPoc);
-  return deriveRelative(cur, ref);
-}
-
-void CameraParamManager::storeFrameParam(const CameraFrameParam &param)
-{
-  m_frameParamByPoc[param.poc] = param;
-  touchLru(param.poc);
-
-  while ((int)m_lruPocs.size() > m_maxStoredParams)
-  {
-    const int oldPoc = m_lruPocs.front();
-    m_lruPocs.pop_front();
-    if (oldPoc != param.poc)
+    double y = 0.0;
+    double xp = 1.0;
+    for (int k = 0; k < nCoef; ++k)
     {
-      m_frameParamByPoc.erase(oldPoc);
+      y += coef[k] * xp;
+      xp *= xNext;
+    }
+    pred.v[d] = y;
+  }
+
+  return pred;
+}
+
+bool DepthCamParamBase::solveSmallLinearSystem(const double* A, const double* b, int n, double* x)
+{
+  if (n <= 0 || n > 3)
+  {
+    return false;
+  }
+
+  double M[3][4] = {{0.0}};
+  for (int r = 0; r < n; ++r)
+  {
+    for (int c = 0; c < n; ++c)
+    {
+      M[r][c] = A[r * n + c];
+    }
+    M[r][n] = b[r];
+  }
+
+  for (int col = 0; col < n; ++col)
+  {
+    int pivot = col;
+    double best = std::fabs(M[col][col]);
+    for (int r = col + 1; r < n; ++r)
+    {
+      const double v = std::fabs(M[r][col]);
+      if (v > best)
+      {
+        best = v;
+        pivot = r;
+      }
+    }
+
+    if (best < 1e-14)
+    {
+      return false;
+    }
+
+    if (pivot != col)
+    {
+      for (int c = col; c <= n; ++c)
+      {
+        std::swap(M[col][c], M[pivot][c]);
+      }
+    }
+
+    const double div = M[col][col];
+    for (int c = col; c <= n; ++c)
+    {
+      M[col][c] /= div;
+    }
+
+    for (int r = 0; r < n; ++r)
+    {
+      if (r == col)
+      {
+        continue;
+      }
+      const double f = M[r][col];
+      for (int c = col; c <= n; ++c)
+      {
+        M[r][c] -= f * M[col][c];
+      }
     }
   }
-}
 
-void CameraParamManager::touchLru(int poc)
-{
-  auto it = std::find(m_lruPocs.begin(), m_lruPocs.end(), poc);
-  if (it != m_lruPocs.end())
+  for (int i = 0; i < n; ++i)
   {
-    m_lruPocs.erase(it);
+    x[i] = M[i][n];
   }
-  m_lruPocs.push_back(poc);
+  return true;
 }
 
-void CameraParamManager::indexJsonIfNeeded()
+DepthCamParamBase::FrameRecord DepthCamParamBase::makeRecord(int poc, const DepthCamParam6& decParam) const
 {
-  if (m_jsonIndexed)
+  FrameRecord rec;
+  rec.poc = poc;
+  rec.decParam = decParam;
+
+  setIdentity(rec.R);
+  setZero(rec.t);
+
+  if (poc <= 0)
   {
+    rec.hasAdjacent = false;
+    return rec;
+  }
+
+  double rvec[3] = { decParam.v[0], decParam.v[1], decParam.v[2] };
+  rodriguesToMatrix(rvec, rec.R);
+
+  rec.t[0] = decParam.v[3] * m_header.depthScale;
+  rec.t[1] = decParam.v[4] * m_header.depthScale;
+  rec.t[2] = decParam.v[5] * m_header.depthScale;
+
+  rec.hasAdjacent = true;
+  return rec;
+}
+
+bool DepthCamParamBase::pushRecord(const FrameRecord& rec)
+{
+  m_predHist.push_back(rec);
+  while (static_cast<int>(m_predHist.size()) > m_cfg.maxPredHist)
+  {
+    m_predHist.pop_front();
+  }
+
+  m_frameStore.push_back(rec);
+  while (static_cast<int>(m_frameStore.size()) > m_cfg.maxFrameStore)
+  {
+    m_frameStore.pop_front();
+  }
+
+  return true;
+}
+
+const DepthCamParamBase::FrameRecord* DepthCamParamBase::findRecord(int poc) const
+{
+  for (auto it = m_frameStore.rbegin(); it != m_frameStore.rend(); ++it)
+  {
+    if (it->poc == poc)
+    {
+      return &(*it);
+    }
+  }
+  return nullptr;
+}
+
+bool DepthCamParamBase::getProjectionParam(int curPoc, int refPoc, DepthCamProjectionParam& out) const
+{
+  if (!m_valid)
+  {
+    setError("DepthCamParamBase is not initialized");
+    return false;
+  }
+
+  out.curPoc = curPoc;
+  out.refPoc = refPoc;
+  out.intr = m_header.intrinsicDec;
+  out.depthScale = m_header.depthScale;
+  setIdentity(out.R);
+  setZero(out.t);
+
+  if (curPoc == refPoc)
+  {
+    return true;
+  }
+
+  if (curPoc > refPoc)
+  {
+    // Compose T[p -> p-1] from p=curPoc down to refPoc+1.
+    for (int p = curPoc; p > refPoc; --p)
+    {
+      const FrameRecord* rec = findRecord(p);
+      if (!rec || !rec->hasAdjacent)
+      {
+        std::ostringstream oss;
+        oss << "missing adjacent transform T[" << p << " -> " << (p - 1)
+            << "] for getProjectionParam(" << curPoc << ", " << refPoc << ")";
+        setError(oss.str());
+        return false;
+      }
+      composeLeft(rec->R, rec->t, out.R, out.t);
+    }
+    return true;
+  }
+
+  // curPoc < refPoc. Use inverse of T[p -> p-1].
+  for (int p = curPoc + 1; p <= refPoc; ++p)
+  {
+    const FrameRecord* rec = findRecord(p);
+    if (!rec || !rec->hasAdjacent)
+    {
+      std::ostringstream oss;
+      oss << "missing adjacent transform T[" << p << " -> " << (p - 1)
+          << "] for getProjectionParam(" << curPoc << ", " << refPoc << ")";
+      setError(oss.str());
+      return false;
+    }
+
+    std::array<double, 9> RInv;
+    std::array<double, 3> tInv;
+    inverseRigid(rec->R, rec->t, RInv, tInv);
+    composeLeft(RInv, tInv, out.R, out.t);
+  }
+
+  return true;
+}
+
+bool DepthCamParamBase::mapCurPixelToRef(
+    const DepthCamProjectionParam& proj,
+    double curX,
+    double curY,
+    double depthLinear,
+    double& refX,
+    double& refY)
+{
+  refX = -1.0;
+  refY = -1.0;
+
+  if (!(depthLinear > 0.0) || !std::isfinite(depthLinear))
+  {
+    return false;
+  }
+
+  const DepthCamIntrinsic& intr = proj.intr;
+  if (std::fabs(intr.fx) < kEps || std::fabs(intr.fy) < kEps)
+  {
+    return false;
+  }
+
+  const double z = depthLinear;
+  const std::array<double, 3> Pcur{{
+      (curX - intr.cx) / intr.fx * z,
+      (curY - intr.cy) / intr.fy * z,
+      intr.zSign * z
+  }};
+
+  std::array<double, 3> RP;
+  matVecMul3(proj.R, Pcur, RP);
+
+  const double Xr = RP[0] + proj.t[0];
+  const double Yr = RP[1] + proj.t[1];
+  const double Zr = RP[2] + proj.t[2];
+
+  if (!(Zr * intr.zSign > 0.0))
+  {
+    return false;
+  }
+
+  const double zDenom = std::fabs(Zr);
+  if (zDenom < kEps)
+  {
+    return false;
+  }
+
+  refX = intr.fx * (Xr / zDenom) + intr.cx;
+  refY = intr.fy * (Yr / zDenom) + intr.cy;
+
+  return std::isfinite(refX) && std::isfinite(refY);
+}
+
+void DepthCamParamBase::setIdentity(std::array<double, 9>& R)
+{
+  R = {{1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0}};
+}
+
+void DepthCamParamBase::setZero(std::array<double, 3>& t)
+{
+  t = {{0.0, 0.0, 0.0}};
+}
+
+void DepthCamParamBase::rodriguesToMatrix(const double rvec[3], std::array<double, 9>& R)
+{
+  const double rx = rvec[0];
+  const double ry = rvec[1];
+  const double rz = rvec[2];
+  const double theta = std::sqrt(rx * rx + ry * ry + rz * rz);
+
+  if (theta < 1e-12)
+  {
+    // First-order approximation: R = I + [r]x.
+    R = {{1.0, -rz,   ry,
+          rz,   1.0, -rx,
+         -ry,   rx,   1.0}};
     return;
   }
 
-  if (m_jsonText.empty())
-  {
-    if (m_jsonFileName.empty())
-    {
-      THROW("CameraParamManager: json file name is not set");
-    }
+  const double kx = rx / theta;
+  const double ky = ry / theta;
+  const double kz = rz / theta;
 
-    std::ifstream ifs(m_jsonFileName.c_str(), std::ios::in | std::ios::binary);
-    if (!ifs.good())
+  const double c = std::cos(theta);
+  const double s = std::sin(theta);
+  const double v = 1.0 - c;
+
+  R[0] = c + kx * kx * v;
+  R[1] = kx * ky * v - kz * s;
+  R[2] = kx * kz * v + ky * s;
+
+  R[3] = ky * kx * v + kz * s;
+  R[4] = c + ky * ky * v;
+  R[5] = ky * kz * v - kx * s;
+
+  R[6] = kz * kx * v - ky * s;
+  R[7] = kz * ky * v + kx * s;
+  R[8] = c + kz * kz * v;
+}
+
+void DepthCamParamBase::matMul3x3(
+    const std::array<double, 9>& A,
+    const std::array<double, 9>& B,
+    std::array<double, 9>& C)
+{
+  std::array<double, 9> T;
+  for (int r = 0; r < 3; ++r)
+  {
+    for (int c = 0; c < 3; ++c)
     {
-      THROW("CameraParamManager: cannot open camera json file: " << m_jsonFileName);
+      T[r * 3 + c] = A[r * 3 + 0] * B[0 * 3 + c]
+                   + A[r * 3 + 1] * B[1 * 3 + c]
+                   + A[r * 3 + 2] * B[2 * 3 + c];
     }
-    std::ostringstream oss;
-    oss << ifs.rdbuf();
-    m_jsonText = oss.str();
+  }
+  C = T;
+}
+
+void DepthCamParamBase::matVecMul3(
+    const std::array<double, 9>& A,
+    const std::array<double, 3>& x,
+    std::array<double, 3>& y)
+{
+  std::array<double, 3> t;
+  t[0] = A[0] * x[0] + A[1] * x[1] + A[2] * x[2];
+  t[1] = A[3] * x[0] + A[4] * x[1] + A[5] * x[2];
+  t[2] = A[6] * x[0] + A[7] * x[1] + A[8] * x[2];
+  y = t;
+}
+
+void DepthCamParamBase::composeLeft(
+    const std::array<double, 9>& RLeft,
+    const std::array<double, 3>& tLeft,
+    std::array<double, 9>& RAcc,
+    std::array<double, 3>& tAcc)
+{
+  // New accumulated transform = TLeft * TAcc.
+  // R = RLeft * RAcc
+  // t = RLeft * tAcc + tLeft
+  std::array<double, 9> RNew;
+  matMul3x3(RLeft, RAcc, RNew);
+
+  std::array<double, 3> Rt;
+  matVecMul3(RLeft, tAcc, Rt);
+
+  std::array<double, 3> tNew{{
+      Rt[0] + tLeft[0],
+      Rt[1] + tLeft[1],
+      Rt[2] + tLeft[2]
+  }};
+
+  RAcc = RNew;
+  tAcc = tNew;
+}
+
+void DepthCamParamBase::inverseRigid(
+    const std::array<double, 9>& R,
+    const std::array<double, 3>& t,
+    std::array<double, 9>& RInv,
+    std::array<double, 3>& tInv)
+{
+  // RInv = R^T.
+  RInv[0] = R[0]; RInv[1] = R[3]; RInv[2] = R[6];
+  RInv[3] = R[1]; RInv[4] = R[4]; RInv[5] = R[7];
+  RInv[6] = R[2]; RInv[7] = R[5]; RInv[8] = R[8];
+
+  std::array<double, 3> Rt;
+  matVecMul3(RInv, t, Rt);
+  tInv[0] = -Rt[0];
+  tInv[1] = -Rt[1];
+  tInv[2] = -Rt[2];
+}
+
+// ============================================================================
+// Encoder JSONL parser
+// ============================================================================
+
+DepthCamParamEncoder::DepthCamParamEncoder(
+    const std::string& jsonlPath,
+    int width,
+    int height,
+    const DepthCamParamConfig& cfg)
+  : DepthCamParamBase(width, height, cfg), m_jsonlPath(jsonlPath)
+{
+  m_fin.open(m_jsonlPath.c_str(), std::ios::in);
+  if (!m_fin.is_open())
+  {
+    setError("failed to open jsonl: " + m_jsonlPath);
+    m_valid = false;
+    return;
   }
 
-  bool foundDepthScale = false;
-  m_depthScale = parseJsonNumber(m_jsonText, { "depthScale", "DepthScale", "depth_scale", "DepthScaleFactor" }, m_depthScale, &foundDepthScale);
-
-  std::string framesArray;
-  std::vector<std::string> entries;
-
-  if (findJsonValue(m_jsonText, { "frames" }, framesArray) && !framesArray.empty() && framesArray[0] == '[')
+  if (!readHeaderFromJsonl())
   {
-    entries = splitTopLevelObjectsFromArray(framesArray);
+    m_valid = false;
+    return;
+  }
+}
+
+DepthCamParamEncoder::~DepthCamParamEncoder()
+{
+  if (m_fin.is_open())
+  {
+    m_fin.close();
+  }
+}
+
+bool DepthCamParamEncoder::load(int poc, DepthCamQResidual& outQ)
+{
+  if (!isValid())
+  {
+    return false;
+  }
+  if (poc < 0)
+  {
+    setError("negative POC is not allowed");
+    return false;
+  }
+
+  if (poc == 0)
+  {
+    DepthCamQResidual q0;
+    q0.q = {{0, 0, 0, 0, 0, 0}};
+    q0.clipped = false;
+    if (!setAndStore(0, q0))
+    {
+      return false;
+    }
+    outQ = q0;
+    return true;
+  }
+
+  JsonFrame jf;
+  while (readNextFrame(jf))
+  {
+    if (jf.poc < poc)
+    {
+      // Allows optional poc=0 or skipped old frame lines in JSONL.
+      continue;
+    }
+
+    if (jf.poc > poc)
+    {
+      std::ostringstream oss;
+      oss << "jsonl frame POC jumped beyond requested POC. requested=" << poc
+          << ", found=" << jf.poc;
+      setError(oss.str());
+      return false;
+    }
+
+    DepthCamParam6 gt;
+    gt.v[0] = jf.rvec[0];
+    gt.v[1] = jf.rvec[1];
+    gt.v[2] = jf.rvec[2];
+    gt.v[3] = jf.tvec[0] / getHeader().depthScale;
+    gt.v[4] = jf.tvec[1] / getHeader().depthScale;
+    gt.v[5] = jf.tvec[2] / getHeader().depthScale;
+
+    return encodeAndStore(poc, gt, outQ);
+  }
+
+  std::ostringstream oss;
+  oss << "failed to find POC " << poc << " in jsonl";
+  setError(oss.str());
+  return false;
+}
+
+bool DepthCamParamEncoder::readHeaderFromJsonl()
+{
+  std::string line;
+  while (std::getline(m_fin, line))
+  {
+    if (isBlankLine(line))
+    {
+      continue;
+    }
+
+    double depthScale = 1.0;
+    DepthCamIntrinsic intr;
+    if (parseHeaderLine(line, depthScale, intr))
+    {
+      return initHeaderFromIntrinsic(depthScale, intr);
+    }
+  }
+
+  setError("header line not found in jsonl");
+  return false;
+}
+
+bool DepthCamParamEncoder::readNextFrame(JsonFrame& frame)
+{
+  std::string line;
+  while (std::getline(m_fin, line))
+  {
+    if (isBlankLine(line))
+    {
+      continue;
+    }
+
+    JsonFrame tmp;
+    if (parseFrameLine(line, tmp))
+    {
+      frame = tmp;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool DepthCamParamEncoder::parseHeaderLine(const std::string& line, double& depthScale, DepthCamIntrinsic& intr)
+{
+  std::string type;
+  if (!parseStringAfterKey(line, "type", type))
+  {
+    return false;
+  }
+
+  if (type != "header" && type != "intrinsic")
+  {
+    return false;
+  }
+
+  if (!parseDoubleAfterKey(line, "depth_scale", depthScale))
+  {
+    return false;
+  }
+  if (!parseDoubleAfterKey(line, "fx", intr.fx))
+  {
+    return false;
+  }
+  if (!parseDoubleAfterKey(line, "fy", intr.fy))
+  {
+    return false;
+  }
+  if (!parseDoubleAfterKey(line, "cx", intr.cx))
+  {
+    return false;
+  }
+  if (!parseDoubleAfterKey(line, "cy", intr.cy))
+  {
+    return false;
+  }
+
+  // Optional. Same default as the Python prototype.
+  double zSign = -1.0;
+  if (parseDoubleAfterKey(line, "z_sign", zSign))
+  {
+    intr.zSign = (zSign >= 0.0) ? 1.0 : -1.0;
   }
   else
-  {
-    const std::string root = trim(m_jsonText);
-    if (!root.empty() && root[0] == '[')
-    {
-      entries = splitTopLevelObjectsFromArray(root);
-    }
-    else if (hasCameraMatrices(root))
-    {
-      entries.push_back(root);
-    }
-    else
-    {
-      for (const auto &kv : splitTopLevelMembers(root))
-      {
-        const std::string value = trim(kv.second);
-        if (!value.empty() && value[0] == '{' && hasCameraMatrices(value))
-        {
-          entries.push_back(value);
-        }
-      }
-    }
-  }
-
-  if (entries.empty())
-  {
-    THROW("CameraParamManager: no camera frame entries found in json: " << m_jsonFileName);
-  }
-
-  for (int i = 0; i < (int)entries.size(); i++)
-  {
-    const int poc = parsePocFromFrameText(entries[i], i);
-    m_jsonFrameTextByPoc[poc] = entries[i];
-    if (m_jsonFrameTextByPoc.find(i) == m_jsonFrameTextByPoc.end())
-    {
-      m_jsonFrameTextByPoc[i] = entries[i];
-    }
-  }
-
-  m_jsonIndexed = true;
-}
-
-CameraFrameParam CameraParamManager::parseFrameParamFromJsonText(int poc, const std::string &frameText) const
-{
-  CameraFrameParam param;
-  param.poc = poc;
-
-  param.depthScale    = m_depthScale;
-  param.nearClipPlane = parseJsonNumber(frameText, { "nearClipPlane", "NearClipPlane" }, 1.0);
-
-  param.invProjectionMatrix = parseMatrix(frameText, { "InvProjectionMatrix", "invProjectionMatrix" }, true);
-
-  bool hasProj = false;
-  std::string projText;
-  hasProj = findJsonValue(frameText, { "ProjectionMatrix", "projectionMatrix" }, projText);
-  if (hasProj)
-  {
-    param.projectionMatrix = parseMatrix(frameText, { "ProjectionMatrix", "projectionMatrix" }, true);
-  }
-  else
-  {
-    param.projectionMatrix.setIdentity();
-  }
-
-  param.worldToCameraMatrix = parseMatrix(frameText, { "WorldToCameraMatrix", "worldToCameraMatrix" }, true);
-  param.cameraToWorldMatrix = parseMatrix(frameText,
-                                          { "CameraToWorldMatrix", "cameraToWorldMatrix", "CameraToWorldMarix", "cameraToWorldMarix" },
-                                          true);
-
-  if (m_width > 0 && m_height > 0)
-  {
-    param.intrinsic = deriveIntrinsic(param.invProjectionMatrix, m_width, m_height);
-  }
-  else
-  {
-    param.intrinsic.valid = false;
-  }
-
-  param.valid = true;
-  return param;
-}
-
-CameraMatrix4x4 CameraParamManager::multiply4x4(const CameraMatrix4x4 &a, const CameraMatrix4x4 &b)
-{
-  CameraMatrix4x4 c;
-  c.m.fill(0.0);
-  for (int r = 0; r < 4; r++)
-  {
-    for (int col = 0; col < 4; col++)
-    {
-      double sum = 0.0;
-      for (int k = 0; k < 4; k++)
-      {
-        sum += a(r, k) * b(k, col);
-      }
-      c(r, col) = sum;
-    }
-  }
-  return c;
-}
-
-CameraMatrix4x4 CameraParamManager::transpose4x4(const CameraMatrix4x4 &a)
-{
-  CameraMatrix4x4 t;
-  for (int r = 0; r < 4; r++)
-  {
-    for (int c = 0; c < 4; c++)
-    {
-      t(r, c) = a(c, r);
-    }
-  }
-  return t;
-}
-
-CameraIntrinsicParam CameraParamManager::deriveIntrinsic(const CameraMatrix4x4 &invProjectionMatrix, int width, int height)
-{
-  CameraIntrinsicParam intr;
-
-  if (width <= 0 || height <= 0)
-  {
-    return intr;
-  }
-
-  constexpr int numX = 32;
-  constexpr int numY = 18;
-
-  double sumRx = 0.0, sumRx2 = 0.0, sumU = 0.0, sumRxU = 0.0;
-  double sumRy = 0.0, sumRy2 = 0.0, sumV = 0.0, sumRyV = 0.0;
-  int    n = 0;
-  std::vector<double> qzList;
-  qzList.reserve(numX * numY);
-
-  for (int iy = 0; iy < numY; iy++)
-  {
-    const double v = (numY == 1) ? 0.0 : (double)iy * (double)(height - 1) / (double)(numY - 1);
-    for (int ix = 0; ix < numX; ix++)
-    {
-      const double u = (numX == 1) ? 0.0 : (double)ix * (double)(width - 1) / (double)(numX - 1);
-
-      const double xNdc = (u + 0.5) / (double)width * 2.0 - 1.0;
-      const double yNdc = 1.0 - (v + 0.5) / (double)height * 2.0;
-
-      const double p[4] = { xNdc, yNdc, 1.0, 1.0 };
-      double q[4] = { 0.0, 0.0, 0.0, 0.0 };
-
-      for (int r = 0; r < 4; r++)
-      {
-        for (int c = 0; c < 4; c++)
-        {
-          q[r] += invProjectionMatrix(r, c) * p[c];
-        }
-      }
-
-      const double qw = std::max(std::abs(q[3]), 1e-8);
-      q[0] /= qw;
-      q[1] /= qw;
-      q[2] /= qw;
-
-      const double zAbs = std::max(std::abs(q[2]), 1e-8);
-      const double rx = q[0] / zAbs;
-      const double ry = q[1] / zAbs;
-
-      sumRx  += rx;
-      sumRx2 += rx * rx;
-      sumU   += u;
-      sumRxU += rx * u;
-
-      sumRy  += ry;
-      sumRy2 += ry * ry;
-      sumV   += v;
-      sumRyV += ry * v;
-
-      qzList.push_back(q[2]);
-      n++;
-    }
-  }
-
-  const double denX = (double)n * sumRx2 - sumRx * sumRx;
-  const double denY = (double)n * sumRy2 - sumRy * sumRy;
-
-  if (std::abs(denX) < 1e-12 || std::abs(denY) < 1e-12)
-  {
-    return intr;
-  }
-
-  intr.fx = ((double)n * sumRxU - sumRx * sumU) / denX;
-  intr.cx = (sumU - intr.fx * sumRx) / (double)n;
-
-  intr.fy = ((double)n * sumRyV - sumRy * sumV) / denY;
-  intr.cy = (sumV - intr.fy * sumRy) / (double)n;
-
-  std::sort(qzList.begin(), qzList.end());
-  const double medianZ = qzList[qzList.size() / 2];
-  intr.zSign = (medianZ >= 0.0) ? 1.0 : -1.0;
-  if (medianZ == 0.0)
   {
     intr.zSign = -1.0;
   }
 
-  intr.valid = true;
-  return intr;
+  return true;
 }
 
-CameraRelativeParam CameraParamManager::deriveRelative(const CameraFrameParam &cur, const CameraFrameParam &ref)
+bool DepthCamParamEncoder::parseFrameLine(const std::string& line, JsonFrame& frame)
 {
-  CameraRelativeParam rel;
-  rel.curPoc = cur.poc;
-  rel.refPoc = ref.poc;
-
-  // X_ref = W2C_ref * C2W_cur * X_cur
-  const CameraMatrix4x4 tCurToRef = multiply4x4(ref.worldToCameraMatrix, cur.cameraToWorldMatrix);
-
-  for (int r = 0; r < 3; r++)
+  if (!parseIntAfterKey(line, "poc", frame.poc))
   {
-    for (int c = 0; c < 3; c++)
-    {
-      rel.r[r * 3 + c] = tCurToRef(r, c);
-    }
-    rel.t[r] = tCurToRef(r, 3);
+    return false;
   }
-
-  rel.intrinsic  = cur.intrinsic;
-  rel.depthScale = cur.depthScale;
-  rel.valid      = cur.valid && ref.valid && cur.intrinsic.valid;
-  return rel;
+  if (!parseArray3AfterKey(line, "rvec", frame.rvec))
+  {
+    return false;
+  }
+  if (!parseArray3AfterKey(line, "tvec", frame.tvec))
+  {
+    return false;
+  }
+  return true;
 }
 
-bool CameraParamManager::hasCameraMatrices(const std::string &text)
+// ============================================================================
+// Decoder
+// ============================================================================
+
+DepthCamParamDecoder::DepthCamParamDecoder(
+    const DepthCamHeader& headerFromBitstream,
+    int width,
+    int height,
+    const DepthCamParamConfig& cfg)
+  : DepthCamParamBase(width, height, cfg)
 {
-  std::string dummy;
-  return findJsonValue(text, { "InvProjectionMatrix", "invProjectionMatrix" }, dummy)
-      && findJsonValue(text, { "WorldToCameraMatrix", "worldToCameraMatrix" }, dummy)
-      && findJsonValue(text, { "CameraToWorldMatrix", "cameraToWorldMatrix", "CameraToWorldMarix", "cameraToWorldMarix" }, dummy);
+  if (!initHeaderFromQuant(headerFromBitstream))
+  {
+    m_valid = false;
+  }
 }
 
-int CameraParamManager::parsePocFromFrameText(const std::string &frameText, int defaultPoc)
+bool DepthCamParamDecoder::set(int poc, const DepthCamQResidual& q)
 {
-  bool found = false;
-  const double poc = parseJsonNumber(frameText, { "frames", "frame", "frameIdx", "frame_idx", "poc", "POC" }, (double)defaultPoc, &found);
-  return found ? (int)std::llround(poc) : defaultPoc;
+  if (poc < 0)
+  {
+    setError("negative POC is not allowed");
+    return false;
+  }
+  return setAndStore(poc, q);
 }
 
-bool CameraParamManager::findJsonValue(const std::string &text, const std::vector<std::string> &keys, std::string &valueText)
-{
-  for (const std::string &key : keys)
-  {
-    const std::string quotedKey = std::string("\"") + key + "\"";
-    const size_t keyPos = text.find(quotedKey);
-    if (keyPos == std::string::npos)
-    {
-      continue;
-    }
-
-    size_t colon = text.find(':', keyPos + quotedKey.size());
-    if (colon == std::string::npos)
-    {
-      continue;
-    }
-
-    size_t pos = colon + 1;
-    while (pos < text.size() && std::isspace((unsigned char)text[pos]))
-    {
-      pos++;
-    }
-    if (pos >= text.size())
-    {
-      continue;
-    }
-
-    size_t end = pos;
-    if (text[pos] == '{' || text[pos] == '[')
-    {
-      const char openCh = text[pos];
-      const char closeCh = (openCh == '{') ? '}' : ']';
-      int depth = 0;
-      bool inString = false;
-      bool escape = false;
-      for (; end < text.size(); end++)
-      {
-        const char ch = text[end];
-        if (inString)
-        {
-          if (escape)
-          {
-            escape = false;
-          }
-          else if (ch == '\\')
-          {
-            escape = true;
-          }
-          else if (ch == '"')
-          {
-            inString = false;
-          }
-          continue;
-        }
-        if (ch == '"')
-        {
-          inString = true;
-          continue;
-        }
-        if (ch == openCh)
-        {
-          depth++;
-        }
-        else if (ch == closeCh)
-        {
-          depth--;
-          if (depth == 0)
-          {
-            end++;
-            break;
-          }
-        }
-      }
-    }
-    else if (text[pos] == '"')
-    {
-      end = pos + 1;
-      bool escape = false;
-      for (; end < text.size(); end++)
-      {
-        const char ch = text[end];
-        if (escape)
-        {
-          escape = false;
-        }
-        else if (ch == '\\')
-        {
-          escape = true;
-        }
-        else if (ch == '"')
-        {
-          end++;
-          break;
-        }
-      }
-    }
-    else
-    {
-      while (end < text.size() && text[end] != ',' && text[end] != '}' && text[end] != ']' && !std::isspace((unsigned char)text[end]))
-      {
-        end++;
-      }
-    }
-
-    valueText = trim(text.substr(pos, end - pos));
-    return true;
-  }
-
-  return false;
-}
-
-double CameraParamManager::parseJsonNumber(const std::string &text, const std::vector<std::string> &keys, double defaultValue, bool *found)
-{
-  std::string valueText;
-  const bool ok = findJsonValue(text, keys, valueText);
-  if (found)
-  {
-    *found = ok;
-  }
-  if (!ok)
-  {
-    return defaultValue;
-  }
-
-  const std::vector<double> numbers = extractNumbers(valueText);
-  if (numbers.empty())
-  {
-    if (found)
-    {
-      *found = false;
-    }
-    return defaultValue;
-  }
-  return numbers[0];
-}
-
-CameraMatrix4x4 CameraParamManager::parseMatrix(const std::string &frameText, const std::vector<std::string> &keys, bool transposeObjectMatrix)
-{
-  std::string valueText;
-  if (!findJsonValue(frameText, keys, valueText))
-  {
-    THROW("CameraParamManager: missing matrix in camera json");
-  }
-
-  CameraMatrix4x4 mat;
-  mat.m.fill(0.0);
-
-  const std::string value = trim(valueText);
-  if (!value.empty() && value[0] == '{')
-  {
-    for (int r = 0; r < 4; r++)
-    {
-      for (int c = 0; c < 4; c++)
-      {
-        const std::string e = std::string("e") + char('0' + r) + char('0' + c);
-        bool found = false;
-        mat(r, c) = parseJsonNumber(value, { e }, 0.0, &found);
-        if (!found)
-        {
-          THROW("CameraParamManager: missing matrix element " << e);
-        }
-      }
-    }
-    return transposeObjectMatrix ? transpose4x4(mat) : mat;
-  }
-
-  std::vector<double> nums = extractNumbers(value);
-  if (nums.size() != 16)
-  {
-    THROW("CameraParamManager: matrix array must have 16 numbers, got " << nums.size());
-  }
-
-  for (int i = 0; i < 16; i++)
-  {
-    mat.m[i] = nums[i];
-  }
-  return mat;
-}
-
-std::vector<std::string> CameraParamManager::splitTopLevelObjectsFromArray(const std::string &arrayText)
-{
-  std::vector<std::string> out;
-  const std::string s = trim(arrayText);
-  if (s.empty())
-  {
-    return out;
-  }
-
-  bool inString = false;
-  bool escape = false;
-  int depth = 0;
-  size_t objStart = std::string::npos;
-
-  for (size_t i = 0; i < s.size(); i++)
-  {
-    const char ch = s[i];
-    if (inString)
-    {
-      if (escape)
-      {
-        escape = false;
-      }
-      else if (ch == '\\')
-      {
-        escape = true;
-      }
-      else if (ch == '"')
-      {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (ch == '"')
-    {
-      inString = true;
-      continue;
-    }
-    if (ch == '{')
-    {
-      if (depth == 0)
-      {
-        objStart = i;
-      }
-      depth++;
-    }
-    else if (ch == '}')
-    {
-      depth--;
-      if (depth == 0 && objStart != std::string::npos)
-      {
-        out.push_back(s.substr(objStart, i - objStart + 1));
-        objStart = std::string::npos;
-      }
-    }
-  }
-
-  return out;
-}
-
-std::vector<std::pair<std::string, std::string>> CameraParamManager::splitTopLevelMembers(const std::string &objectText)
-{
-  std::vector<std::pair<std::string, std::string>> members;
-  const std::string s = trim(objectText);
-  if (s.size() < 2 || s.front() != '{' || s.back() != '}')
-  {
-    return members;
-  }
-
-  size_t pos = 1;
-  while (pos + 1 < s.size())
-  {
-    while (pos < s.size() && (std::isspace((unsigned char)s[pos]) || s[pos] == ','))
-    {
-      pos++;
-    }
-    if (pos >= s.size() || s[pos] == '}')
-    {
-      break;
-    }
-    if (s[pos] != '"')
-    {
-      break;
-    }
-
-    const size_t keyStart = pos + 1;
-    size_t keyEnd = keyStart;
-    while (keyEnd < s.size() && s[keyEnd] != '"')
-    {
-      keyEnd++;
-    }
-    if (keyEnd >= s.size())
-    {
-      break;
-    }
-    const std::string key = s.substr(keyStart, keyEnd - keyStart);
-
-    size_t colon = s.find(':', keyEnd + 1);
-    if (colon == std::string::npos)
-    {
-      break;
-    }
-    pos = colon + 1;
-    while (pos < s.size() && std::isspace((unsigned char)s[pos]))
-    {
-      pos++;
-    }
-
-    const size_t valueStart = pos;
-    size_t valueEnd = valueStart;
-
-    if (pos < s.size() && (s[pos] == '{' || s[pos] == '['))
-    {
-      const char openCh = s[pos];
-      const char closeCh = (openCh == '{') ? '}' : ']';
-      int depth = 0;
-      bool inString = false;
-      bool escape = false;
-      for (; valueEnd < s.size(); valueEnd++)
-      {
-        const char ch = s[valueEnd];
-        if (inString)
-        {
-          if (escape) escape = false;
-          else if (ch == '\\') escape = true;
-          else if (ch == '"') inString = false;
-          continue;
-        }
-        if (ch == '"')
-        {
-          inString = true;
-          continue;
-        }
-        if (ch == openCh) depth++;
-        else if (ch == closeCh)
-        {
-          depth--;
-          if (depth == 0)
-          {
-            valueEnd++;
-            break;
-          }
-        }
-      }
-    }
-    else
-    {
-      while (valueEnd < s.size() && s[valueEnd] != ',' && s[valueEnd] != '}')
-      {
-        valueEnd++;
-      }
-    }
-
-    members.push_back({ key, trim(s.substr(valueStart, valueEnd - valueStart)) });
-    pos = valueEnd;
-  }
-
-  return members;
-}
-
-std::vector<double> CameraParamManager::extractNumbers(const std::string &text)
-{
-  std::vector<double> nums;
-  const char *begin = text.c_str();
-  char *end = nullptr;
-
-  for (size_t i = 0; i < text.size(); )
-  {
-    const char ch = text[i];
-    const bool possibleStart = (ch == '-') || (ch == '+') || (ch == '.') || std::isdigit((unsigned char)ch);
-    if (!possibleStart)
-    {
-      i++;
-      continue;
-    }
-
-    const double v = std::strtod(begin + i, &end);
-    if (end != begin + i)
-    {
-      nums.push_back(v);
-      i = (size_t)(end - begin);
-    }
-    else
-    {
-      i++;
-    }
-  }
-  return nums;
-}
-
-std::string CameraParamManager::trim(const std::string &s)
-{
-  size_t b = 0;
-  while (b < s.size() && std::isspace((unsigned char)s[b]))
-  {
-    b++;
-  }
-  size_t e = s.size();
-  while (e > b && std::isspace((unsigned char)s[e - 1]))
-  {
-    e--;
-  }
-  return s.substr(b, e - b);
-}
+} // namespace depthcam
