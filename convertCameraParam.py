@@ -361,11 +361,14 @@ def main():
     # intrinsic은 일단 첫 frame 기준으로 1번만 사용
     intr = derive_intrinsic_4(cams[0], w, h)
 
-    with open(out_param, "w", encoding="utf-8") as fp:
-        fp.write(json.dumps({
-            "type": "intrinsic",
-            "intrinsic": intr,
-        }) + "\n")
+depth_scale = get_near(cams[0])
+
+with open(out_param, "w", encoding="utf-8") as fp:
+    fp.write(json.dumps({
+        "type": "header",
+        "depth_scale": depth_scale,
+        "intrinsic": intr,
+    }) + "\n")
 
         for poc in range(max_poc):
             cur_y, cur_u, cur_v = read_yuv420(seq_yuv, poc, w, h, bit_depth)
