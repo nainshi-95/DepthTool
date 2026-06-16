@@ -24,7 +24,7 @@ struct CameraMatrix4x4
 
   CameraMatrix4x4();
 
-  double &operator()(int r, int c) { return m[r * 4 + c]; }
+  double       &operator()(int r, int c)       { return m[r * 4 + c]; }
   const double &operator()(int r, int c) const { return m[r * 4 + c]; }
 
   void setIdentity();
@@ -49,8 +49,9 @@ struct CameraFrameParam
   CameraMatrix4x4 worldToCameraMatrix;
   CameraMatrix4x4 cameraToWorldMatrix;
 
-  double nearClipPlane = 1.0;
-  double depthScale    = 10.0;
+  // Linear depth conversion:
+  //   depthLinear = codedDepthValue * depthScale
+  double depthScale = 10.0;
 
   CameraIntrinsicParam intrinsic;
   bool valid = false;
@@ -81,30 +82,32 @@ public:
   void setMaxStoredParams(int maxStoredParams);
   int  getMaxStoredParams() const { return m_maxStoredParams; }
 
-  // Encoder-side API. The json is indexed once, and each POC is converted lazily.
+  // Encoder-side API.
+  // The JSON file is indexed once, and each POC is converted lazily.
   void setJsonFileName(const std::string &jsonFileName);
   void loadJsonFile(const std::string &jsonFileName);
   bool hasJsonFile() const { return !m_jsonFileName.empty(); }
 
-  // Decoder-side API. The decoder must provide already decoded camera parameters.
+  // Decoder-side API.
+  // Decoder must provide already decoded absolute camera parameters.
   void setFrameParam(const CameraFrameParam &param);
   void setFrameParams(const std::vector<CameraFrameParam> &params);
 
-  // Load one frame camera parameter. Encoder can lazy-load from JSON. Decoder errors if missing.
+  // Load one absolute frame camera parameter.
+  // Encoder can lazy-load from JSON.
+  // Decoder errors if the requested POC does not exist.
   const CameraFrameParam &loadFrameParam(int poc);
   bool hasFrameParam(int poc) const;
 
-  // Convenience API matching the current tool: current POC to previous POC.
-  CameraRelativeParam loadCameraParam(int poc);
-
-  // General form for inter prediction against arbitrary reference POC.
+  // General camera transform for inter prediction.
+  // curPoc -> refPoc.
   CameraRelativeParam loadRelativeParam(int curPoc, int refPoc);
 
   double getDepthScale() const { return m_depthScale; }
   void   setDepthScale(double depthScale) { m_depthScale = depthScale; }
 
   void setFrameSize(int width, int height);
-  int  getWidth() const { return m_width; }
+  int  getWidth()  const { return m_width; }
   int  getHeight() const { return m_height; }
 
 private:
@@ -116,7 +119,7 @@ private:
 
 private:
   int m_maxStoredParams = 10;
-  int m_width = 0;
+  int m_width  = 0;
   int m_height = 0;
 
   double      m_depthScale = 10.0;
@@ -136,15 +139,39 @@ private:
 
   static CameraMatrix4x4 multiply4x4(const CameraMatrix4x4 &a, const CameraMatrix4x4 &b);
   static CameraMatrix4x4 transpose4x4(const CameraMatrix4x4 &a);
-  static CameraIntrinsicParam deriveIntrinsic(const CameraMatrix4x4 &invProjectionMatrix, int width, int height);
-  static CameraRelativeParam deriveRelative(const CameraFrameParam &cur, const CameraFrameParam &ref);
+
+  static CameraIntrinsicParam deriveIntrinsic(
+    const CameraMatrix4x4 &invProjectionMatrix,
+    int width,
+    int height
+  );
+
+  static CameraRelativeParam deriveRelative(
+    const CameraFrameParam &cur,
+    const CameraFrameParam &ref
+  );
 
   static bool hasCameraMatrices(const std::string &text);
   static int  parsePocFromFrameText(const std::string &frameText, int defaultPoc);
 
-  static bool findJsonValue(const std::string &text, const std::vector<std::string> &keys, std::string &valueText);
-  static double parseJsonNumber(const std::string &text, const std::vector<std::string> &keys, double defaultValue, bool *found = nullptr);
-  static CameraMatrix4x4 parseMatrix(const std::string &frameText, const std::vector<std::string> &keys, bool transposeObjectMatrix);
+  static bool findJsonValue(
+    const std::string &text,
+    const std::vector<std::string> &keys,
+    std::string &valueText
+  );
+
+  static double parseJsonNumber(
+    const std::string &text,
+    const std::vector<std::string> &keys,
+    double defaultValue,
+    bool *found = nullptr
+  );
+
+  static CameraMatrix4x4 parseMatrix(
+    const std::string &frameText,
+    const std::vector<std::string> &keys,
+    bool transposeObjectMatrix
+  );
 
   static std::vector<std::string> splitTopLevelObjectsFromArray(const std::string &arrayText);
   static std::vector<std::pair<std::string, std::string>> splitTopLevelMembers(const std::string &objectText);
