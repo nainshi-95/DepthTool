@@ -90,9 +90,20 @@ def quant_u(value, lo, hi, bits):
     return q, dec, clipped
 
 
+def signed_q_abs_max(bits):
+    """
+    bits=8이면 signed residual range는 [-127, 127].
+    2's complement의 [-128, 127]이 아니라 symmetric range를 사용.
+    """
+    if bits < 2:
+        raise ValueError("ext-bits must be >= 2")
+    return (1 << (bits - 1)) - 1
+
+
 def quant_s(value, step, bits):
-    qmin = -((1 << (bits - 1)) - 1)
-    qmax =  ((1 << (bits - 1)) - 1)
+    q_abs_max = signed_q_abs_max(bits)
+    qmin = -q_abs_max
+    qmax =  q_abs_max
 
     q = np.round(value / step)
     clipped = (q < qmin) | (q > qmax)
@@ -105,6 +116,7 @@ def quant_s(value, step, bits):
 
 def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
     """
+    intrinsic은 고정 16bit 양자화.
     fx, fy는 각각 width/height로 normalize 후 [0, f_max]에서 uint16.
     cx, cy는 각각 width/height로 normalize 후 [c_min, c_max]에서 uint16.
     """
@@ -149,6 +161,75 @@ def rt_from_param6(p, depth_scale):
         "rvec": p[:3].astype(float).tolist(),
         "tvec": (p[3:] * depth_scale).astype(float).tolist(),
     }
+
+
+# ============================================================
+# Signed truncated Exp-Golomb bit count
+# ============================================================
+
+def signed_to_code_num(x):
+    """
+    signed Exp-Golomb mapping:
+       0 -> 0
+      +1 -> 1
+      -1 -> 2
+      +2 -> 3
+      -2 -> 4
+      ...
+    """
+    x = int(x)
+    if x == 0:
+        return 0
+    if x > 0:
+        return 2 * x - 1
+    return -2 * x
+
+
+def ue_exp_golomb_bits(code_num):
+    """
+    unsigned Exp-Golomb code length.
+    code_num=0 -> 1 bit
+    code_num=1,2 -> 3 bits
+    code_num=3~6 -> 5 bits
+    """
+    code_num = int(code_num)
+    if code_num < 0:
+        raise ValueError("code_num must be non-negative")
+
+    k = (code_num + 1).bit_length() - 1
+    return 2 * k + 1
+
+
+def signed_truncated_exp_golomb_bits(x, q_abs_max):
+    """
+    signed residual x in [-q_abs_max, q_abs_max]의 bit 수 계산.
+    truncated range 밖이면 error.
+    """
+    x = int(x)
+
+    if x < -q_abs_max or x > q_abs_max:
+        raise ValueError(
+            f"x={x} outside signed truncated range "
+            f"[-{q_abs_max}, {q_abs_max}]"
+        )
+
+    code_num = signed_to_code_num(x)
+    max_code_num = 2 * q_abs_max
+
+    if code_num > max_code_num:
+        raise ValueError(
+            f"code_num={code_num} outside truncated range [0, {max_code_num}]"
+        )
+
+    return ue_exp_golomb_bits(code_num)
+
+
+def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
+    bits_each = [
+        signed_truncated_exp_golomb_bits(int(v), q_abs_max)
+        for v in q_residual
+    ]
+    return bits_each, int(sum(bits_each))
 
 
 # ============================================================
@@ -350,6 +431,23 @@ def main():
 
     decoded_hist = []
 
+    # ------------------------------------------------------------
+    # Bit count constants
+    # ------------------------------------------------------------
+    q_abs_max = signed_q_abs_max(args.ext_bits)
+
+    intrinsic_bits = 4 * 16
+    depth_scale_bits = 4
+    z_sign_bits = 1
+    header_bits = intrinsic_bits + depth_scale_bits + z_sign_bits
+
+    total_ext_bits = 0
+    total_ext_bits_r = 0
+    total_ext_bits_t = 0
+    total_ext_bits_each = np.zeros(6, dtype=np.int64)
+    total_coded_frames = 0
+    total_clipped_frames = 0
+
     with open(out_q_jsonl, "w", encoding="utf-8") as fq:
         fq.write(json.dumps({
             "type": "header",
@@ -359,10 +457,19 @@ def main():
             "intrinsic_gt": intr_gt,
             "intrinsic_clipped": intr_clip,
             "extrinsic_bits": args.ext_bits,
+            "extrinsic_q_abs_max": q_abs_max,
+            "extrinsic_q_range": [-q_abs_max, q_abs_max],
             "r_step": args.r_step,
             "t_step_norm": args.t_step_norm,
             "pred_n": args.pred_n,
             "pred_degree": args.pred_degree,
+            "bit_count": {
+                "intrinsic_bits": intrinsic_bits,
+                "depth_scale_bits": depth_scale_bits,
+                "z_sign_bits": z_sign_bits,
+                "header_bits": header_bits,
+                "extrinsic_code": "signed_truncated_exp_golomb",
+            },
             "param6_order": [
                 "rx",
                 "ry",
@@ -385,6 +492,8 @@ def main():
                 fq.write(json.dumps({
                     "poc": 0,
                     "q_residual": [0, 0, 0, 0, 0, 0],
+                    "q_residual_bits": [0, 0, 0, 0, 0, 0],
+                    "q_residual_total_bits": 0,
                     "param6_dec": p0_dec.astype(float).tolist(),
                     "mae_y": 0.0,
                 }) + "\n")
@@ -416,6 +525,19 @@ def main():
                 step=args.t_step_norm,
                 bits=args.ext_bits,
             )
+
+            q_residual = np.concatenate([q_r, q_t]).astype(np.int32)
+
+            q_bits_each, q_bits_total = q_residual_bits_signed_trunc_exp_golomb(
+                q_residual,
+                q_abs_max=q_abs_max,
+            )
+
+            total_ext_bits += q_bits_total
+            total_ext_bits_r += sum(q_bits_each[:3])
+            total_ext_bits_t += sum(q_bits_each[3:])
+            total_ext_bits_each += np.array(q_bits_each, dtype=np.int64)
+            total_coded_frames += 1
 
             p_dec = p_pred.copy()
             p_dec[:3] += d_r
@@ -456,10 +578,14 @@ def main():
             )))
 
             clipped = bool(np.any(clip_r) or np.any(clip_t))
+            if clipped:
+                total_clipped_frames += 1
 
             fq.write(json.dumps({
                 "poc": poc,
-                "q_residual": np.concatenate([q_r, q_t]).astype(int).tolist(),
+                "q_residual": q_residual.astype(int).tolist(),
+                "q_residual_bits": q_bits_each,
+                "q_residual_total_bits": q_bits_total,
                 "param6_pred": p_pred.astype(float).tolist(),
                 "param6_dec": p_dec.astype(float).tolist(),
                 "param6_gt": p_gt.astype(float).tolist(),
@@ -469,9 +595,50 @@ def main():
 
             print(
                 f"[{poc:04d}/{max_poc - 1:04d}] "
-                f"Y-MAE={mae_y:.3f}, clipped={clipped}"
+                f"Y-MAE={mae_y:.3f}, clipped={clipped}, "
+                f"param_bits={q_bits_total}, "
+                f"bits_each={q_bits_each}"
             )
 
+    total_bits = header_bits + total_ext_bits
+
+    print("============================================================")
+    print("Bit summary")
+    print("============================================================")
+    print(f"intrinsic bits        : {intrinsic_bits} bits")
+    print(f"  fx, fy, cx, cy      : 16 bits each")
+    print(f"depth_scale bits      : {depth_scale_bits} bits")
+    print(f"z_sign bits           : {z_sign_bits} bits")
+    print(f"header bits           : {header_bits} bits")
+    print("------------------------------------------------------------")
+    print(f"extrinsic code        : signed truncated Exp-Golomb")
+    print(f"extrinsic q range     : [-{q_abs_max}, {q_abs_max}]")
+    print(f"coded frames          : {total_coded_frames}")
+    print(f"clipped frames        : {total_clipped_frames}")
+    print(f"extrinsic total bits  : {total_ext_bits} bits")
+
+    if total_coded_frames > 0:
+        avg_ext_bits = total_ext_bits / total_coded_frames
+        avg_r_bits = total_ext_bits_r / total_coded_frames
+        avg_t_bits = total_ext_bits_t / total_coded_frames
+        avg_bits_each = total_ext_bits_each.astype(np.float64) / total_coded_frames
+
+        print(f"avg ext bits/frame    : {avg_ext_bits:.3f}")
+        print(f"avg rotation bits     : {avg_r_bits:.3f} / frame")
+        print(f"avg translation bits  : {avg_t_bits:.3f} / frame")
+        print(
+            "avg bits each         : "
+            f"rx={avg_bits_each[0]:.3f}, "
+            f"ry={avg_bits_each[1]:.3f}, "
+            f"rz={avg_bits_each[2]:.3f}, "
+            f"tx={avg_bits_each[3]:.3f}, "
+            f"ty={avg_bits_each[4]:.3f}, "
+            f"tz={avg_bits_each[5]:.3f}"
+        )
+
+    print("------------------------------------------------------------")
+    print(f"total bits            : {total_bits} bits")
+    print("============================================================")
     print("Done.")
     print(f"warped yuv : {out_yuv}")
     print(f"q jsonl    : {out_q_jsonl}")
