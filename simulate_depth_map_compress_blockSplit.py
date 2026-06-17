@@ -58,8 +58,6 @@ class CSNode:
     sse: float = 0.0
     cost: float = 0.0
     split_bits: float = 0.0
-
-    # True only when qt_split_flag was actually coded at this node.
     qt_flag_present: bool = False
 
     def is_leaf(self):
@@ -307,6 +305,15 @@ def adaptive_signed_residual_update(q, model, abs_max):
 
 
 def create_adaptive_models(args):
+    cand_symbols = [
+        "temporal",
+        "left",
+        "top",
+        "top_left",
+        "top_right",
+        "avg_left_top",
+    ]
+
     models = {
         "mode": AdaptiveProbTable(
             ["direct", "copy", "delta"],
@@ -316,7 +323,7 @@ def create_adaptive_models(args):
             name="mode",
         ),
         "candidate": AdaptiveProbTable(
-            ["left", "top", "top_left", "top_right", "avg_left_top"],
+            cand_symbols,
             update_rate=args.prob_lr,
             p_min=args.prob_min,
             p_max=args.prob_max,
@@ -459,9 +466,28 @@ def top_right(store, x, y, w):
     return None
 
 
-def make_candidates(store, x, y, w, h, cx, cy, max_cands):
+def temporal_center(prev_store, cx, cy):
+    if not prev_store:
+        return None
+
+    for r in prev_store:
+        if r.x <= cx < r.x + r.w and r.y <= cy < r.y + r.h:
+            return r
+
+    return None
+
+
+def make_candidates(store, prev_store, x, y, w, h, cx, cy, max_cands, use_temporal):
     cand = []
     conv = {}
+
+    if use_temporal:
+        r = temporal_center(prev_store, cx, cy)
+
+        if r is not None:
+            p = plane_to_center(r.plane, cx, cy)
+            conv["temporal"] = p
+            cand.append(("temporal", p))
 
     items = [
         ("left", best_left(store, x, y, w, h)),
@@ -636,7 +662,7 @@ def eval_delta(block, actual, cands, xx, yy, args, adaptive, avail_modes, avail_
     return out
 
 
-def eval_leaf(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
+def eval_leaf(padded, x, y, w, h, depth, parent, args, grid, store, prev_store, adaptive):
     block = padded[y : y + h, x : x + w]
 
     cx = x + (w - 1) / 2.0
@@ -645,7 +671,19 @@ def eval_leaf(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
     xx, yy, pinv = grid.get(w, h)
     actual = fit_plane(block, pinv, cx, cy)
 
-    cands = make_candidates(store, x, y, w, h, cx, cy, args.max_candidates)
+    cands = make_candidates(
+        store=store,
+        prev_store=prev_store,
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        cx=cx,
+        cy=cy,
+        max_cands=args.max_candidates,
+        use_temporal=args.temporal_candidate,
+    )
+
     avail_cands = [n for n, _ in cands]
     avail_modes = ["direct", "copy", "delta"] if cands else ["direct"]
 
@@ -708,7 +746,7 @@ def parent_node(x, y, w, h, depth, parent, split, split_bits, children, args, qt
     return n
 
 
-def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
+def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, prev_store, adaptive):
     qt_ok = (
         depth < args.max_qt_depth
         and w >= 2
@@ -724,9 +762,22 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
     cand = []
 
     # no split
-    leaf = eval_leaf(padded, x, y, w, h, depth, parent, args, grid, store, adaptive)
-    leaf.qt_flag_present = qt_ok
+    leaf = eval_leaf(
+        padded,
+        x,
+        y,
+        w,
+        h,
+        depth,
+        parent,
+        args,
+        grid,
+        store,
+        prev_store,
+        adaptive,
+    )
 
+    leaf.qt_flag_present = qt_ok
     leaf.split_bits = 0.0
 
     if qt_ok:
@@ -744,7 +795,20 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
         st = list(store)
         h0 = h // 2
 
-        c0 = eval_leaf(padded, x, y, w, h0, depth + 1, None, args, grid, st, adaptive)
+        c0 = eval_leaf(
+            padded,
+            x,
+            y,
+            w,
+            h0,
+            depth + 1,
+            None,
+            args,
+            grid,
+            st,
+            prev_store,
+            adaptive,
+        )
         add_leaves_to_store(c0, st)
 
         c1 = eval_leaf(
@@ -758,6 +822,7 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
             args,
             grid,
             st,
+            prev_store,
             adaptive,
         )
 
@@ -790,7 +855,20 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
         st = list(store)
         w0 = w // 2
 
-        c0 = eval_leaf(padded, x, y, w0, h, depth + 1, None, args, grid, st, adaptive)
+        c0 = eval_leaf(
+            padded,
+            x,
+            y,
+            w0,
+            h,
+            depth + 1,
+            None,
+            args,
+            grid,
+            st,
+            prev_store,
+            adaptive,
+        )
         add_leaves_to_store(c0, st)
 
         c1 = eval_leaf(
@@ -804,6 +882,7 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
             args,
             grid,
             st,
+            prev_store,
             adaptive,
         )
 
@@ -858,6 +937,7 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
                 args,
                 grid,
                 st,
+                prev_store,
                 adaptive,
             )
 
@@ -889,7 +969,6 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
 
 
 def commit_node(node, store, adaptive, writer, frame_idx):
-    # Update qt_split_flag only for nodes where that flag was really coded.
     qt_split_flag_update(adaptive, node)
 
     if not node.is_leaf():
@@ -1021,12 +1100,13 @@ def compute_metrics(orig, recon, maxv):
     }
 
 
-def simulate_one_frame(depth, frame_idx, args, grid, writer=None, adaptive=None):
+def simulate_one_frame(depth, frame_idx, args, grid, prev_store=None, writer=None, adaptive=None):
     h, w = depth.shape
     padded, hp, wp = pad_to_block_multiple(depth, args.block_size)
 
     recon = np.zeros_like(padded, dtype=np.float64)
     store = []
+    prev_store = prev_store or []
 
     root_count = 0
     total_bits = 0.0
@@ -1060,6 +1140,7 @@ def simulate_one_frame(depth, frame_idx, args, grid, writer=None, adaptive=None)
                 args,
                 grid,
                 store,
+                prev_store,
                 adaptive,
             )
 
@@ -1129,7 +1210,7 @@ def simulate_one_frame(depth, frame_idx, args, grid, writer=None, adaptive=None)
                     adaptive[f"delta_res_abs_{k}"].snapshot(f"final_delta_abs_{k}")
                 )
 
-    return rec, summary
+    return rec, summary, store
 
 
 def read_yuv420p10le_y_frame(fp, idx, w, h):
@@ -1177,6 +1258,8 @@ def parse_args():
 
     p.add_argument("--mode-bits", type=int, default=2)
     p.add_argument("--max-value", type=int, default=1023)
+
+    p.add_argument("--temporal-candidate", action="store_true")
 
     p.add_argument("--adaptive-prob", action="store_true")
     p.add_argument("--copy-candidate-unary", action="store_true")
@@ -1249,6 +1332,8 @@ def main():
     )
 
     summaries = []
+    prev_store = None
+
     recon_fp = open(args.out_recon_yuv, "wb") if args.out_recon_yuv else None
 
     block_fp = None
@@ -1295,7 +1380,17 @@ def main():
 
                 depth = read_yuv420p10le_y_frame(fp, fi, args.width, args.height)
 
-                rec, sm = simulate_one_frame(depth, fi, args, grid, writer, adaptive)
+                rec, sm, cur_store = simulate_one_frame(
+                    depth,
+                    fi,
+                    args,
+                    grid,
+                    prev_store=prev_store,
+                    writer=writer,
+                    adaptive=adaptive,
+                )
+
+                prev_store = cur_store
                 summaries.append(sm)
 
                 if recon_fp:
