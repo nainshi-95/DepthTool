@@ -33,6 +33,178 @@ class ModeResult:
     q_values: Tuple[int, ...]
 
 
+class AdaptiveProbTable:
+    """
+    Simple CABAC-like adaptive probability model.
+
+    - bit estimate: -log2(P(symbol))
+    - after selected symbol:
+        selected probability increases
+        other probabilities decrease
+    - probabilities are clamped by p_min / p_max
+    """
+
+    def __init__(
+        self,
+        symbols,
+        init_probs=None,
+        update_rate=0.05,
+        p_min=0.02,
+        p_max=0.95,
+        name="",
+    ):
+        self.symbols = list(symbols)
+        self.n = len(self.symbols)
+        self.update_rate = float(update_rate)
+        self.p_min = float(p_min)
+        self.p_max = float(p_max)
+        self.name = name
+
+        if self.n <= 0:
+            raise ValueError("AdaptiveProbTable needs at least one symbol")
+
+        if self.p_min * self.n > 1.0:
+            raise ValueError(
+                f"{name}: p_min too large. p_min * num_symbols = {self.p_min * self.n}"
+            )
+
+        if self.p_max * self.n < 1.0:
+            raise ValueError(
+                f"{name}: p_max too small. p_max * num_symbols = {self.p_max * self.n}"
+            )
+
+        if init_probs is None:
+            p0 = 1.0 / self.n
+            self.probs = {s: p0 for s in self.symbols}
+        else:
+            total = sum(float(init_probs.get(s, 0.0)) for s in self.symbols)
+            if total <= 0:
+                raise ValueError("init_probs sum must be positive")
+            self.probs = {
+                s: float(init_probs.get(s, 0.0)) / total for s in self.symbols
+            }
+
+        self._project_to_bounds()
+
+    def prob(self, symbol):
+        if symbol not in self.probs:
+            raise KeyError(f"Unknown symbol '{symbol}' in model '{self.name}'")
+        return self.probs[symbol]
+
+    def bits(self, symbol, available_symbols=None):
+        """
+        If available_symbols is given, probabilities are normalized only over
+        currently available symbols.
+
+        Example:
+          candidate list only has [left], then candidate bits = 0.
+        """
+        if symbol not in self.probs:
+            raise KeyError(f"Unknown symbol '{symbol}' in model '{self.name}'")
+
+        if available_symbols is None:
+            p = self.prob(symbol)
+            return -math.log2(max(p, 1e-12))
+
+        available = [s for s in available_symbols if s in self.probs]
+
+        if symbol not in available:
+            raise KeyError(
+                f"Symbol '{symbol}' is not in available symbols for model '{self.name}'"
+            )
+
+        if len(available) <= 1:
+            return 0.0
+
+        norm = sum(self.probs[s] for s in available)
+        if norm <= 0:
+            return math.log2(len(available))
+
+        p = self.probs[symbol] / norm
+        return -math.log2(max(p, 1e-12))
+
+    def update(self, selected):
+        if selected not in self.probs:
+            raise KeyError(f"Unknown selected symbol '{selected}' in model '{self.name}'")
+
+        feasible_selected_max = min(
+            self.p_max,
+            1.0 - (self.n - 1) * self.p_min,
+        )
+
+        target = {}
+        target[selected] = feasible_selected_max
+
+        other_symbols = [s for s in self.symbols if s != selected]
+        remain = 1.0 - feasible_selected_max
+
+        if other_symbols:
+            other_p = remain / len(other_symbols)
+            for s in other_symbols:
+                target[s] = other_p
+
+        lr = self.update_rate
+
+        for s in self.symbols:
+            self.probs[s] = (1.0 - lr) * self.probs[s] + lr * target[s]
+
+        self._project_to_bounds()
+
+    def _project_to_bounds(self):
+        for s in self.symbols:
+            self.probs[s] = min(max(self.probs[s], self.p_min), self.p_max)
+
+        for _ in range(64):
+            total = sum(self.probs.values())
+            diff = 1.0 - total
+
+            if abs(diff) < 1e-12:
+                break
+
+            if diff > 0:
+                adjustable = [
+                    s for s in self.symbols if self.probs[s] < self.p_max - 1e-12
+                ]
+            else:
+                adjustable = [
+                    s for s in self.symbols if self.probs[s] > self.p_min + 1e-12
+                ]
+
+            if not adjustable:
+                break
+
+            add = diff / len(adjustable)
+
+            for s in adjustable:
+                self.probs[s] = min(max(self.probs[s] + add, self.p_min), self.p_max)
+
+    def snapshot(self, prefix):
+        return {f"{prefix}_{s}_prob": self.probs[s] for s in self.symbols}
+
+
+def create_adaptive_models(args):
+    mode_model = AdaptiveProbTable(
+        symbols=["direct", "copy", "delta"],
+        update_rate=args.prob_lr,
+        p_min=args.prob_min,
+        p_max=args.prob_max,
+        name="mode",
+    )
+
+    candidate_model = AdaptiveProbTable(
+        symbols=["left", "top", "top_left", "top_right", "avg_left_top"],
+        update_rate=args.prob_lr,
+        p_min=args.prob_min,
+        p_max=args.prob_max,
+        name="candidate",
+    )
+
+    return {
+        "mode": mode_model,
+        "candidate": candidate_model,
+    }
+
+
 def ceil_log2(x: int) -> int:
     if x <= 1:
         return 0
@@ -79,11 +251,6 @@ def dequantize(q: int, qstep: float) -> float:
 
 
 def make_plane_grids(block_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Local coordinates centered at block center.
-    For block_size=16:
-      x, y = -7.5 ... +7.5
-    """
     coords = np.arange(block_size, dtype=np.float64) - (block_size - 1) / 2.0
     xx, yy = np.meshgrid(coords, coords)
     design = np.stack(
@@ -95,23 +262,12 @@ def make_plane_grids(block_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarra
 
 
 def fit_plane(block: np.ndarray, pinv: np.ndarray, cx: float, cy: float) -> Plane:
-    """
-    Least squares fitting:
-      depth(x,y) ~= a*x + b*y + c
-    """
     coeff = pinv @ block.astype(np.float64).reshape(-1)
     a, b, c = coeff.tolist()
     return Plane(a=a, b=b, c=c, cx=cx, cy=cy)
 
 
 def plane_to_current_center(src: Plane, cur_cx: float, cur_cy: float) -> Plane:
-    """
-    Convert neighboring plane to current block center.
-
-    src.c is depth at src center.
-    Current center c is:
-      c_cur = src.c + src.a * (cur_cx - src.cx) + src.b * (cur_cy - src.cy)
-    """
     dcx = cur_cx - src.cx
     dcy = cur_cy - src.cy
     c_cur = src.c + src.a * dcx + src.b * dcy
@@ -141,17 +297,6 @@ def read_yuv420p10le_y_frame(
     width: int,
     height: int,
 ) -> np.ndarray:
-    """
-    Read only Y plane from yuv420p10le.
-
-    Assumption:
-      Y: width * height uint16 little-endian samples
-      U: width/2 * height/2 uint16
-      V: width/2 * height/2 uint16
-
-    Total frame size:
-      width * height * 3 bytes
-    """
     y_samples = width * height
     y_bytes = y_samples * 2
     frame_size = width * height * 3
@@ -216,14 +361,6 @@ def make_candidates(
     cur_cx: float,
     cur_cy: float,
 ) -> List[Tuple[str, Plane]]:
-    """
-    Raster-scan available neighbors:
-      left
-      top
-      top-left
-      top-right
-      avg(left, top)
-    """
     candidates: List[Tuple[str, Plane]] = []
 
     neighbor_keys = [
@@ -267,6 +404,8 @@ def eval_direct_mode(
     lambda_rd: float,
     mode_bits: int,
     max_value: int,
+    adaptive_models=None,
+    available_modes=None,
 ) -> ModeResult:
     qa = quantize(actual.a, qa_step)
     qb = quantize(actual.b, qb_step)
@@ -283,7 +422,11 @@ def eval_direct_mode(
     recon_block = render_plane_block(recon_plane, xx, yy, max_value)
     sse = block_sse(orig_block, recon_block)
 
-    bits = float(mode_bits)
+    if adaptive_models is not None:
+        bits = adaptive_models["mode"].bits("direct", available_modes)
+    else:
+        bits = float(mode_bits)
+
     bits += exp_golomb_len_signed(qa)
     bits += exp_golomb_len_signed(qb)
 
@@ -314,6 +457,9 @@ def eval_copy_modes(
     lambda_rd: float,
     mode_bits: int,
     max_value: int,
+    adaptive_models=None,
+    available_modes=None,
+    available_candidate_names=None,
 ) -> List[ModeResult]:
     results: List[ModeResult] = []
 
@@ -326,7 +472,12 @@ def eval_copy_modes(
         recon_block = render_plane_block(cand_plane, xx, yy, max_value)
         sse = block_sse(orig_block, recon_block)
 
-        bits = float(mode_bits + cand_bits)
+        if adaptive_models is not None:
+            bits = adaptive_models["mode"].bits("copy", available_modes)
+            bits += adaptive_models["candidate"].bits(cand_name, available_candidate_names)
+        else:
+            bits = float(mode_bits + cand_bits)
+
         cost = sse + lambda_rd * bits
 
         results.append(
@@ -357,6 +508,9 @@ def eval_delta_modes(
     lambda_rd: float,
     mode_bits: int,
     max_value: int,
+    adaptive_models=None,
+    available_modes=None,
+    available_candidate_names=None,
 ) -> List[ModeResult]:
     results: List[ModeResult] = []
 
@@ -385,7 +539,12 @@ def eval_delta_modes(
         recon_block = render_plane_block(recon_plane, xx, yy, max_value)
         sse = block_sse(orig_block, recon_block)
 
-        bits = float(mode_bits + cand_bits)
+        if adaptive_models is not None:
+            bits = adaptive_models["mode"].bits("delta", available_modes)
+            bits += adaptive_models["candidate"].bits(cand_name, available_candidate_names)
+        else:
+            bits = float(mode_bits + cand_bits)
+
         bits += exp_golomb_len_signed(qda)
         bits += exp_golomb_len_signed(qdb)
         bits += exp_golomb_len_signed(qdc)
@@ -449,6 +608,7 @@ def simulate_one_frame(
     yy: np.ndarray,
     pinv: np.ndarray,
     block_csv_writer: Optional[csv.DictWriter] = None,
+    adaptive_models=None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     h, w = depth.shape
     padded, hp, wp = pad_to_block_multiple(depth, block_size)
@@ -488,6 +648,13 @@ def simulate_one_frame(
                 cur_cy=cur_cy,
             )
 
+            available_candidate_names = [name for name, _ in candidates]
+
+            if candidates:
+                available_modes = ["direct", "copy", "delta"]
+            else:
+                available_modes = ["direct"]
+
             mode_results: List[ModeResult] = []
 
             mode_results.append(
@@ -502,6 +669,8 @@ def simulate_one_frame(
                     lambda_rd=lambda_rd,
                     mode_bits=mode_bits,
                     max_value=max_value,
+                    adaptive_models=adaptive_models,
+                    available_modes=available_modes,
                 )
             )
 
@@ -514,6 +683,9 @@ def simulate_one_frame(
                     lambda_rd=lambda_rd,
                     mode_bits=mode_bits,
                     max_value=max_value,
+                    adaptive_models=adaptive_models,
+                    available_modes=available_modes,
+                    available_candidate_names=available_candidate_names,
                 )
             )
 
@@ -530,10 +702,21 @@ def simulate_one_frame(
                     lambda_rd=lambda_rd,
                     mode_bits=mode_bits,
                     max_value=max_value,
+                    adaptive_models=adaptive_models,
+                    available_modes=available_modes,
+                    available_candidate_names=available_candidate_names,
                 )
             )
 
             best = min(mode_results, key=lambda r: r.cost)
+
+            # Probability update must happen after R-D decision.
+            if adaptive_models is not None:
+                if len(available_modes) > 1:
+                    adaptive_models["mode"].update(best.mode)
+
+                if best.mode in ("copy", "delta") and len(available_candidate_names) > 1:
+                    adaptive_models["candidate"].update(best.candidate_name)
 
             recon_padded[by : by + block_size, bx : bx + block_size] = best.recon_block
             plane_store[(bx, by)] = best.plane
@@ -614,6 +797,10 @@ def simulate_one_frame(
         safe_name = name.replace("-", "_")
         summary[f"candidate_{safe_name}_count"] = count
 
+    if adaptive_models is not None:
+        summary.update(adaptive_models["mode"].snapshot("final_mode"))
+        summary.update(adaptive_models["candidate"].snapshot("final_candidate"))
+
     return recon, summary
 
 
@@ -656,7 +843,7 @@ def parse_args():
         "--mode-bits",
         type=int,
         default=2,
-        help="Simplified mode signaling bits per block",
+        help="Simplified mode signaling bits per block. Ignored for mode when --adaptive-prob is used.",
     )
 
     parser.add_argument(
@@ -664,6 +851,40 @@ def parse_args():
         type=int,
         default=1023,
         help="Max depth sample value. For 10-bit, use 1023.",
+    )
+
+    parser.add_argument(
+        "--adaptive-prob",
+        action="store_true",
+        help="Use adaptive probability table for mode/candidate bit estimation.",
+    )
+
+    parser.add_argument(
+        "--prob-lr",
+        type=float,
+        default=0.05,
+        help="Adaptive probability update rate.",
+    )
+
+    parser.add_argument(
+        "--prob-min",
+        type=float,
+        default=0.02,
+        help="Minimum probability clamp.",
+    )
+
+    parser.add_argument(
+        "--prob-max",
+        type=float,
+        default=0.95,
+        help="Maximum probability clamp.",
+    )
+
+    parser.add_argument(
+        "--prob-reset",
+        choices=["frame", "sequence"],
+        default="frame",
+        help="Reset adaptive probability tables per frame or keep across sequence.",
     )
 
     parser.add_argument(
@@ -705,7 +926,19 @@ def main():
     if args.width % 2 != 0 or args.height % 2 != 0:
         raise ValueError("yuv420p10le requires even width and height")
 
+    if args.prob_lr < 0.0 or args.prob_lr > 1.0:
+        raise ValueError("--prob-lr must be in [0, 1]")
+
+    if args.prob_min < 0.0 or args.prob_max <= 0.0:
+        raise ValueError("--prob-min and --prob-max must be positive")
+
+    if args.prob_min >= args.prob_max:
+        raise ValueError("--prob-min must be smaller than --prob-max")
+
     total_frames = count_yuv420p10le_frames(args.input, args.width, args.height)
+
+    if total_frames <= 0:
+        raise ValueError("No complete yuv420p10le frames found")
 
     if args.start_frame < 0 or args.start_frame >= total_frames:
         raise ValueError(
@@ -720,6 +953,10 @@ def main():
     xx, yy, pinv = make_plane_grids(args.block_size)
 
     frame_summaries: List[Dict[str, float]] = []
+
+    sequence_adaptive_models = None
+    if args.adaptive_prob and args.prob_reset == "sequence":
+        sequence_adaptive_models = create_adaptive_models(args)
 
     recon_fp = None
     if args.out_recon_yuv:
@@ -757,6 +994,14 @@ def main():
     try:
         with open(args.input, "rb") as fp:
             for frame_idx in range(args.start_frame, end_frame):
+                if args.adaptive_prob:
+                    if args.prob_reset == "frame":
+                        adaptive_models = create_adaptive_models(args)
+                    else:
+                        adaptive_models = sequence_adaptive_models
+                else:
+                    adaptive_models = None
+
                 depth = read_yuv420p10le_y_frame(
                     fp=fp,
                     frame_idx=frame_idx,
@@ -778,6 +1023,7 @@ def main():
                     yy=yy,
                     pinv=pinv,
                     block_csv_writer=block_csv_writer,
+                    adaptive_models=adaptive_models,
                 )
 
                 frame_summaries.append(summary)
@@ -831,10 +1077,22 @@ def main():
         "copy_ratio",
         "delta_ratio",
         "zero_delta_ratio_in_delta",
+        "final_mode_direct_prob",
+        "final_mode_copy_prob",
+        "final_mode_delta_prob",
+        "final_candidate_left_prob",
+        "final_candidate_top_prob",
+        "final_candidate_top_left_prob",
+        "final_candidate_top_right_prob",
+        "final_candidate_avg_left_top_prob",
     ]
 
     for k in numeric_keys:
-        vals = [float(s[k]) for s in frame_summaries if k in s and math.isfinite(float(s[k]))]
+        vals = [
+            float(s[k])
+            for s in frame_summaries
+            if k in s and math.isfinite(float(s[k]))
+        ]
         if vals:
             avg[k] = float(np.mean(vals))
 
@@ -854,6 +1112,11 @@ def main():
         "lambda_rd": args.lambda_rd,
         "mode_bits": args.mode_bits,
         "max_value": args.max_value,
+        "adaptive_prob": args.adaptive_prob,
+        "prob_lr": args.prob_lr,
+        "prob_min": args.prob_min,
+        "prob_max": args.prob_max,
+        "prob_reset": args.prob_reset,
         "total_bits": total_bits,
         "overall_bpp": total_bits / total_pixels,
         "average": avg,
