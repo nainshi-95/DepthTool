@@ -34,14 +34,6 @@ class ModeResult:
 
 
 class AdaptiveProbTable:
-    """
-    Simple categorical CABAC-like adaptive probability model.
-
-    Used for:
-      - mode coding
-      - delta candidate categorical coding
-    """
-
     def __init__(
         self,
         symbols,
@@ -90,13 +82,6 @@ class AdaptiveProbTable:
         return self.probs[symbol]
 
     def bits(self, symbol, available_symbols=None):
-        """
-        If available_symbols is given, probabilities are normalized only over
-        currently available symbols.
-
-        Example:
-          candidate list only has [left], then candidate bits = 0.
-        """
         if symbol not in self.probs:
             raise KeyError(f"Unknown symbol '{symbol}' in model '{self.name}'")
 
@@ -130,8 +115,7 @@ class AdaptiveProbTable:
             1.0 - (self.n - 1) * self.p_min,
         )
 
-        target = {}
-        target[selected] = feasible_selected_max
+        target = {selected: feasible_selected_max}
 
         other_symbols = [s for s in self.symbols if s != selected]
         remain = 1.0 - feasible_selected_max
@@ -181,17 +165,6 @@ class AdaptiveProbTable:
 
 
 class BinaryAdaptiveProb:
-    """
-    Binary CABAC-like probability model.
-
-    Used for:
-      - copy candidate truncated unary coding
-
-    p1 = P(bin == 1)
-    bits(1) = -log2(p1)
-    bits(0) = -log2(1 - p1)
-    """
-
     def __init__(
         self,
         init_p1=0.5,
@@ -214,11 +187,7 @@ class BinaryAdaptiveProb:
         if bin_value not in (0, 1):
             raise ValueError("bin_value must be 0 or 1")
 
-        if bin_value == 1:
-            p = self.p1
-        else:
-            p = 1.0 - self.p1
-
+        p = self.p1 if bin_value == 1 else 1.0 - self.p1
         return -math.log2(max(p, 1e-12))
 
     def update(self, bin_value: int):
@@ -240,15 +209,6 @@ def unary_candidate_bits(
     ctx_models: List[BinaryAdaptiveProb],
     truncated: bool = True,
 ) -> float:
-    """
-    Truncated unary candidate coding.
-
-    Example num_candidates=4:
-      idx 0: 1
-      idx 1: 0 1
-      idx 2: 0 0 1
-      idx 3: 0 0 0     # final candidate implicit if truncated=True
-    """
     if num_candidates <= 1:
         return 0.0
 
@@ -294,6 +254,38 @@ def unary_candidate_update(
         ctx_models[cand_idx].update(1)
 
 
+def adaptive_signed_residual_bits(
+    q: int,
+    abs_model: AdaptiveProbTable,
+    abs_max: int,
+) -> float:
+    abs_q = abs(q)
+
+    if abs_q <= abs_max:
+        bits = abs_model.bits(abs_q)
+    else:
+        bits = abs_model.bits("esc")
+        bits += exp_golomb_len_unsigned(abs_q - (abs_max + 1))
+
+    if abs_q > 0:
+        bits += 1.0  # sign bit
+
+    return bits
+
+
+def adaptive_signed_residual_update(
+    q: int,
+    abs_model: AdaptiveProbTable,
+    abs_max: int,
+):
+    abs_q = abs(q)
+
+    if abs_q <= abs_max:
+        abs_model.update(abs_q)
+    else:
+        abs_model.update("esc")
+
+
 def create_adaptive_models(args):
     mode_model = AdaptiveProbTable(
         symbols=["direct", "copy", "delta"],
@@ -314,6 +306,7 @@ def create_adaptive_models(args):
     models = {
         "mode": mode_model,
         "candidate": candidate_model,
+        "delta_abs_max": args.delta_abs_max,
     }
 
     if args.copy_candidate_unary:
@@ -327,6 +320,33 @@ def create_adaptive_models(args):
             )
             for i in range(args.max_candidates)
         ]
+
+    if args.delta_residual_adaptive:
+        delta_abs_symbols = list(range(args.delta_abs_max + 1)) + ["esc"]
+
+        models["delta_res_abs_a"] = AdaptiveProbTable(
+            symbols=delta_abs_symbols,
+            update_rate=args.prob_lr,
+            p_min=args.prob_min,
+            p_max=args.prob_max,
+            name="delta_res_abs_a",
+        )
+
+        models["delta_res_abs_b"] = AdaptiveProbTable(
+            symbols=delta_abs_symbols,
+            update_rate=args.prob_lr,
+            p_min=args.prob_min,
+            p_max=args.prob_max,
+            name="delta_res_abs_b",
+        )
+
+        models["delta_res_abs_c"] = AdaptiveProbTable(
+            symbols=delta_abs_symbols,
+            update_rate=args.prob_lr,
+            p_min=args.prob_min,
+            p_max=args.prob_max,
+            name="delta_res_abs_c",
+        )
 
     return models
 
@@ -674,9 +694,26 @@ def eval_delta_modes(
         else:
             bits = float(mode_bits + cand_bits)
 
-        bits += exp_golomb_len_signed(qda)
-        bits += exp_golomb_len_signed(qdb)
-        bits += exp_golomb_len_signed(qdc)
+        if adaptive_models is not None and "delta_res_abs_a" in adaptive_models:
+            bits += adaptive_signed_residual_bits(
+                qda,
+                adaptive_models["delta_res_abs_a"],
+                adaptive_models["delta_abs_max"],
+            )
+            bits += adaptive_signed_residual_bits(
+                qdb,
+                adaptive_models["delta_res_abs_b"],
+                adaptive_models["delta_abs_max"],
+            )
+            bits += adaptive_signed_residual_bits(
+                qdc,
+                adaptive_models["delta_res_abs_c"],
+                adaptive_models["delta_abs_max"],
+            )
+        else:
+            bits += exp_golomb_len_signed(qda)
+            bits += exp_golomb_len_signed(qdb)
+            bits += exp_golomb_len_signed(qdc)
 
         cost = sse + lambda_rd * bits
 
@@ -841,7 +878,6 @@ def simulate_one_frame(
 
             best = min(mode_results, key=lambda r: r.cost)
 
-            # Probability update must happen after R-D decision.
             if adaptive_models is not None:
                 if len(available_modes) > 1:
                     adaptive_models["mode"].update(best.mode)
@@ -860,6 +896,25 @@ def simulate_one_frame(
 
                 elif best.mode == "delta" and len(available_candidate_names) > 1:
                     adaptive_models["candidate"].update(best.candidate_name)
+
+                if best.mode == "delta" and "delta_res_abs_a" in adaptive_models:
+                    qda, qdb, qdc = best.q_values
+
+                    adaptive_signed_residual_update(
+                        qda,
+                        adaptive_models["delta_res_abs_a"],
+                        adaptive_models["delta_abs_max"],
+                    )
+                    adaptive_signed_residual_update(
+                        qdb,
+                        adaptive_models["delta_res_abs_b"],
+                        adaptive_models["delta_abs_max"],
+                    )
+                    adaptive_signed_residual_update(
+                        qdc,
+                        adaptive_models["delta_res_abs_c"],
+                        adaptive_models["delta_abs_max"],
+                    )
 
             recon_padded[by : by + block_size, bx : bx + block_size] = best.recon_block
             plane_store[(bx, by)] = best.plane
@@ -948,6 +1003,11 @@ def simulate_one_frame(
             for i, ctx in enumerate(adaptive_models["copy_candidate_unary"]):
                 summary[f"final_copy_unary_ctx{i}_p1"] = ctx.p1
 
+        if "delta_res_abs_a" in adaptive_models:
+            summary.update(adaptive_models["delta_res_abs_a"].snapshot("final_delta_abs_a"))
+            summary.update(adaptive_models["delta_res_abs_b"].snapshot("final_delta_abs_b"))
+            summary.update(adaptive_models["delta_res_abs_c"].snapshot("final_delta_abs_c"))
+
     return recon, summary
 
 
@@ -972,7 +1032,7 @@ def parse_args():
         "--block-size",
         type=int,
         default=16,
-        help="Square block size. Example: 8, 16, 32, 128",
+        help="Square block size. Example: 8, 16, 32, 64, 128",
     )
 
     parser.add_argument(
@@ -1010,6 +1070,19 @@ def parse_args():
         "--copy-candidate-unary",
         action="store_true",
         help="Use truncated unary adaptive coding for copy candidate index.",
+    )
+
+    parser.add_argument(
+        "--delta-residual-adaptive",
+        action="store_true",
+        help="Use adaptive abs-level table for delta qda/qdb/qdc coding.",
+    )
+
+    parser.add_argument(
+        "--delta-abs-max",
+        type=int,
+        default=7,
+        help="Maximum abs residual value coded by adaptive table. Larger values use escape + Exp-Golomb.",
     )
 
     parser.add_argument(
@@ -1091,6 +1164,12 @@ def main():
 
     if args.copy_candidate_unary and not args.adaptive_prob:
         raise ValueError("--copy-candidate-unary requires --adaptive-prob")
+
+    if args.delta_residual_adaptive and not args.adaptive_prob:
+        raise ValueError("--delta-residual-adaptive requires --adaptive-prob")
+
+    if args.delta_abs_max < 0:
+        raise ValueError("--delta-abs-max must be non-negative")
 
     if args.prob_lr < 0.0 or args.prob_lr > 1.0:
         raise ValueError("--prob-lr must be in [0, 1]")
@@ -1257,6 +1336,15 @@ def main():
     for i in range(args.max_candidates):
         numeric_keys.append(f"final_copy_unary_ctx{i}_p1")
 
+    for i in range(args.delta_abs_max + 1):
+        numeric_keys.append(f"final_delta_abs_a_{i}_prob")
+        numeric_keys.append(f"final_delta_abs_b_{i}_prob")
+        numeric_keys.append(f"final_delta_abs_c_{i}_prob")
+
+    numeric_keys.append("final_delta_abs_a_esc_prob")
+    numeric_keys.append("final_delta_abs_b_esc_prob")
+    numeric_keys.append("final_delta_abs_c_esc_prob")
+
     for k in numeric_keys:
         vals = [
             float(s[k])
@@ -1284,6 +1372,8 @@ def main():
         "max_value": args.max_value,
         "adaptive_prob": args.adaptive_prob,
         "copy_candidate_unary": args.copy_candidate_unary,
+        "delta_residual_adaptive": args.delta_residual_adaptive,
+        "delta_abs_max": args.delta_abs_max,
         "max_candidates": args.max_candidates,
         "prob_lr": args.prob_lr,
         "prob_min": args.prob_min,
