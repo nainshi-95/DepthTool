@@ -1,3 +1,5 @@
+plan.md
+
 Coding Plan: DepthCam parameter Slice Header bitstream integration
 
 Goal
@@ -6,98 +8,68 @@ Implement DepthCam camera parameter loading, slice-header writing/parsing, and e
 
 DepthCam parameters are picture-level semantic data, but the bitstream syntax must be placed in the slice header, not the Picture Header, because the decoder can know the full reconstructed POC only inside parseSliceHeader().
 
-Core rule:
+Core rules:
 
-Use display POC as the only key.
+Use display POC as the only parameter key.
 Do not use gopId as a parameter index.
 Do not store long-term params in PicHeader.
-All long-term state must be managed by DepthCamParam.
+All long-term parameter state must be managed by DepthCamParam.
+EncGOP must actually load DepthCam parameters before slice header writing.
+
+Before coding, inspect the current codebase and produce an implementation-specific plan.
+
+Do not assume ownership/access paths.
+
+Before modifying code, report:
+
+- Exact files to modify
+- Exact functions to modify
+- Exact insertion points
+- Existing DepthCamParam API and missing API
+- How EncGOP can access DepthCamParam
+- How HLSWriter can access encoder-side DepthCamParam
+- How HLSyntaxReader can access decoder-side DepthCamParam
+- Where full POC is available
+- Whether Slice needs additional fields
+- Whether PicHeader changes are unnecessary
+- Build risks
+- Any mismatch between this plan and current code
+
+Do not start coding until the implementation-specific plan is approved.
 
 ⸻
 
-1. Mandatory macro guard
+1. Final syntax location
 
-Use this compile-time macro for every DepthCam change:
+Do not add DepthCam syntax to:
 
-<PUT_MACRO_NAME_HERE>
-
-Use this debug macro for logs:
-
-DEBUG_DEPTH_CAM_PARAM
-
-Every modification to existing VTM behavior must be guarded.
-
-For existing function modifications:
-
-#if <PUT_MACRO_NAME_HERE>
-  // New DepthCam behavior
-#else
-  // Original existing VTM code exactly as before
-#endif
-
-For new fields/classes/functions:
-
-#if <PUT_MACRO_NAME_HERE>
-  // DepthCam-only declarations or definitions
-#endif
-
-For debug logs:
-
-#if <PUT_MACRO_NAME_HERE>
-#if DEBUG_DEPTH_CAM_PARAM
-  // DepthCam debug log
-#endif
-#endif
-
-Macro OFF requirements:
-
-- No DepthCam loading.
-- No DepthCam writing.
-- No DepthCam parsing.
-- No DepthCam store update.
-- No DepthCam logs.
-- No bitstream syntax change.
-- Encoder/decoder behavior identical to original VTM.
-
-Build both:
-
-1. Macro OFF
-2. Macro ON
-
-⸻
-
-2. Final syntax location
-
-Do not add DepthCam syntax to codePictureHeader() / parsePictureHeader().
+codePictureHeader()
+parsePictureHeader()
 
 Reason:
 
-Decoder parsePictureHeader() only knows ph_pic_order_cnt_lsb.
-Decoder parseSliceHeader() reconstructs full POC.
+parsePictureHeader() only reads ph_pic_order_cnt_lsb.
+Full reconstructed POC is available only after POC reconstruction in parseSliceHeader().
 DepthCam syntax existence is inferred from full POC.
-Therefore DepthCam syntax must be read/written from slice header.
+Therefore DepthCam syntax must be written/read in slice header.
 
-Writer location
+Writer insertion point
 
-In HLSWriter::codeSliceHeader(...), add DepthCam syntax after normal slice header syntax where full POC is available.
+In HLSWriter::codeSliceHeader(...), add DepthCam syntax after normal slice header syntax where pcSlice->m_poc is valid.
 
 Recommended position:
 
 codeClippingValues(pcSlice);
-#if <PUT_MACRO_NAME_HERE>
-  codeDepthCamSliceHeaderPayload(pcSlice);
-#endif
+codeDepthCamSliceHeaderPayload(pcSlice);
 
-Reader location
+Reader insertion point
 
-In HLSyntaxReader::parseSliceHeader(...), add DepthCam parsing after full POC reconstruction and after corresponding normal syntax.
+In HLSyntaxReader::parseSliceHeader(...), add DepthCam parsing after full POC reconstruction and after the corresponding normal slice header syntax.
 
 Recommended position:
 
 parseClippingValues(pcSlice);
-#if <PUT_MACRO_NAME_HERE>
-  parseDepthCamSliceHeaderPayload(pcSlice);
-#endif
+parseDepthCamSliceHeaderPayload(pcSlice);
 std::vector<uint32_t> entryPointOffset;
 ...
 m_pcBitstream->readByteAlignment();
@@ -106,7 +78,7 @@ Do not place DepthCam parsing after readByteAlignment().
 
 ⸻
 
-3. DepthCam behavior rule
+2. DepthCam syntax existence rule
 
 DepthCam slice-header payload has no explicit present flag.
 
@@ -145,7 +117,7 @@ POC > 0:
 
 Multiple slices in one picture
 
-The same rule prevents duplicate syntax parsing/writing.
+The same rule prevents duplicate writing/parsing.
 
 Example:
 
@@ -160,17 +132,16 @@ Second slice of POC 32:
   pocCurr <= lastReadParamPOC
   read nothing
 
-Therefore, no extra first-slice flag is required for DepthCam duplication prevention.
+No extra first-slice flag is required for DepthCam duplication prevention.
 
 ⸻
 
-4. DepthCamParam manager state
+3. DepthCamParam manager state
 
-Add all persistent DepthCam state to the DepthCamParam manager.
+Add all persistent DepthCam state to DepthCamParam.
 
 Suggested fields:
 
-#if <PUT_MACRO_NAME_HERE>
 int m_lastLoadedParamPOC  = 0;
 int m_lastWrittenParamPOC = 0;
 int m_lastReadParamPOC    = 0;
@@ -178,7 +149,6 @@ bool m_intrinsicHeaderLoaded = false;
 bool m_intrinsicHeaderParsed = false;
 DepthCamIntrinsicHeader m_intrinsicHeader;
 std::map<int, DepthCamExtrinsicParam> m_extrinsicParamStore;
-#endif
 
 Meaning:
 
@@ -189,11 +159,10 @@ m_lastWrittenParamPOC:
 m_lastReadParamPOC:
   Extrinsic params from POC 1 to this POC have already been parsed from the bitstream.
 m_extrinsicParamStore:
-  Long-term param storage by display POC.
+  Long-term parameter storage by display POC.
 
 Required functions:
 
-#if <PUT_MACRO_NAME_HERE>
 bool ensureIntrinsicHeaderLoaded();
 bool ensureExtrinsicLoadedUpToPOC(int pocCurr);
 const DepthCamIntrinsicHeader& getIntrinsicHeader() const;
@@ -208,13 +177,43 @@ int getLastReadParamPOC() const;
 void setLastLoadedParamPOC(int poc);
 void setLastWrittenParamPOC(int poc);
 void setLastReadParamPOC(int poc);
-uint64_t calcIntrinsicChecksum(const DepthCamIntrinsicHeader& header) const;
-uint64_t calcExtrinsicChecksum(const DepthCamExtrinsicParam& param) const;
-#endif
 
-Sequential loading rule:
+⸻
 
-#if <PUT_MACRO_NAME_HERE>
+4. Encoder-side parameter loading
+
+This part is mandatory.
+
+The encoder must actually load DepthCam params before slice header writing.
+
+In EncGOP::compressGOP, after pocCurr is computed and before slice header writing, call the DepthCamParam manager.
+
+Do not write bits directly from EncGOP.
+
+Required behavior:
+
+DepthCamParam& depthCamParam = m_pcEncLib->getDepthCamParam();
+if (pocCurr == 0)
+{
+  CHECK(!depthCamParam.ensureIntrinsicHeaderLoaded(),
+        "Failed to load DepthCam intrinsic/header");
+  // POC 0 extrinsic is default all-zero and must not be loaded/written as a normal extrinsic payload.
+}
+else
+{
+  CHECK(!depthCamParam.ensureExtrinsicLoadedUpToPOC(pocCurr),
+        "Failed to load DepthCam extrinsic params up to current POC");
+}
+
+The manager must load sequentially by display POC.
+
+Required invariant:
+
+m_lastLoadedParamPOC == N means:
+POC 1..N extrinsic params have been loaded with no holes.
+
+Required sequential loading logic:
+
 bool DepthCamParam::ensureExtrinsicLoadedUpToPOC(int pocCurr)
 {
   if (pocCurr <= m_lastLoadedParamPOC)
@@ -226,7 +225,7 @@ bool DepthCamParam::ensureExtrinsicLoadedUpToPOC(int pocCurr)
     DepthCamExtrinsicParam param;
     if (!loadOneExtrinsicParamForPOC(poc, param))
     {
-      // Do not advance last loaded POC on failure.
+      // Do not advance m_lastLoadedParamPOC on failure.
       return false;
     }
     setExtrinsicParam(poc, param);
@@ -234,19 +233,34 @@ bool DepthCamParam::ensureExtrinsicLoadedUpToPOC(int pocCurr)
   }
   return true;
 }
-#endif
 
-Do not silently reuse stale params from a previous POC.
+Important RA behavior:
+
+For RA GOP32:
+  - When encoder reaches POC 32, EncGOP must call ensureExtrinsicLoadedUpToPOC(32).
+  - This must load POC 1,2,3,...,32 sequentially.
+  - When encoder later reaches POC 16/8/4/2/1, loading must be skipped because m_lastLoadedParamPOC is already 32.
+  - When encoder reaches POC 64, it must load POC 33~64 sequentially.
+
+Never use gopId as a DepthCam parameter index.
+
+Do not silently reuse stale parameters.
+
+If parameter loading fails for POC N:
+
+- return false
+- do not store invalid parameter
+- do not advance m_lastLoadedParamPOC to N
+- fail clearly with CHECK at the EncGOP call site
 
 ⸻
 
-5. Slice tracking fields
+5. Slice status fields
 
-Add optional debug/status fields to Slice.
+Add optional status fields to Slice.
 
 These are not long-term storage. They only record what happened for the current slice.
 
-#if <PUT_MACRO_NAME_HERE>
 int m_depthCamLastWrittenParamPOCBefore = 0;
 int m_depthCamLastWrittenParamPOCAfter  = 0;
 int m_depthCamLastReadParamPOCBefore = 0;
@@ -254,72 +268,31 @@ int m_depthCamLastReadParamPOCAfter  = 0;
 int m_depthCamBundleStartPOC = 0;
 int m_depthCamBundleEndPOC   = 0;
 int m_depthCamBundleNumPics  = 0;
-#endif
 
 Persistent state must remain in DepthCamParam.
 
 ⸻
 
-6. EncGOP integration
-
-In EncGOP::compressGOP, after pocCurr is computed, ensure the required DepthCam params are loaded.
-
-Do not write bits directly from EncGOP.
-
-Pseudo behavior:
-
-#if <PUT_MACRO_NAME_HERE>
-auto& depthCamParam = m_pcEncLib->getDepthCamParam();
-if (pocCurr == 0)
-{
-  CHECK(!depthCamParam.ensureIntrinsicHeaderLoaded(),
-        "Failed to load DepthCam intrinsic/header");
-  // POC 0 extrinsic is all-zero/default and is not loaded/written.
-}
-else
-{
-  CHECK(!depthCamParam.ensureExtrinsicLoadedUpToPOC(pocCurr),
-        "Failed to load DepthCam extrinsic params");
-}
-#endif
-
-Important:
-
-- Access key is always pocCurr.
-- Do not use gopId.
-- For RA GOP32, when pocCurr == 32, load POC 1~32 sequentially.
-- For later POC 16/8/4/2/1, do not load again if already loaded.
-
-⸻
-
-7. HLSWriter helper
+6. HLSWriter helper
 
 Add:
 
-#if <PUT_MACRO_NAME_HERE>
 void HLSWriter::codeDepthCamSliceHeaderPayload(Slice* pcSlice);
 void HLSWriter::codeDepthCamIntrinsicHeader(const DepthCamIntrinsicHeader& header);
 void HLSWriter::codeDepthCamExtrinsicParam(const DepthCamExtrinsicParam& param);
-#endif
 
 Writer logic:
 
-#if <PUT_MACRO_NAME_HERE>
 void HLSWriter::codeDepthCamSliceHeaderPayload(Slice* pcSlice)
 {
   const int pocCurr = pcSlice->m_poc;
-  DepthCamParam& depthCamParam = getEncoderDepthCamParam(); // Use the actual existing access path.
+  DepthCamParam& depthCamParam = getEncoderDepthCamParam(); // Use actual current-code access path.
   if (pocCurr == 0)
   {
     const auto& header = depthCamParam.getIntrinsicHeader();
     codeDepthCamIntrinsicHeader(header);
     pcSlice->m_depthCamLastWrittenParamPOCBefore = depthCamParam.getLastWrittenParamPOC();
     pcSlice->m_depthCamLastWrittenParamPOCAfter  = depthCamParam.getLastWrittenParamPOC();
-#if DEBUG_DEPTH_CAM_PARAM
-    fprintf(stderr,
-            "[DepthCam][ENC][PH_INTRINSIC_WRITE] poc=0 checksum=%llu\n",
-            (unsigned long long)depthCamParam.calcIntrinsicChecksum(header));
-#endif
     // Never write POC 0 extrinsic.
     return;
   }
@@ -328,12 +301,6 @@ void HLSWriter::codeDepthCamSliceHeaderPayload(Slice* pcSlice)
   if (pocCurr <= lastWritten)
   {
     pcSlice->m_depthCamLastWrittenParamPOCAfter = lastWritten;
-#if DEBUG_DEPTH_CAM_PARAM
-    fprintf(stderr,
-            "[DepthCam][ENC][SH_BUNDLE_SKIP] currPoc=%d lastWrittenPoc=%d\n",
-            pocCurr,
-            lastWritten);
-#endif
     return;
   }
   const int startPoc = lastWritten + 1;
@@ -344,57 +311,40 @@ void HLSWriter::codeDepthCamSliceHeaderPayload(Slice* pcSlice)
   pcSlice->m_depthCamBundleNumPics  = numPics;
   xWriteUvlc(startPoc, "depth_cam_param_bundle_start_poc");
   xWriteUvlc(numPics,  "depth_cam_param_bundle_num_pics");
-#if DEBUG_DEPTH_CAM_PARAM
-  fprintf(stderr,
-          "[DepthCam][ENC][SH_BUNDLE_WRITE] currPoc=%d startPoc=%d numPics=%d endPoc=%d\n",
-          pocCurr,
-          startPoc,
-          numPics,
-          endPoc);
-#endif
   for (int poc = startPoc; poc <= endPoc; ++poc)
   {
     CHECK(!depthCamParam.hasExtrinsicParam(poc),
           "Missing DepthCam extrinsic param before writing");
     const auto& param = depthCamParam.getExtrinsicParam(poc);
     codeDepthCamExtrinsicParam(param);
-#if DEBUG_DEPTH_CAM_PARAM
-    fprintf(stderr,
-            "[DepthCam][ENC][EXTRINSIC] poc=%d checksum=%llu\n",
-            poc,
-            (unsigned long long)depthCamParam.calcExtrinsicChecksum(param));
-#endif
   }
   depthCamParam.setLastWrittenParamPOC(endPoc);
   pcSlice->m_depthCamLastWrittenParamPOCAfter = endPoc;
 }
-#endif
 
-Notes:
+Access path rule:
 
-- Use the actual existing access path to DepthCamParam.
-- If HLSWriter cannot currently access EncLib/DepthCamParam, add a guarded pointer/reference setter.
-- Do not create global state.
+Use the actual existing access path to DepthCamParam.
+If HLSWriter currently cannot access EncLib/DepthCamParam, add the minimum necessary API.
+Do not create global state.
+Do not invent ownership relationships.
 
 ⸻
 
-8. HLSReader helper
+7. HLSReader helper
 
 Add:
 
-#if <PUT_MACRO_NAME_HERE>
 void HLSyntaxReader::parseDepthCamSliceHeaderPayload(Slice* pcSlice);
 void HLSyntaxReader::parseDepthCamIntrinsicHeader(DepthCamIntrinsicHeader& header);
 void HLSyntaxReader::parseDepthCamExtrinsicParam(DepthCamExtrinsicParam& param);
-#endif
 
 Reader logic:
 
-#if <PUT_MACRO_NAME_HERE>
 void HLSyntaxReader::parseDepthCamSliceHeaderPayload(Slice* pcSlice)
 {
   const int pocCurr = pcSlice->m_poc;
-  DepthCamParam& depthCamParam = getDecoderDepthCamParam(); // Use the actual existing access path.
+  DepthCamParam& depthCamParam = getDecoderDepthCamParam(); // Use actual current-code access path.
   if (pocCurr == 0)
   {
     DepthCamIntrinsicHeader header;
@@ -403,11 +353,6 @@ void HLSyntaxReader::parseDepthCamSliceHeaderPayload(Slice* pcSlice)
     depthCamParam.setExtrinsicParam(0, depthCamParam.getDefaultZeroExtrinsicParam());
     pcSlice->m_depthCamLastReadParamPOCBefore = depthCamParam.getLastReadParamPOC();
     pcSlice->m_depthCamLastReadParamPOCAfter  = depthCamParam.getLastReadParamPOC();
-#if DEBUG_DEPTH_CAM_PARAM
-    fprintf(stderr,
-            "[DepthCam][DEC][PH_INTRINSIC_READ] poc=0 checksum=%llu\n",
-            (unsigned long long)depthCamParam.calcIntrinsicChecksum(header));
-#endif
     // Never read POC 0 extrinsic.
     return;
   }
@@ -416,12 +361,6 @@ void HLSyntaxReader::parseDepthCamSliceHeaderPayload(Slice* pcSlice)
   if (pocCurr <= lastRead)
   {
     pcSlice->m_depthCamLastReadParamPOCAfter = lastRead;
-#if DEBUG_DEPTH_CAM_PARAM
-    fprintf(stderr,
-            "[DepthCam][DEC][SH_BUNDLE_SKIP] currPoc=%d lastReadPoc=%d\n",
-            pocCurr,
-            lastRead);
-#endif
     return;
   }
   uint32_t startPoc = 0;
@@ -440,52 +379,35 @@ void HLSyntaxReader::parseDepthCamSliceHeaderPayload(Slice* pcSlice)
   pcSlice->m_depthCamBundleStartPOC = int(startPoc);
   pcSlice->m_depthCamBundleEndPOC   = endPoc;
   pcSlice->m_depthCamBundleNumPics  = int(numPics);
-#if DEBUG_DEPTH_CAM_PARAM
-  fprintf(stderr,
-          "[DepthCam][DEC][SH_BUNDLE_READ] currPoc=%d startPoc=%d numPics=%d endPoc=%d\n",
-          pocCurr,
-          int(startPoc),
-          int(numPics),
-          endPoc);
-#endif
   for (int i = 0; i < int(numPics); ++i)
   {
     const int poc = int(startPoc) + i;
     DepthCamExtrinsicParam param;
     parseDepthCamExtrinsicParam(param);
     depthCamParam.setExtrinsicParam(poc, param);
-#if DEBUG_DEPTH_CAM_PARAM
-    fprintf(stderr,
-            "[DepthCam][DEC][EXTRINSIC] poc=%d checksum=%llu\n",
-            poc,
-            (unsigned long long)depthCamParam.calcExtrinsicChecksum(param));
-#endif
   }
   depthCamParam.setLastReadParamPOC(pocCurr);
   pcSlice->m_depthCamLastReadParamPOCAfter = pocCurr;
 }
-#endif
 
-Notes:
+Important:
 
-- Immediately copy parsed params into DepthCamParam manager.
-- Do not use PicHeader as long-term storage.
-- Do not parse anything when pocCurr <= lastReadParamPOC.
+Immediately copy parsed params into DepthCamParam manager.
+Do not use PicHeader as long-term parameter storage.
+Do not parse anything when pocCurr <= lastReadParamPOC.
 
 ⸻
 
-9. Truncated signed Exp-Golomb coding
+8. Truncated signed Exp-Golomb coding
 
 Use cameraParamQuantTest.py as the reference.
 
-Claude Code must inspect cameraParamQuantTest.py and port the same quantization and truncated signed Exp-Golomb behavior to C++.
+Inspect cameraParamQuantTest.py and port the same integer quantization and truncated signed Exp-Golomb behavior to C++.
 
 Required helper functions:
 
-#if <PUT_MACRO_NAME_HERE>
 void xWriteTruncatedSignedExpGolomb(int value, int minVal, int maxVal, const char* name);
 void xReadTruncatedSignedExpGolomb(int& value, int minVal, int maxVal, const char* name);
-#endif
 
 Requirements:
 
@@ -496,9 +418,8 @@ Requirements:
 - Do not silently clamp decoder values unless the Python reference does.
 - Add CHECK for decoded out-of-range values.
 
-Suggested syntax function structure:
+Suggested structure:
 
-#if <PUT_MACRO_NAME_HERE>
 void HLSWriter::codeDepthCamIntrinsicHeader(const DepthCamIntrinsicHeader& header)
 {
   // Write fields in deterministic order.
@@ -515,11 +436,10 @@ void HLSyntaxReader::parseDepthCamExtrinsicParam(DepthCamExtrinsicParam& param)
 {
   // Read quantized signed fields using truncated signed Exp-Golomb.
 }
-#endif
 
 ⸻
 
-10. Slice header syntax order
+9. Slice header syntax order
 
 POC 0
 
@@ -563,11 +483,10 @@ Write/read nothing.
 
 ⸻
 
-11. Decoder parameter use
+10. Decoder parameter use
 
 When decoder needs DepthCam params for any picture, use only DepthCamParam.
 
-#if <PUT_MACRO_NAME_HERE>
 DepthCamParam& depthCamParam = getDecoderDepthCamParam();
 if (pocCurr == 0)
 {
@@ -579,271 +498,12 @@ else
         "Missing DepthCam extrinsic param for current POC");
   const auto& param = depthCamParam.getExtrinsicParam(pocCurr);
 }
-#endif
 
-Add debug use log:
-
-#if <PUT_MACRO_NAME_HERE>
-#if DEBUG_DEPTH_CAM_PARAM
-const bool available = pocCurr == 0 || depthCamParam.hasExtrinsicParam(pocCurr);
-uint64_t checksum = 0;
-if (pocCurr == 0)
-{
-  checksum = depthCamParam.calcExtrinsicChecksum(depthCamParam.getDefaultZeroExtrinsicParam());
-}
-else if (available)
-{
-  checksum = depthCamParam.calcExtrinsicChecksum(depthCamParam.getExtrinsicParam(pocCurr));
-}
-fprintf(stderr,
-        "[DepthCam][DEC][PARAM_USE] poc=%d available=%d checksum=%llu\n",
-        pocCurr,
-        available ? 1 : 0,
-        (unsigned long long)checksum);
-#endif
-#endif
+Do not access DepthCam params through PicHeader.
 
 ⸻
 
-12. Debug logs
-
-Encoder logs:
-
-[DepthCam][ENC][PH_INTRINSIC_WRITE] poc=0 checksum=<checksum>
-[DepthCam][ENC][SH_BUNDLE_WRITE] currPoc=32 startPoc=1 numPics=32 endPoc=32
-[DepthCam][ENC][SH_BUNDLE_SKIP] currPoc=16 lastWrittenPoc=32
-[DepthCam][ENC][EXTRINSIC] poc=1 checksum=<checksum>
-[DepthCam][ENC][EXTRINSIC] poc=2 checksum=<checksum>
-...
-
-Decoder logs:
-
-[DepthCam][DEC][PH_INTRINSIC_READ] poc=0 checksum=<checksum>
-[DepthCam][DEC][SH_BUNDLE_READ] currPoc=32 startPoc=1 numPics=32 endPoc=32
-[DepthCam][DEC][SH_BUNDLE_SKIP] currPoc=16 lastReadPoc=32
-[DepthCam][DEC][EXTRINSIC] poc=1 checksum=<checksum>
-[DepthCam][DEC][EXTRINSIC] poc=2 checksum=<checksum>
-...
-[DepthCam][DEC][PARAM_USE] poc=16 available=1 checksum=<checksum>
-
-Checksum requirements:
-
-- Deterministic.
-- Same function on encoder and decoder sides.
-- Use quantized integer fields.
-- Do not hash raw float memory.
-- Hash fields in explicit fixed order.
-
-Suggested checksum style:
-
-#if <PUT_MACRO_NAME_HERE>
-static uint64_t depthCamHashUpdate(uint64_t h, int v)
-{
-  uint64_t x = uint64_t(int64_t(v)) ^ 0x9e3779b97f4a7c15ULL;
-  return (h ^ x) * 1099511628211ULL;
-}
-#endif
-
-⸻
-
-13. Verification script
-
-Create:
-
-verify_depthcam_param_logs.py
-
-Required usage:
-
-python verify_depthcam_param_logs.py --enc-log depthcam_encoder.log --dec-log depthcam_decoder.log
-
-The script must print all PASS/FAIL messages to stdout.
-
-The caller will redirect stdout/stderr to:
-
-depthcam_verify.log
-
-Checks
-
-Intrinsic/header check
-
-Expected logs:
-
-[DepthCam][ENC][PH_INTRINSIC_WRITE] poc=0 checksum=<checksum>
-[DepthCam][DEC][PH_INTRINSIC_READ] poc=0 checksum=<checksum>
-
-Pass:
-
-- Encoder intrinsic exists exactly once.
-- Decoder intrinsic exists exactly once.
-- Checksums match.
-- Encoder has no EXTRINSIC poc=0 log.
-
-Bundle check
-
-For RA GOP32:
-
-[DepthCam][ENC][SH_BUNDLE_WRITE] currPoc=32 startPoc=1 numPics=32 endPoc=32
-[DepthCam][DEC][SH_BUNDLE_READ] currPoc=32 startPoc=1 numPics=32 endPoc=32
-
-Pass:
-
-- Encoder and decoder bundle records match.
-- POC 16/8/4/2/1 do not create duplicate bundle writes/reads after POC 1~32 are already covered.
-
-Per-POC extrinsic checksum
-
-For every encoder line:
-
-[DepthCam][ENC][EXTRINSIC] poc=N checksum=X
-
-Decoder must have:
-
-[DepthCam][DEC][EXTRINSIC] poc=N checksum=X
-
-Pass:
-
-- Every encoder POC exists in decoder log.
-- Every checksum matches.
-- No missing POC in transmitted bundle.
-
-Decoder parameter use
-
-Expected:
-
-[DepthCam][DEC][PARAM_USE] poc=N available=1 checksum=X
-
-Pass:
-
-- available=1 for all used POC.
-- PARAM_USE checksum matches the decoded stored EXTRINSIC checksum for the same POC.
-- No stale checksum reuse.
-
-Decoder MD5/checksum
-
-Pass:
-
-- Decoder log contains at least one MD5/checksum OK.
-- Decoder log contains no MD5/checksum ERROR.
-
-Fail if any MD5/checksum line contains ERROR.
-
-⸻
-
-14. Validation command template
-
-Claude Code must create all three logs.
-
-ENCODER_CMD="<PUT_ENCODER_COMMAND_HERE>"
-DECODER_CMD="<PUT_DECODER_COMMAND_HERE>"
-ENC_LOG="depthcam_encoder.log"
-DEC_LOG="depthcam_decoder.log"
-CHECK_LOG="depthcam_verify.log"
-${ENCODER_CMD} > ${ENC_LOG} 2>&1
-${DECODER_CMD} > ${DEC_LOG} 2>&1
-python verify_depthcam_param_logs.py --enc-log ${ENC_LOG} --dec-log ${DEC_LOG} > ${CHECK_LOG} 2>&1
-
-depthcam_verify.log is mandatory.
-
-Success output must include:
-
-[PASS] intrinsic/header checksum match
-[PASS] no POC0 extrinsic written
-[PASS] slice-header bundle write/read check passed
-[PASS] all extrinsic checksums match
-[PASS] decoder parameter use checks passed
-[PASS] decoder MD5 checks are OK
-FINAL RESULT: PASS
-
-Failure output must include exact reasons:
-
-[FAIL] POC 16 extrinsic checksum mismatch: enc=1234 dec=5678
-[FAIL] Decoder used unavailable param at POC 8
-[FAIL] Decoder MD5 ERROR found: <full line>
-FINAL RESULT: FAIL
-
-⸻
-
-15. Macro OFF validation
-
-Build and run with <PUT_MACRO_NAME_HERE> OFF.
-
-Expected:
-
-- Build succeeds.
-- No [DepthCam] logs appear.
-- No DepthCam syntax exists in slice header.
-- Bitstream remains compatible with original VTM.
-- Encoder/decoder behavior is identical to original VTM.
-- Decoder MD5/checksum lines are all OK.
-
-Fail if:
-
-- Any [DepthCam] log appears.
-- Build fails.
-- Decoder mismatch occurs.
-- Bitstream syntax changes.
-
-⸻
-
-16. Macro ON validation
-
-Build and run with <PUT_MACRO_NAME_HERE> ON.
-
-Expected:
-
-- Build succeeds.
-- DepthCam logs appear.
-- POC 0 intrinsic/header checksum matches.
-- POC 0 extrinsic is not written.
-- Slice-header bundle write/read records match.
-- Every extrinsic POC checksum matches.
-- Decoder PARAM_USE logs show available=1.
-- Decoder MD5/checksum lines are all OK.
-
-⸻
-
-17. Required final report
-
-Claude Code must report:
-
-Modified files:
-- ...
-Modified functions:
-- ...
-New fields:
-- ...
-New helper functions:
-- ...
-New slice-header syntax order:
-- ...
-Macro OFF build result:
-- ...
-Macro ON build result:
-- ...
-Encoder command used:
-- ...
-Decoder command used:
-- ...
-Encoder log path:
-- depthcam_encoder.log
-Decoder log path:
-- depthcam_decoder.log
-Verification log path:
-- depthcam_verify.log
-Intrinsic/header checksum comparison:
-- ...
-Number of extrinsic POCs compared:
-- ...
-First 10 compared POC/checksum pairs:
-- ...
-Decoder MD5/checksum result:
-- ...
-Final result:
-- PASS or FAIL
-
-⸻
-
-18. Do not change unrelated behavior
+11. Do not change unrelated behavior
 
 Do not:
 
@@ -854,30 +514,493 @@ Do not:
 - Do not write bits from EncGOP directly.
 - Do not write POC 0 extrinsic.
 - Do not store long-term params in PicHeader.
-- Do not add DepthCam behavior when macro is OFF.
-- Do not rely on runtime flags as the primary guard.
+- Do not create global DepthCamParam state.
+- Do not invent ownership/access paths.
 - Do not refactor unrelated VTM code.
 
 ⸻
 
-19. Implementation order
+12. Implementation order
 
 Recommended order:
 
-1. Add macro definitions and guards.
-2. Build macro OFF.
-3. Add DepthCamParam manager state/functions.
-4. Add Slice debug/status fields.
-5. Add encoder-side sequential load in EncGOP.
+1. Read current codebase and produce implementation-specific plan.
+2. Add or update DepthCamParam manager state/functions.
+3. Implement actual encoder-side parameter loading in EncGOP.
+4. Add Slice status fields if needed.
+5. Add HLSWriter access path to encoder-side DepthCamParam.
 6. Add HLSWriter slice-header payload helper.
-7. Add HLSReader slice-header payload helper.
-8. Port truncated signed Exp-Golomb from cameraParamQuantTest.py.
-9. Add intrinsic/extrinsic syntax helpers.
-10. Add deterministic checksum helpers.
-11. Add debug logs.
-12. Add decoder PARAM_USE log.
-13. Create verify_depthcam_param_logs.py.
-14. Build macro OFF.
-15. Build macro ON.
-16. Run encoder, decoder, verification script.
-17. Report final results.
+7. Add HLSReader access path to decoder-side DepthCamParam.
+8. Add HLSReader slice-header payload helper.
+9. Port truncated signed Exp-Golomb from cameraParamQuantTest.py.
+10. Add intrinsic/extrinsic syntax helpers.
+11. Add decoder-side parameter use through DepthCamParam manager.
+12. Build.
+13. Run tests according to test_skill.md.
+14. Report final result.
+
+⸻
+
+13. Required final report
+
+Report:
+
+Modified files:
+- ...
+Modified functions:
+- ...
+New fields:
+- ...
+New helper functions:
+- ...
+DepthCamParam manager changes:
+- ...
+Encoder parameter loading path:
+- ...
+HLSWriter DepthCamParam access path:
+- ...
+HLSReader DepthCamParam access path:
+- ...
+New slice-header syntax order:
+- ...
+Build result:
+- ...
+Test result:
+- ...
+Final result:
+- PASS or FAIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+macro_guard_skill.md
+
+Skill: Mandatory macro guard for DepthCam parameter integration
+
+Goal
+
+Ensure every DepthCam parameter bitstream/load/store change is fully compile-time guarded.
+
+The macro guard must make macro-OFF behavior identical to original VTM.
+
+Macro names
+
+Use the project-selected compile-time macro:
+
+<PUT_MACRO_NAME_HERE>
+
+Optional debug/log macro:
+
+DEBUG_DEPTH_CAM_PARAM
+
+Required rule
+
+Every DepthCam-related modification to existing VTM behavior must be guarded.
+
+For existing function modifications:
+
+#if <PUT_MACRO_NAME_HERE>
+  // New DepthCam behavior
+#else
+  // Original existing VTM code exactly as before
+#endif
+
+For new fields, classes, functions, helper structs, and includes:
+
+#if <PUT_MACRO_NAME_HERE>
+  // DepthCam-only declaration or definition
+#endif
+
+For debug-only code:
+
+#if <PUT_MACRO_NAME_HERE>
+#if DEBUG_DEPTH_CAM_PARAM
+  // debug code
+#endif
+#endif
+
+Macro OFF requirements
+
+When <PUT_MACRO_NAME_HERE> is undefined or set to 0:
+
+- No DepthCam parameter loading.
+- No DepthCam syntax writing.
+- No DepthCam syntax parsing.
+- No DepthCam store update.
+- No DepthCam-specific fields used by original code.
+- No DepthCam logs.
+- No changed bitstream syntax.
+- No changed encoder behavior.
+- No changed decoder behavior.
+- Original VTM bitstream compatibility must be preserved.
+
+Existing function modification rule
+
+If an existing function is modified, preserve the original code path.
+
+Example:
+
+void SomeExistingFunction(...)
+{
+#if <PUT_MACRO_NAME_HERE>
+  // Modified version with DepthCam behavior.
+#else
+  // Original function body exactly as it existed before.
+#endif
+}
+
+If only a small insertion is needed and the rest of the function is unchanged, this form is also acceptable:
+
+original_code_before();
+#if <PUT_MACRO_NAME_HERE>
+  depthCamOnlyCode();
+#endif
+original_code_after();
+
+Use the second form only when macro-OFF compiled output and behavior remain exactly original.
+
+New API rule
+
+Any new DepthCam-only API must be guarded.
+
+Example:
+
+class DepthCamParam
+{
+public:
+#if <PUT_MACRO_NAME_HERE>
+  bool ensureIntrinsicHeaderLoaded();
+  bool ensureExtrinsicLoadedUpToPOC(int pocCurr);
+#endif
+};
+
+New include rule
+
+If a new include is needed only for DepthCam code, guard it.
+
+Example:
+
+#if <PUT_MACRO_NAME_HERE>
+#include "DepthCamParam.h"
+#include <map>
+#endif
+
+Syntax rule
+
+DepthCam syntax must not exist when the macro is OFF.
+
+When macro OFF:
+
+HLSWriter must write the exact original slice header syntax.
+HLSyntaxReader must read the exact original slice header syntax.
+No DepthCam syntax element may be written or read.
+
+Build requirement
+
+Build both configurations:
+
+1. Macro OFF
+2. Macro ON
+
+Macro OFF must compile and behave as original VTM.
+
+Macro ON must compile and enable DepthCam behavior.
+
+Do not use runtime flags as the primary guard
+
+Runtime config flags may be added later, but they are not a replacement for the compile-time macro.
+
+The compile-time macro is mandatory.
+
+Report requirement
+
+When implementation is complete, report:
+
+Macro used:
+- ...
+Files with macro-guarded changes:
+- ...
+New macro-guarded fields:
+- ...
+New macro-guarded functions:
+- ...
+Existing functions modified:
+- ...
+Macro OFF build result:
+- ...
+Macro ON build result:
+- ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+test_skill.md
+
+Skill: DepthCam slice-header integration build and functional test
+
+Goal
+
+Verify that the DepthCam slice-header integration builds and runs correctly without relying on encoder/decoder parameter debug-log comparison.
+
+This test skill validates:
+
+- Macro OFF build
+- Macro ON build
+- Encoder run
+- Decoder run
+- Decoder MD5/checksum success
+- No crash/assert during DepthCam parameter load/write/read/use
+- Macro OFF behavior remains original-compatible
+
+Do not add direct encoder-vs-decoder camera-parameter log comparison.
+
+Do not require per-POC parameter checksum logs.
+
+Required commands
+
+The user will fill in actual commands.
+
+Use this template:
+
+ENCODER_CMD="<PUT_ENCODER_COMMAND_HERE>"
+DECODER_CMD="<PUT_DECODER_COMMAND_HERE>"
+ENC_LOG="depthcam_encoder.log"
+DEC_LOG="depthcam_decoder.log"
+CHECK_LOG="depthcam_test.log"
+${ENCODER_CMD} > ${ENC_LOG} 2>&1
+${DECODER_CMD} > ${DEC_LOG} 2>&1
+python check_depthcam_run.py --enc-log ${ENC_LOG} --dec-log ${DEC_LOG} > ${CHECK_LOG} 2>&1
+
+The following files must be created:
+
+depthcam_encoder.log
+depthcam_decoder.log
+depthcam_test.log
+
+Required checker script
+
+Create:
+
+check_depthcam_run.py
+
+Required usage:
+
+python check_depthcam_run.py --enc-log depthcam_encoder.log --dec-log depthcam_decoder.log
+
+The script must print PASS/FAIL messages to stdout.
+
+Checker requirements
+
+The checker must inspect encoder and decoder logs for run-level success/failure only.
+
+Encoder log checks
+
+Pass if:
+
+- Encoder log exists.
+- Encoder log is non-empty.
+- Encoder process completed without fatal error.
+
+Fail if encoder log contains obvious fatal failure patterns such as:
+
+- "ERROR"
+- "Error:"
+- "failed"
+- "Failed"
+- "assert"
+- "CHECK"
+- "Segmentation fault"
+- "Aborted"
+- "Exception"
+
+Use case-insensitive matching where appropriate, but avoid false positives from harmless text if the codebase commonly prints benign “error” strings.
+
+Decoder log checks
+
+Pass if:
+
+- Decoder log exists.
+- Decoder log is non-empty.
+- Decoder process completed without fatal error.
+- Decoder MD5/checksum result is OK.
+
+Fail if decoder log contains fatal failure patterns such as:
+
+- "ERROR"
+- "Error:"
+- "failed"
+- "Failed"
+- "assert"
+- "CHECK"
+- "Segmentation fault"
+- "Aborted"
+- "Exception"
+
+Decoder MD5/checksum check
+
+Pass:
+
+- Decoder log contains at least one MD5/checksum line with OK.
+- Decoder log contains no MD5/checksum line with ERROR or mismatch.
+
+Fail:
+
+- No MD5/checksum OK line is found.
+- Any MD5/checksum line contains ERROR.
+- Any checksum mismatch line is found.
+
+The checker should print:
+
+[PASS] encoder log exists
+[PASS] encoder completed without fatal errors
+[PASS] decoder log exists
+[PASS] decoder completed without fatal errors
+[PASS] decoder MD5/checksum checks are OK
+FINAL RESULT: PASS
+
+On failure, print exact reasons:
+
+[FAIL] encoder fatal error found: <full line>
+[FAIL] decoder MD5 ERROR found: <full line>
+FINAL RESULT: FAIL
+
+Macro OFF validation
+
+Build and run with <PUT_MACRO_NAME_HERE> OFF.
+
+Expected:
+
+- Build succeeds.
+- No DepthCam syntax exists in slice header.
+- No DepthCam parameter loading occurs.
+- Encoder/decoder behavior remains original-compatible.
+- Decoder MD5/checksum lines are OK.
+
+If possible, compare macro-OFF output against an original baseline.
+
+Fail if:
+
+- Build fails.
+- Encoder fails.
+- Decoder fails.
+- Decoder MD5/checksum mismatch occurs.
+- Any DepthCam behavior appears in macro-OFF output.
+
+Macro ON validation
+
+Build and run with <PUT_MACRO_NAME_HERE> ON.
+
+Expected:
+
+- Build succeeds.
+- Encoder runs.
+- Decoder runs.
+- DepthCam parameter loading/writing/parsing does not crash.
+- Decoder MD5/checksum lines are OK.
+
+Fail if:
+
+- Build fails.
+- Encoder fails.
+- Decoder fails.
+- Decoder MD5/checksum mismatch occurs.
+- DepthCam parameter loading fails.
+- DepthCam parameter parsing fails.
+- Decoder cannot find required DepthCam param for current POC.
+
+Required final report
+
+Report:
+
+Encoder command used:
+- ...
+Decoder command used:
+- ...
+Encoder log path:
+- depthcam_encoder.log
+Decoder log path:
+- depthcam_decoder.log
+Test log path:
+- depthcam_test.log
+Macro OFF build result:
+- ...
+Macro OFF run result:
+- ...
+Macro ON build result:
+- ...
+Macro ON run result:
+- ...
+Decoder MD5/checksum result:
+- ...
+Final result:
+- PASS or FAIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
