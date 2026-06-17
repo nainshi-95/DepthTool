@@ -1004,3 +1004,49 @@ Final result:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Read plan.md first.
+
+Also use these project skills:
+
+* .claude/skills/depthcam-macro-guard/SKILL.md
+* .claude/skills/depthcam-test/SKILL.md
+
+Do not modify code yet.
+
+First, inspect the current codebase and compare it against plan.md.
+Create an implementation-specific plan.
+
+Report:
+
+* exact files to modify
+* exact functions to modify
+* exact insertion points
+* how EncGOP loads DepthCam parameters
+* how HLSWriter accesses encoder-side DepthCamParam
+* how HLSyntaxReader accesses decoder-side DepthCamParam
+* where full POC is available
+* what API changes are needed
+* build risks
+* any mismatch between plan.md and the current code
+
+After reporting this, stop and wait for my approval before coding.
+
+
+
+
