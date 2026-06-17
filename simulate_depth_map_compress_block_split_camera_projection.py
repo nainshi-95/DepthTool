@@ -18,9 +18,9 @@ import numpy as np
 
 @dataclass
 class Plane:
-    # This script uses inverse-depth plane:
+    # Inverse-depth plane:
     #   invY(x,y) = a * (x - cx) + b * (y - cy) + c
-    # where Y is the stored depth sample, e.g. Z_real = Y * near.
+    # where Y is stored depth sample, e.g. Z_real = Y * near.
     a: float
     b: float
     c: float
@@ -530,114 +530,258 @@ def temporal_center(prev_store, cx, cy):
 
 
 # ============================================================
-# Camera JSON / matrices
+# Camera JSON / JSONL / matrices
 # ============================================================
 
 def load_camera_json(path):
-    with open(path, "r") as f:
-        return json.load(f)
+    """
+    Supports:
+      1. JSON object
+      2. JSON array
+      3. JSONL, one camera frame per line
 
+    Matches the previously verified forward-warp parser style.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
 
-def get_value_by_alias(d, aliases):
-    for a in aliases:
-        if isinstance(d, dict) and a in d:
-            return d[a]
-    return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as json_err:
+        entries = []
 
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
 
-def get_near_clip(cam):
-    v = get_value_by_alias(
-        cam,
-        [
-            "nearClipPlane",
-            "near_clip_plane",
-            "near",
-            "Near",
-            "NearClipPlane",
-        ],
-    )
-    if v is None:
-        return 1.0
-    return float(v)
-
-
-def get_matrix(cam, aliases):
-    v = get_value_by_alias(cam, aliases)
-
-    if v is None:
-        raise KeyError(f"matrix not found: {aliases}")
-
-    if isinstance(v, dict):
-        keys = [
-            ["e00", "e01", "e02", "e03"],
-            ["e10", "e11", "e12", "e13"],
-            ["e20", "e21", "e22", "e23"],
-            ["e30", "e31", "e32", "e33"],
-        ]
-
-        return np.array([[float(v[k]) for k in row] for row in keys], dtype=np.float64)
-
-    arr = np.array(v, dtype=np.float64)
-
-    if arr.shape == (4, 4):
-        return arr
-
-    if arr.size == 16:
-        return arr.reshape(4, 4)
-
-    raise ValueError(f"bad matrix shape for {aliases}: {arr.shape}")
-
-
-def extract_camera_entries(obj):
-    if isinstance(obj, list):
-        return obj
-
-    if isinstance(obj, dict):
-        for k in ["frames", "Frames", "cameras", "Cameras", "cameraFrames", "CameraFrames"]:
-            if k in obj and isinstance(obj[k], list):
-                return obj[k]
-
-        # Single frame dictionary.
-        if any(k in obj for k in ["ProjectionMatrix", "WorldToCameraMatrix", "CameraToWorldMatrix"]):
-            return [obj]
-
-    raise ValueError("cannot find camera frame list in camera json")
-
-
-def camera_frame_key(cam, fallback_idx):
-    for k in ["frameIdx", "frame_idx", "frame", "Frame", "poc", "POC"]:
-        if isinstance(cam, dict) and k in cam:
             try:
-                return int(cam[k])
+                obj = json.loads(line)
+            except json.JSONDecodeError as jsonl_err:
+                raise RuntimeError(
+                    f"Failed to parse camera parameter file as JSON or JSONL: {path}\n"
+                    f"JSON error={json_err}\n"
+                    f"JSONL error at line {line_no}: {jsonl_err}"
+                ) from jsonl_err
+
+            entries.append(obj)
+
+        if not entries:
+            raise RuntimeError(f"Camera parameter file is empty or invalid: {path}")
+
+        return entries
+
+
+def has_camera_matrices(obj):
+    if not isinstance(obj, dict):
+        return False
+
+    keys = set(obj.keys())
+
+    inv_keys = {
+        "InvProjectionMatrix",
+        "invProjectionMatrix",
+        "InverseProjectionMatrix",
+    }
+    proj_keys = {
+        "ProjectionMatrix",
+        "projectionMatrix",
+    }
+    w2c_keys = {
+        "WorldToCameraMatrix",
+        "worldToCameraMatrix",
+        "ViewMatrix",
+    }
+    c2w_keys = {
+        "CameraToWorldMatrix",
+        "cameraToWorldMatrix",
+        "CameraToWorldMarix",
+        "cameraToWorldMarix",
+        "InvViewMatrix",
+    }
+
+    return (
+        bool(keys & inv_keys)
+        and bool(keys & proj_keys)
+        and bool(keys & w2c_keys)
+        and bool(keys & c2w_keys)
+    )
+
+
+def camera_frame_poc(entry, fallback_idx):
+    for key in ["frames", "frame", "Frame", "frameIdx", "frame_idx", "poc", "POC"]:
+        if isinstance(entry, dict) and key in entry:
+            try:
+                return int(entry[key])
             except Exception:
                 pass
-    return fallback_idx
+
+    return int(fallback_idx)
 
 
-def build_camera_lookup(camera_json):
-    entries = extract_camera_entries(camera_json)
+def extract_camera_entries(cams_json):
+    entries = []
+
+    if isinstance(cams_json, list):
+        entries = cams_json
+
+    elif isinstance(cams_json, dict):
+        for k in [
+            "frames",
+            "Frames",
+            "cameras",
+            "Cameras",
+            "cameraFrames",
+            "CameraFrames",
+            "camera_params",
+            "cameraParams",
+        ]:
+            if k in cams_json and isinstance(cams_json[k], list):
+                entries = cams_json[k]
+                break
+
+        if not entries and has_camera_matrices(cams_json):
+            entries = [cams_json]
+
+        if not entries:
+            numeric_items = []
+            for k, v in cams_json.items():
+                if isinstance(v, dict) and has_camera_matrices(v):
+                    try:
+                        numeric_items.append((int(k), v))
+                    except Exception:
+                        pass
+
+            if numeric_items:
+                numeric_items.sort(key=lambda x: x[0])
+                entries = [v for _, v in numeric_items]
+
+    if not entries:
+        raise RuntimeError("Cannot parse camera parameter structure")
+
+    return entries
+
+
+def build_camera_lookup(cams_json):
+    entries = extract_camera_entries(cams_json)
+
     lookup = {}
 
-    for i, cam in enumerate(entries):
-        key = camera_frame_key(cam, i)
-        lookup[key] = cam
-        lookup[i] = cam
+    for i, entry in enumerate(entries):
+        poc = camera_frame_poc(entry, i)
+
+        lookup[poc] = entry
+
+        # fallback by list index
+        if i not in lookup:
+            lookup[i] = entry
 
     return lookup
 
 
-def get_camera(lookup, frame_idx):
-    if frame_idx in lookup:
-        return lookup[frame_idx]
-    raise KeyError(f"camera for frame {frame_idx} not found")
+def get_camera(camera_lookup, frame_idx):
+    if frame_idx not in camera_lookup:
+        raise KeyError(f"Camera for frame {frame_idx} not found")
+    return camera_lookup[frame_idx]
+
+
+def get_value_by_alias(entry, aliases, required=True):
+    for key in aliases:
+        if isinstance(entry, dict) and key in entry:
+            return entry[key]
+
+    if required:
+        raise KeyError(f"Missing key. aliases={aliases}")
+
+    return None
+
+
+def get_near_clip(entry):
+    val = get_value_by_alias(
+        entry,
+        ["nearClipPlane", "NearClipPlane", "near_clip_plane", "near", "Near"],
+        required=False,
+    )
+
+    if val is None:
+        return 1.0
+
+    return float(val)
+
+
+def get_matrix(frame_entry, logical_name_or_aliases):
+    """
+    Important:
+      If matrix is stored as dict e00~e33, return mat.T.
+
+    This matches the previously verified forward-warp code:
+      # ì¤ì: dict e00~e33 matrixë transposeí´ì ì¬ì©
+      return mat.T
+
+    Accepts either:
+      get_matrix(cam, "ProjectionMatrix")
+      get_matrix(cam, ["ProjectionMatrix", "projectionMatrix"])
+    """
+    alias_map = {
+        "InvProjectionMatrix": [
+            "InvProjectionMatrix",
+            "invProjectionMatrix",
+            "InverseProjectionMatrix",
+        ],
+        "ProjectionMatrix": [
+            "ProjectionMatrix",
+            "projectionMatrix",
+        ],
+        "WorldToCameraMatrix": [
+            "WorldToCameraMatrix",
+            "worldToCameraMatrix",
+            "ViewMatrix",
+        ],
+        "CameraToWorldMatrix": [
+            "CameraToWorldMatrix",
+            "cameraToWorldMatrix",
+            "CameraToWorldMarix",
+            "cameraToWorldMarix",
+            "InvViewMatrix",
+        ],
+    }
+
+    if isinstance(logical_name_or_aliases, str):
+        aliases = alias_map.get(logical_name_or_aliases, [logical_name_or_aliases])
+    else:
+        aliases = list(logical_name_or_aliases)
+
+    obj = get_value_by_alias(frame_entry, aliases, required=True)
+
+    if isinstance(obj, dict):
+        mat = np.zeros((4, 4), dtype=np.float64)
+
+        for r in range(4):
+            for c in range(4):
+                key = f"e{r}{c}"
+                if key not in obj:
+                    raise KeyError(f"Missing matrix key {key} for aliases={aliases}")
+                mat[r, c] = float(obj[key])
+
+        return mat.T
+
+    mat = np.array(obj, dtype=np.float64)
+
+    if mat.shape == (16,):
+        mat = mat.reshape(4, 4)
+
+    if mat.shape != (4, 4):
+        raise ValueError(f"matrix shape is {mat.shape}, expected 4x4. aliases={aliases}")
+
+    return mat
 
 
 def camera_has_required_mats(cam):
     try:
-        get_matrix(cam, ["InvProjectionMatrix", "invProjectionMatrix", "InverseProjectionMatrix"])
-        get_matrix(cam, ["ProjectionMatrix", "projectionMatrix"])
-        get_matrix(cam, ["WorldToCameraMatrix", "worldToCameraMatrix", "ViewMatrix"])
-        get_matrix(cam, ["CameraToWorldMatrix", "cameraToWorldMatrix", "InvViewMatrix"])
+        get_matrix(cam, "InvProjectionMatrix")
+        get_matrix(cam, "ProjectionMatrix")
+        get_matrix(cam, "WorldToCameraMatrix")
+        get_matrix(cam, "CameraToWorldMatrix")
         return True
     except Exception:
         return False
@@ -662,7 +806,8 @@ def pixel_rays_camera(u, v, width, height, inv_proj):
     z = p_view[..., 2:3]
     z_abs = np.maximum(np.abs(z), 1e-12)
 
-    # ray has abs(z) == 1. A real point is ray * linear_depth.
+    # Same convention as verified forward warp:
+    # p_view_scaled = p_view / abs(p_view.z) * depth
     return p_view / z_abs
 
 
@@ -694,9 +839,11 @@ def fit_3d_plane(points):
 
 
 def transform_plane_src_to_tgt(plane_src, cam_src, cam_tgt):
-    c2w_src = get_matrix(cam_src, ["CameraToWorldMatrix", "cameraToWorldMatrix", "InvViewMatrix"])
-    w2c_tgt = get_matrix(cam_tgt, ["WorldToCameraMatrix", "worldToCameraMatrix", "ViewMatrix"])
+    c2w_src = get_matrix(cam_src, "CameraToWorldMatrix")
+    w2c_tgt = get_matrix(cam_tgt, "WorldToCameraMatrix")
 
+    # Column-vector transform equivalent to:
+    # p_tgt = W2C_tgt @ C2W_src @ p_src
     m = w2c_tgt @ c2w_src
 
     try:
@@ -714,7 +861,7 @@ def transform_plane_src_to_tgt(plane_src, cam_src, cam_tgt):
 
 
 def image_inv_plane_to_3d_plane(leaf, cam, frame_w, frame_h, args):
-    inv_proj = get_matrix(cam, ["InvProjectionMatrix", "invProjectionMatrix", "InverseProjectionMatrix"])
+    inv_proj = get_matrix(cam, "InvProjectionMatrix")
     near = get_near_clip(cam)
 
     ns = max(2, int(args.plane_warp_samples))
@@ -740,7 +887,7 @@ def image_inv_plane_to_3d_plane(leaf, cam, frame_w, frame_h, args):
 
 
 def render_3d_plane_to_depth_block(plane_cam, cam_cur, x, y, w, h, frame_w, frame_h, args):
-    inv_proj = get_matrix(cam_cur, ["InvProjectionMatrix", "invProjectionMatrix", "InverseProjectionMatrix"])
+    inv_proj = get_matrix(cam_cur, "InvProjectionMatrix")
     near = get_near_clip(cam_cur)
 
     gx = np.arange(x, x + w, dtype=np.float64)
@@ -762,7 +909,7 @@ def render_3d_plane_to_depth_block(plane_cam, cam_cur, x, y, w, h, frame_w, fram
     scale = np.full((h, w), np.nan, dtype=np.float64)
     scale[valid] = -d / denom[valid]
 
-    # Since rays have abs(z)=1, scale is the linear depth.
+    # rays have abs(z)==1, so scale is linear depth.
     valid = valid & np.isfinite(scale) & (scale > 0)
 
     valid_ratio = float(np.mean(valid))
@@ -1543,13 +1690,18 @@ def compute_metrics(orig, recon, maxv, mask=None):
 def bilinear_sample(img, map_x, map_y, valid, fill):
     h, w = img.shape
 
-    x0 = np.floor(map_x).astype(np.int64)
-    y0 = np.floor(map_y).astype(np.int64)
+    safe_x = np.where(np.isfinite(map_x), map_x, 0.0)
+    safe_y = np.where(np.isfinite(map_y), map_y, 0.0)
+
+    x0 = np.floor(safe_x).astype(np.int64)
+    y0 = np.floor(safe_y).astype(np.int64)
     x1 = x0 + 1
     y1 = y0 + 1
 
     valid2 = (
         valid
+        & np.isfinite(map_x)
+        & np.isfinite(map_y)
         & (x0 >= 0)
         & (y0 >= 0)
         & (x1 < w)
@@ -1561,8 +1713,8 @@ def bilinear_sample(img, map_x, map_y, valid, fill):
     y0c = np.clip(y0, 0, h - 1)
     y1c = np.clip(y1, 0, h - 1)
 
-    dx = map_x - x0
-    dy = map_y - y0
+    dx = safe_x - x0
+    dy = safe_y - y0
 
     v00 = img[y0c, x0c]
     v01 = img[y0c, x1c]
@@ -1582,10 +1734,10 @@ def bilinear_sample(img, map_x, map_y, valid, fill):
 
 
 def make_backward_map_cur_to_prev(depth_y_cur, cam_cur, cam_prev, width, height):
-    inv_proj_cur = get_matrix(cam_cur, ["InvProjectionMatrix", "invProjectionMatrix", "InverseProjectionMatrix"])
-    c2w_cur = get_matrix(cam_cur, ["CameraToWorldMatrix", "cameraToWorldMatrix", "InvViewMatrix"])
-    w2c_prev = get_matrix(cam_prev, ["WorldToCameraMatrix", "worldToCameraMatrix", "ViewMatrix"])
-    proj_prev = get_matrix(cam_prev, ["ProjectionMatrix", "projectionMatrix"])
+    inv_proj_cur = get_matrix(cam_cur, "InvProjectionMatrix")
+    c2w_cur = get_matrix(cam_cur, "CameraToWorldMatrix")
+    w2c_prev = get_matrix(cam_prev, "WorldToCameraMatrix")
+    proj_prev = get_matrix(cam_prev, "ProjectionMatrix")
 
     near_cur = get_near_clip(cam_cur)
 
@@ -1622,6 +1774,8 @@ def make_backward_map_cur_to_prev(depth_y_cur, cam_cur, cam_prev, width, height)
         valid
         & np.isfinite(map_x)
         & np.isfinite(map_y)
+        & np.isfinite(linear_z)
+        & (linear_z > 0)
         & (map_x >= 0.0)
         & (map_y >= 0.0)
         & (map_x <= width - 1.0)
@@ -1841,7 +1995,12 @@ def frame_size_yuv420p10le(w, h):
 
 
 def count_frames(path, w, h):
-    return os.path.getsize(path) // frame_size_yuv420p10le(w, h)
+    size = os.path.getsize(path)
+    frame_size = frame_size_yuv420p10le(w, h)
+    trailing = size % frame_size
+    if trailing:
+        print(f"[WARN] trailing bytes ignored: {path}, trailing={trailing}")
+    return size // frame_size
 
 
 def read_yuv420p10le_frame(fp, idx, w, h):
@@ -1906,7 +2065,7 @@ def parse_args():
         default="",
         help="GT video YUV420p10le sequence to backward warp. If empty, input-depth is used.",
     )
-    p.add_argument("--camera-param", required=True, help="camera json")
+    p.add_argument("--camera-param", required=True, help="camera JSON/JSONL/TXT")
 
     p.add_argument("--width", type=int, required=True)
     p.add_argument("--height", type=int, required=True)
@@ -2177,7 +2336,7 @@ def main():
                     f"leaf={sm['leaf_blocks']} | "
                     f"QT={sm['qt_nodes']} | "
                     f"BH/BV={sm['bin_h_nodes']}/{sm['bin_v_nodes']} | "
-                    f"D/C/Δ={sm['direct_ratio']:.3f}/"
+                    f"D/C/Î={sm['direct_ratio']:.3f}/"
                     f"{sm['copy_ratio']:.3f}/"
                     f"{sm['delta_ratio']:.3f}"
                 )
