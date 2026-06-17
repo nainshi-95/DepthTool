@@ -3,7 +3,7 @@
 
 import argparse, csv, json, math, os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -48,21 +48,34 @@ class CSNode:
     parent: Optional["CSNode"] = None
     split: str = "leaf"  # leaf, qt, bh, bv
     children: List["CSNode"] = field(default_factory=list)
+
     best: Optional[ModeResult] = None
     actual: Optional[Plane] = None
     avail_modes: List[str] = field(default_factory=list)
     avail_cands: List[str] = field(default_factory=list)
+
     bits: float = 0.0
     sse: float = 0.0
     cost: float = 0.0
     split_bits: float = 0.0
+
+    # True only when qt_split_flag was actually coded at this node.
+    qt_flag_present: bool = False
 
     def is_leaf(self):
         return self.split == "leaf"
 
 
 class AdaptiveProbTable:
-    def __init__(self, symbols, init_probs=None, update_rate=0.05, p_min=0.02, p_max=0.95, name=""):
+    def __init__(
+        self,
+        symbols,
+        init_probs=None,
+        update_rate=0.05,
+        p_min=0.02,
+        p_max=0.95,
+        name="",
+    ):
         self.symbols = list(symbols)
         self.n = len(self.symbols)
         self.update_rate = float(update_rate)
@@ -83,7 +96,9 @@ class AdaptiveProbTable:
             total = sum(float(init_probs.get(s, 0.0)) for s in self.symbols)
             if total <= 0:
                 raise ValueError("init_probs sum must be positive")
-            self.probs = {s: float(init_probs.get(s, 0.0)) / total for s in self.symbols}
+            self.probs = {
+                s: float(init_probs.get(s, 0.0)) / total for s in self.symbols
+            }
 
         self._project()
 
@@ -135,9 +150,15 @@ class AdaptiveProbTable:
                 break
 
             if diff > 0:
-                adj = [s for s in self.symbols if self.probs[s] < self.p_max - 1e-12]
+                adj = [
+                    s for s in self.symbols
+                    if self.probs[s] < self.p_max - 1e-12
+                ]
             else:
-                adj = [s for s in self.symbols if self.probs[s] > self.p_min + 1e-12]
+                adj = [
+                    s for s in self.symbols
+                    if self.probs[s] > self.p_min + 1e-12
+                ]
 
             if not adj:
                 break
@@ -152,7 +173,14 @@ class AdaptiveProbTable:
 
 
 class BinaryAdaptiveProb:
-    def __init__(self, init_p1=0.5, update_rate=0.05, p_min=0.02, p_max=0.98, name=""):
+    def __init__(
+        self,
+        init_p1=0.5,
+        update_rate=0.05,
+        p_min=0.02,
+        p_max=0.98,
+        name="",
+    ):
         self.p1 = float(init_p1)
         self.update_rate = float(update_rate)
         self.p_min = float(p_min)
@@ -206,6 +234,27 @@ def unary_candidate_update(idx, n, ctx, truncated=True):
 
     if not (truncated and idx == n - 1):
         ctx[idx].update(1)
+
+
+def qt_split_flag_bits(adaptive, depth, flag):
+    if adaptive is not None and "qt_split" in adaptive and depth < len(adaptive["qt_split"]):
+        return adaptive["qt_split"][depth].bits(flag)
+
+    return 1.0
+
+
+def qt_split_flag_update(adaptive, node):
+    if adaptive is None or "qt_split" not in adaptive:
+        return
+
+    if not node.qt_flag_present:
+        return
+
+    if node.depth >= len(adaptive["qt_split"]):
+        return
+
+    flag = 1 if node.split == "qt" else 0
+    adaptive["qt_split"][node.depth].update(flag)
 
 
 def ceil_log2(x):
@@ -285,6 +334,18 @@ def create_adaptive_models(args):
                 name=f"copy_ctx{i}",
             )
             for i in range(args.max_candidates)
+        ]
+
+    if args.qt_split_adaptive:
+        models["qt_split"] = [
+            BinaryAdaptiveProb(
+                init_p1=0.5,
+                update_rate=args.prob_lr,
+                p_min=args.prob_min,
+                p_max=args.prob_max,
+                name=f"qt_split_depth{i}",
+            )
+            for i in range(args.max_qt_depth)
         ]
 
     if args.delta_residual_adaptive:
@@ -623,7 +684,7 @@ def add_leaves_to_store(node, store):
         add_leaves_to_store(c, store)
 
 
-def parent_node(x, y, w, h, depth, parent, split, split_bits, children, args):
+def parent_node(x, y, w, h, depth, parent, split, split_bits, children, args, qt_flag_present):
     n = CSNode(
         x=x,
         y=y,
@@ -634,6 +695,7 @@ def parent_node(x, y, w, h, depth, parent, split, split_bits, children, args):
         split=split,
         children=children,
         split_bits=split_bits,
+        qt_flag_present=qt_flag_present,
     )
 
     for c in children:
@@ -663,7 +725,16 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
 
     # no split
     leaf = eval_leaf(padded, x, y, w, h, depth, parent, args, grid, store, adaptive)
-    leaf.split_bits = (1.0 if qt_ok else 0.0) + (1.0 if extra_ok else 0.0)
+    leaf.qt_flag_present = qt_ok
+
+    leaf.split_bits = 0.0
+
+    if qt_ok:
+        leaf.split_bits += qt_split_flag_bits(adaptive, depth, 0)
+
+    if extra_ok:
+        leaf.split_bits += 1.0  # extra_split_flag = 0, fixed 50:50
+
     leaf.bits += leaf.split_bits
     leaf.cost += args.lambda_rd * leaf.split_bits
     cand.append(leaf)
@@ -690,8 +761,29 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
             adaptive,
         )
 
-        split_bits = (1.0 if qt_ok else 0.0) + 1.0 + 1.0
-        cand.append(parent_node(x, y, w, h, depth, parent, "bh", split_bits, [c0, c1], args))
+        split_bits = 0.0
+
+        if qt_ok:
+            split_bits += qt_split_flag_bits(adaptive, depth, 0)
+
+        split_bits += 1.0  # extra_split_flag = 1
+        split_bits += 1.0  # extra_split_dir_flag
+
+        cand.append(
+            parent_node(
+                x,
+                y,
+                w,
+                h,
+                depth,
+                parent,
+                "bh",
+                split_bits,
+                [c0, c1],
+                args,
+                qt_flag_present=qt_ok,
+            )
+        )
 
     # binary vertical: left/right
     if bv_ok:
@@ -715,8 +807,29 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
             adaptive,
         )
 
-        split_bits = (1.0 if qt_ok else 0.0) + 1.0 + 1.0
-        cand.append(parent_node(x, y, w, h, depth, parent, "bv", split_bits, [c0, c1], args))
+        split_bits = 0.0
+
+        if qt_ok:
+            split_bits += qt_split_flag_bits(adaptive, depth, 0)
+
+        split_bits += 1.0  # extra_split_flag = 1
+        split_bits += 1.0  # extra_split_dir_flag
+
+        cand.append(
+            parent_node(
+                x,
+                y,
+                w,
+                h,
+                depth,
+                parent,
+                "bv",
+                split_bits,
+                [c0, c1],
+                args,
+                qt_flag_present=qt_ok,
+            )
+        )
 
     # quad split
     if qt_ok:
@@ -751,7 +864,23 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
             children.append(c)
             add_leaves_to_store(c, st)
 
-        cand.append(parent_node(x, y, w, h, depth, parent, "qt", 1.0, children, args))
+        split_bits = qt_split_flag_bits(adaptive, depth, 1)
+
+        cand.append(
+            parent_node(
+                x,
+                y,
+                w,
+                h,
+                depth,
+                parent,
+                "qt",
+                split_bits,
+                children,
+                args,
+                qt_flag_present=True,
+            )
+        )
 
     best = min(cand, key=lambda n: n.cost)
     best.parent = parent
@@ -760,6 +889,9 @@ def encode_node(padded, x, y, w, h, depth, parent, args, grid, store, adaptive):
 
 
 def commit_node(node, store, adaptive, writer, frame_idx):
+    # Update qt_split_flag only for nodes where that flag was really coded.
+    qt_split_flag_update(adaptive, node)
+
     if not node.is_leaf():
         for c in node.children:
             commit_node(c, store, adaptive, writer, frame_idx)
@@ -987,6 +1119,10 @@ def simulate_one_frame(depth, frame_idx, args, grid, writer=None, adaptive=None)
             for i, c in enumerate(adaptive["copy_candidate_unary"]):
                 summary[f"final_copy_unary_ctx{i}_p1"] = c.p1
 
+        if "qt_split" in adaptive:
+            for i, c in enumerate(adaptive["qt_split"]):
+                summary[f"final_qt_split_depth{i}_p1"] = c.p1
+
         if "delta_res_abs_a" in adaptive:
             for k in "abc":
                 summary.update(
@@ -1044,6 +1180,7 @@ def parse_args():
 
     p.add_argument("--adaptive-prob", action="store_true")
     p.add_argument("--copy-candidate-unary", action="store_true")
+    p.add_argument("--qt-split-adaptive", action="store_true")
 
     p.add_argument("--delta-residual-adaptive", action="store_true")
     p.add_argument("--delta-abs-max", type=int, default=7)
@@ -1077,6 +1214,9 @@ def main():
 
     if args.copy_candidate_unary and not args.adaptive_prob:
         raise ValueError("--copy-candidate-unary requires --adaptive-prob")
+
+    if args.qt_split_adaptive and not args.adaptive_prob:
+        raise ValueError("--qt-split-adaptive requires --adaptive-prob")
 
     if args.delta_residual_adaptive and not args.adaptive_prob:
         raise ValueError("--delta-residual-adaptive requires --adaptive-prob")
