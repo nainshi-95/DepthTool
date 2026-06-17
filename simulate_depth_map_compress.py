@@ -35,13 +35,11 @@ class ModeResult:
 
 class AdaptiveProbTable:
     """
-    Simple CABAC-like adaptive probability model.
+    Simple categorical CABAC-like adaptive probability model.
 
-    - bit estimate: -log2(P(symbol))
-    - after selected symbol:
-        selected probability increases
-        other probabilities decrease
-    - probabilities are clamped by p_min / p_max
+    Used for:
+      - mode coding
+      - delta candidate categorical coding
     """
 
     def __init__(
@@ -182,6 +180,120 @@ class AdaptiveProbTable:
         return {f"{prefix}_{s}_prob": self.probs[s] for s in self.symbols}
 
 
+class BinaryAdaptiveProb:
+    """
+    Binary CABAC-like probability model.
+
+    Used for:
+      - copy candidate truncated unary coding
+
+    p1 = P(bin == 1)
+    bits(1) = -log2(p1)
+    bits(0) = -log2(1 - p1)
+    """
+
+    def __init__(
+        self,
+        init_p1=0.5,
+        update_rate=0.05,
+        p_min=0.02,
+        p_max=0.98,
+        name="",
+    ):
+        self.p1 = float(init_p1)
+        self.update_rate = float(update_rate)
+        self.p_min = float(p_min)
+        self.p_max = float(p_max)
+        self.name = name
+        self._clip()
+
+    def _clip(self):
+        self.p1 = min(max(self.p1, self.p_min), self.p_max)
+
+    def bits(self, bin_value: int) -> float:
+        if bin_value not in (0, 1):
+            raise ValueError("bin_value must be 0 or 1")
+
+        if bin_value == 1:
+            p = self.p1
+        else:
+            p = 1.0 - self.p1
+
+        return -math.log2(max(p, 1e-12))
+
+    def update(self, bin_value: int):
+        if bin_value not in (0, 1):
+            raise ValueError("bin_value must be 0 or 1")
+
+        target = self.p_max if bin_value == 1 else self.p_min
+        lr = self.update_rate
+        self.p1 = (1.0 - lr) * self.p1 + lr * target
+        self._clip()
+
+    def snapshot(self, prefix):
+        return {f"{prefix}_p1": self.p1}
+
+
+def unary_candidate_bits(
+    cand_idx: int,
+    num_candidates: int,
+    ctx_models: List[BinaryAdaptiveProb],
+    truncated: bool = True,
+) -> float:
+    """
+    Truncated unary candidate coding.
+
+    Example num_candidates=4:
+      idx 0: 1
+      idx 1: 0 1
+      idx 2: 0 0 1
+      idx 3: 0 0 0     # final candidate implicit if truncated=True
+    """
+    if num_candidates <= 1:
+        return 0.0
+
+    if cand_idx < 0 or cand_idx >= num_candidates:
+        raise ValueError("cand_idx out of range")
+
+    if num_candidates > len(ctx_models):
+        raise ValueError("num_candidates exceeds number of unary contexts")
+
+    bits = 0.0
+    last_idx = num_candidates - 1
+
+    for i in range(cand_idx):
+        bits += ctx_models[i].bits(0)
+
+    if not (truncated and cand_idx == last_idx):
+        bits += ctx_models[cand_idx].bits(1)
+
+    return bits
+
+
+def unary_candidate_update(
+    cand_idx: int,
+    num_candidates: int,
+    ctx_models: List[BinaryAdaptiveProb],
+    truncated: bool = True,
+):
+    if num_candidates <= 1:
+        return
+
+    if cand_idx < 0 or cand_idx >= num_candidates:
+        raise ValueError("cand_idx out of range")
+
+    if num_candidates > len(ctx_models):
+        raise ValueError("num_candidates exceeds number of unary contexts")
+
+    last_idx = num_candidates - 1
+
+    for i in range(cand_idx):
+        ctx_models[i].update(0)
+
+    if not (truncated and cand_idx == last_idx):
+        ctx_models[cand_idx].update(1)
+
+
 def create_adaptive_models(args):
     mode_model = AdaptiveProbTable(
         symbols=["direct", "copy", "delta"],
@@ -199,10 +311,24 @@ def create_adaptive_models(args):
         name="candidate",
     )
 
-    return {
+    models = {
         "mode": mode_model,
         "candidate": candidate_model,
     }
+
+    if args.copy_candidate_unary:
+        models["copy_candidate_unary"] = [
+            BinaryAdaptiveProb(
+                init_p1=0.5,
+                update_rate=args.prob_lr,
+                p_min=args.prob_min,
+                p_max=args.prob_max,
+                name=f"copy_cand_unary_ctx{i}",
+            )
+            for i in range(args.max_candidates)
+        ]
+
+    return models
 
 
 def ceil_log2(x: int) -> int:
@@ -212,25 +338,12 @@ def ceil_log2(x: int) -> int:
 
 
 def exp_golomb_len_unsigned(u: int) -> int:
-    """
-    Unsigned Exp-Golomb code length.
-    code_num = u
-    length = 2 * floor(log2(code_num + 1)) + 1
-    """
     if u < 0:
         raise ValueError("unsigned Exp-Golomb input must be non-negative")
     return 2 * int(math.floor(math.log2(u + 1))) + 1
 
 
 def signed_to_code_num(v: int) -> int:
-    """
-    Signed integer mapping:
-      0  -> 0
-      +1 -> 1
-      -1 -> 2
-      +2 -> 3
-      -2 -> 4
-    """
     if v == 0:
         return 0
     if v > 0:
@@ -360,6 +473,7 @@ def make_candidates(
     block_size: int,
     cur_cx: float,
     cur_cy: float,
+    max_candidates: int,
 ) -> List[Tuple[str, Plane]]:
     candidates: List[Tuple[str, Plane]] = []
 
@@ -390,7 +504,7 @@ def make_candidates(
         )
         candidates.append(("avg_left_top", avg))
 
-    return candidates
+    return candidates[:max_candidates]
 
 
 def eval_direct_mode(
@@ -468,13 +582,25 @@ def eval_copy_modes(
 
     cand_bits = ceil_log2(len(candidates))
 
-    for cand_name, cand_plane in candidates:
+    for cand_idx, (cand_name, cand_plane) in enumerate(candidates):
         recon_block = render_plane_block(cand_plane, xx, yy, max_value)
         sse = block_sse(orig_block, recon_block)
 
         if adaptive_models is not None:
             bits = adaptive_models["mode"].bits("copy", available_modes)
-            bits += adaptive_models["candidate"].bits(cand_name, available_candidate_names)
+
+            if "copy_candidate_unary" in adaptive_models:
+                bits += unary_candidate_bits(
+                    cand_idx=cand_idx,
+                    num_candidates=len(candidates),
+                    ctx_models=adaptive_models["copy_candidate_unary"],
+                    truncated=True,
+                )
+            else:
+                bits += adaptive_models["candidate"].bits(
+                    cand_name,
+                    available_candidate_names,
+                )
         else:
             bits = float(mode_bits + cand_bits)
 
@@ -541,7 +667,10 @@ def eval_delta_modes(
 
         if adaptive_models is not None:
             bits = adaptive_models["mode"].bits("delta", available_modes)
-            bits += adaptive_models["candidate"].bits(cand_name, available_candidate_names)
+            bits += adaptive_models["candidate"].bits(
+                cand_name,
+                available_candidate_names,
+            )
         else:
             bits = float(mode_bits + cand_bits)
 
@@ -604,6 +733,7 @@ def simulate_one_frame(
     lambda_rd: float,
     mode_bits: int,
     max_value: int,
+    max_candidates: int,
     xx: np.ndarray,
     yy: np.ndarray,
     pinv: np.ndarray,
@@ -646,6 +776,7 @@ def simulate_one_frame(
                 block_size=block_size,
                 cur_cx=cur_cx,
                 cur_cy=cur_cy,
+                max_candidates=max_candidates,
             )
 
             available_candidate_names = [name for name, _ in candidates]
@@ -715,7 +846,19 @@ def simulate_one_frame(
                 if len(available_modes) > 1:
                     adaptive_models["mode"].update(best.mode)
 
-                if best.mode in ("copy", "delta") and len(available_candidate_names) > 1:
+                if best.mode == "copy" and len(available_candidate_names) > 1:
+                    if "copy_candidate_unary" in adaptive_models:
+                        cand_idx = available_candidate_names.index(best.candidate_name)
+                        unary_candidate_update(
+                            cand_idx=cand_idx,
+                            num_candidates=len(available_candidate_names),
+                            ctx_models=adaptive_models["copy_candidate_unary"],
+                            truncated=True,
+                        )
+                    else:
+                        adaptive_models["candidate"].update(best.candidate_name)
+
+                elif best.mode == "delta" and len(available_candidate_names) > 1:
                     adaptive_models["candidate"].update(best.candidate_name)
 
             recon_padded[by : by + block_size, bx : bx + block_size] = best.recon_block
@@ -801,6 +944,10 @@ def simulate_one_frame(
         summary.update(adaptive_models["mode"].snapshot("final_mode"))
         summary.update(adaptive_models["candidate"].snapshot("final_candidate"))
 
+        if "copy_candidate_unary" in adaptive_models:
+            for i, ctx in enumerate(adaptive_models["copy_candidate_unary"]):
+                summary[f"final_copy_unary_ctx{i}_p1"] = ctx.p1
+
     return recon, summary
 
 
@@ -825,7 +972,7 @@ def parse_args():
         "--block-size",
         type=int,
         default=16,
-        help="Square block size. Example: 8, 16, 32",
+        help="Square block size. Example: 8, 16, 32, 128",
     )
 
     parser.add_argument(
@@ -857,6 +1004,19 @@ def parse_args():
         "--adaptive-prob",
         action="store_true",
         help="Use adaptive probability table for mode/candidate bit estimation.",
+    )
+
+    parser.add_argument(
+        "--copy-candidate-unary",
+        action="store_true",
+        help="Use truncated unary adaptive coding for copy candidate index.",
+    )
+
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=8,
+        help="Maximum number of candidates and unary contexts.",
     )
 
     parser.add_argument(
@@ -925,6 +1085,12 @@ def main():
 
     if args.width % 2 != 0 or args.height % 2 != 0:
         raise ValueError("yuv420p10le requires even width and height")
+
+    if args.max_candidates <= 0:
+        raise ValueError("--max-candidates must be positive")
+
+    if args.copy_candidate_unary and not args.adaptive_prob:
+        raise ValueError("--copy-candidate-unary requires --adaptive-prob")
 
     if args.prob_lr < 0.0 or args.prob_lr > 1.0:
         raise ValueError("--prob-lr must be in [0, 1]")
@@ -1019,6 +1185,7 @@ def main():
                     lambda_rd=args.lambda_rd,
                     mode_bits=args.mode_bits,
                     max_value=args.max_value,
+                    max_candidates=args.max_candidates,
                     xx=xx,
                     yy=yy,
                     pinv=pinv,
@@ -1087,6 +1254,9 @@ def main():
         "final_candidate_avg_left_top_prob",
     ]
 
+    for i in range(args.max_candidates):
+        numeric_keys.append(f"final_copy_unary_ctx{i}_p1")
+
     for k in numeric_keys:
         vals = [
             float(s[k])
@@ -1113,6 +1283,8 @@ def main():
         "mode_bits": args.mode_bits,
         "max_value": args.max_value,
         "adaptive_prob": args.adaptive_prob,
+        "copy_candidate_unary": args.copy_candidate_unary,
+        "max_candidates": args.max_candidates,
         "prob_lr": args.prob_lr,
         "prob_min": args.prob_min,
         "prob_max": args.prob_max,
