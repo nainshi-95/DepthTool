@@ -1,45 +1,46 @@
-현재 PYUV viewer의 장기 목표는 Windows 전용 D3D11 viewer를 Windows/Linux 공통 viewer 구조로 확장하는 것이다.
+The long-term goal of the current PYUV viewer is to extend the Windows-only D3D11 viewer into a common Windows/Linux viewer architecture.
 
-핵심 목표는 다음과 같다.
+The core goals are as follows.
 
-1. PyQt UI, playlist, JSON import, options, metadata, PYUV reader, prefetch/read-ahead, playback control은 OS와 무관한 공통 코드로 유지한다.
+1. Keep the PyQt UI, playlist, JSON import, options, metadata, PYUV reader, prefetch/read-ahead, and playback control as OS-independent common code.
 
-2. OS별로 달라지는 부분은 video rendering backend 안에만 격리한다.
+2. Isolate all OS-specific behavior inside the video rendering backend.
 
-3. Windows에서는 기존 D3D11/DXGI backend를 유지한다.
-   - 현재 구현된 Windows SDR/HDR 기능은 최대한 그대로 보존한다.
-   - Windows HDR은 기존처럼 D3D11 swapchain, DXGI color space, FP16/scRGB 계열 출력 경로를 사용한다.
+3. On Windows, keep the existing D3D11/DXGI backend.
+   - Preserve the current Windows SDR/HDR functionality as much as possible.
+   - Continue using the existing Windows HDR path based on the D3D11 swapchain, DXGI color space handling, and FP16/scRGB-style output.
 
-4. Linux에서는 새 Vulkan backend를 추가한다.
-   - Linux에서 D3D11은 사용할 수 없으므로 rendering backend를 새로 작성해야 한다.
-   - Linux SDR playback은 Vulkan backend로 구현한다.
-   - Linux HDR은 Vulkan + Wayland 중심으로 experimental support로 구현한다.
+4. On Linux, add a new Vulkan backend.
+   - D3D11 cannot be used on Linux, so the rendering backend must be newly implemented.
+   - Linux SDR playback should be implemented using Vulkan.
+   - Linux HDR should be implemented as experimental support based mainly on Vulkan + Wayland.
 
-5. viewer_main.py가 D3D11이나 Vulkan의 세부 구현을 직접 알지 않게 한다.
-   - viewer_main.py는 공통 VideoWidget/Renderer interface만 호출한다.
-   - 실제 backend 선택은 RendererFactory에서 처리한다.
+5. viewer_main.py should not directly know about D3D11 or Vulkan implementation details.
+   - viewer_main.py should only call a common VideoWidget/Renderer interface.
+   - Actual backend selection should be handled by a RendererFactory.
 
-6. 실행 시 OS를 감지해서 backend를 자동 선택한다.
+6. Detect the OS at runtime and automatically select the backend.
    - Windows: D3D11VideoWidget / D3D11Renderer
    - Linux: VulkanVideoWidget / VulkanRenderer
-   - 지원하지 않는 OS는 명확한 error를 표시한다.
+   - Unsupported OS: show a clear error message.
 
-7. HDR은 단순히 사용자가 켜면 무조건 native HDR로 출력하는 구조가 아니라, runtime capability probe 기반으로 동작해야 한다.
-   - Windows에서는 기존 HDR 경로를 사용한다.
-   - Linux에서는 Vulkan surface format/color space를 검사한다.
-   - HDR 가능한 color space가 있으면 native HDR output을 시도한다.
-   - HDR 출력이 불가능한 환경이면 SDR tone-mapped preview로 fallback한다.
+7. HDR should not be implemented as “always output native HDR whenever the user enables HDR.”
+   Instead, HDR must be based on runtime capability probing.
+   - On Windows, use the existing HDR path.
+   - On Linux, inspect the available Vulkan surface formats and color spaces.
+   - If an HDR-capable color space is available, try native HDR output.
+   - If native HDR output is not available, fall back to SDR tone-mapped preview.
 
-8. Linux HDR은 환경 의존성이 크기 때문에 반드시 fallback 구조가 있어야 한다.
-   - Wayland session 여부
-   - Vulkan 지원 여부
-   - GPU driver 지원 여부
-   - monitor HDR 지원 여부
-   - compositor의 HDR/color management 지원 여부
-   - Vulkan swapchain이 HDR color space를 expose하는지
-   이런 조건을 runtime에 확인해야 한다.
+8. Linux HDR is highly environment-dependent, so a fallback path is mandatory.
+   The implementation must check the following at runtime:
+   - Whether the session is Wayland
+   - Whether Vulkan is available
+   - Whether the GPU driver supports the required features
+   - Whether the monitor supports HDR
+   - Whether the compositor supports HDR/color management
+   - Whether the Vulkan swapchain exposes HDR-capable color spaces
 
-9. 최종 구조는 다음과 같은 형태를 목표로 한다.
+9. The final architecture should look like this:
 
 PYUV Viewer
 ├─ Common App Layer
@@ -55,39 +56,40 @@ PYUV Viewer
 │  └─ Linux   → Vulkan backend
 │
 └─ HDR Policy
-   ├─ Native HDR 가능 → HDR output
-   └─ Native HDR 불가능 → SDR tone-map fallback
+   ├─ Native HDR available     → HDR output
+   └─ Native HDR not available → SDR tone-map fallback
 
-10. 가장 중요한 설계 원칙은 다음과 같다.
+10. The most important design principles are:
 
-- 공통 기능과 OS별 rendering backend를 강하게 분리한다.
-- Windows 기존 기능을 깨지 않는 것을 최우선으로 한다.
-- Linux backend는 먼저 SDR playback을 안정화하고, HDR은 capability probe 후 experimental path로 추가한다.
-- HDR이 불가능한 Linux 환경에서도 viewer 자체는 정상 동작해야 한다.
-- playlist JSON, options, metadata, prefetch, fullscreen 같은 기능은 Windows/Linux에서 동일한 방식으로 동작해야 한다.
+- Strongly separate common viewer functionality from OS-specific rendering backends.
+- Do not break the existing Windows functionality.
+- First stabilize Linux SDR playback, then add Linux HDR as a capability-probed experimental path.
+- The viewer must still work normally on Linux even when native HDR output is unavailable.
+- Playlist JSON, options, metadata, prefetch, fullscreen, and playback behavior should work the same way on Windows and Linux.
 
-11. 현실적인 목표선은 다음과 같다.
+11. A realistic development target is:
 
-1차 목표:
-- renderer interface 분리
-- Windows D3D11 backend 기존 기능 유지
-- OS detection + backend factory 구조 추가
+Phase 1:
+- Separate the renderer interface.
+- Preserve the existing Windows D3D11 backend behavior.
+- Add OS detection and a backend factory.
 
-2차 목표:
-- Linux Vulkan backend 추가
-- Linux SDR playback 구현
-- packed 10-bit YUV420 upload/rendering 지원
-- PQ/HLG content는 SDR tone-map preview로 표시
+Phase 2:
+- Add the Linux Vulkan backend.
+- Implement Linux SDR playback.
+- Support packed 10-bit YUV420 upload/rendering.
+- Display PQ/HLG content through SDR tone-mapped preview.
 
-3차 목표:
-- Linux Vulkan HDR capability probe 구현
-- Wayland/Vulkan 환경에서 HDR surface format/color space 확인
-- HDR 가능 시 experimental native HDR output
-- HDR 불가능 시 자동 SDR fallback
+Phase 3:
+- Add Linux Vulkan HDR capability probing.
+- Check HDR surface formats and color spaces in Wayland/Vulkan environments.
+- Use experimental native HDR output when supported.
+- Automatically fall back to SDR when native HDR is not supported.
 
-최종 목표:
-- 하나의 코드베이스에서 Windows/Linux를 모두 지원
-- Windows에서는 기존 D3D11 HDR viewer처럼 동작
-- Linux에서는 Vulkan 기반 viewer로 동작
-- Linux HDR은 가능한 환경에서만 native HDR로 출력하고, 불가능하면 SDR preview로 안전하게 fallback
-- 사용자는 동일한 playlist JSON과 동일한 UI로 OS와 관계없이 viewer를 사용할 수 있음
+Final target:
+- One codebase supports both Windows and Linux.
+- On Windows, the viewer behaves like the existing D3D11 HDR viewer.
+- On Linux, the viewer runs through a Vulkan backend.
+- Linux native HDR is used only when the environment supports it.
+- Otherwise, the Linux viewer safely falls back to SDR preview.
+- Users can use the same playlist JSON and the same UI regardless of OS.
