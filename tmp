@@ -1,95 +1,1019 @@
-The long-term goal of the current PYUV viewer is to extend the Windows-only D3D11 viewer into a common Windows/Linux viewer architecture.
+# Depth Map Plane Simulation and Camera-Projection Evaluation Summary
+# 목적: NotebookLM / PPT 그림 생성을 위한 복사-붙여넣기용 정리 문서
+# 작성 대상: depth map compression simulation, inverse-depth plane model, camera-parameter-based predictor, backward projection PSNR evaluation
 
-The core goals are as follows.
 
-1. Keep the PyQt UI, playlist, JSON import, options, metadata, PYUV reader, prefetch/read-ahead, and playback control as OS-independent common code.
+============================================================
+1. 연구 목적
+============================================================
 
-2. Isolate all OS-specific behavior inside the video rendering backend.
+이 작업의 목적은 비디오 코딩에서 별도로 전송해야 하는 depth map의 비트량을 줄이는 것이다.
 
-3. On Windows, keep the existing D3D11/DXGI backend.
-   - Preserve the current Windows SDR/HDR functionality as much as possible.
-   - Continue using the existing Windows HDR path based on the D3D11 swapchain, DXGI color space handling, and FP16/scRGB-style output.
+기존 방식처럼 depth map 전체를 일반 영상처럼 압축하면, depth map이 video texture와 다른 특성을 가지기 때문에 VVC inter coding이 항상 효율적이지 않을 수 있다. 실제 관찰에서도 같은 QP에서 All Intra(AI)는 약 1000 bit/frame 수준으로 안정적인데, Low Delay(LD) 구조에서는 같은 QP라도 더 많은 bit가 발생하는 상황이 있었다.
 
-4. On Linux, add a new Vulkan backend.
-   - D3D11 cannot be used on Linux, so the rendering backend must be newly implemented.
-   - Linux SDR playback should be implemented using Vulkan.
-   - Linux HDR should be implemented as experimental support based mainly on Vulkan + Wayland.
+따라서 depth map을 pixel-wise image로만 보기보다, block 단위의 기하적 평면 모델로 표현하고, 이전 frame의 reconstructed depth plane과 camera parameter를 이용해 현재 frame의 depth plane predictor를 만드는 방향을 검토했다.
 
-5. viewer_main.py should not directly know about D3D11 or Vulkan implementation details.
-   - viewer_main.py should only call a common VideoWidget/Renderer interface.
-   - Actual backend selection should be handled by a RendererFactory.
+핵심 아이디어는 다음과 같다.
 
-6. Detect the OS at runtime and automatically select the backend.
-   - Windows: D3D11VideoWidget / D3D11Renderer
-   - Linux: VulkanVideoWidget / VulkanRenderer
-   - Unsupported OS: show a clear error message.
+- depth map을 block 단위 plane으로 근사한다.
+- 현재 block의 depth plane을 직접 coding하지 않고, 가능한 경우 이전 frame 또는 주변 block의 plane을 predictor로 사용한다.
+- candidate가 좋으면 copy mode 또는 작은 delta mode만 보내서 bit를 줄인다.
+- camera parameter가 있으면 이전 frame의 depth plane을 현재 camera view로 변환하여 더 좋은 temporal/camera predictor를 만들 수 있다.
+- 최종적으로 이렇게 복원된 depth map이 실제 texture/video prediction에 얼마나 유용한지, backward projection으로 이전 GT frame을 현재 frame으로 warp하고 PSNR을 측정한다.
 
-7. HDR should not be implemented as “always output native HDR whenever the user enables HDR.”
-   Instead, HDR must be based on runtime capability probing.
-   - On Windows, use the existing HDR path.
-   - On Linux, inspect the available Vulkan surface formats and color spaces.
-   - If an HDR-capable color space is available, try native HDR output.
-   - If native HDR output is not available, fall back to SDR tone-mapped preview.
 
-8. Linux HDR is highly environment-dependent, so a fallback path is mandatory.
-   The implementation must check the following at runtime:
-   - Whether the session is Wayland
-   - Whether Vulkan is available
-   - Whether the GPU driver supports the required features
-   - Whether the monitor supports HDR
-   - Whether the compositor supports HDR/color management
-   - Whether the Vulkan swapchain exposes HDR-capable color spaces
+============================================================
+2. 전체 시스템 개요
+============================================================
 
-9. The final architecture should look like this:
+전체 시스템은 크게 두 부분으로 나뉜다.
 
-PYUV Viewer
-├─ Common App Layer
-│  ├─ PyQt UI
-│  ├─ Playlist / JSON Import
-│  ├─ Options / Metadata
-│  ├─ PYUV Reader
-│  ├─ Prefetch / Read-ahead
-│  └─ Playback Control
-│
-├─ Renderer Factory
-│  ├─ Windows → D3D11 backend
-│  └─ Linux   → Vulkan backend
-│
-└─ HDR Policy
-   ├─ Native HDR available     → HDR output
-   └─ Native HDR not available → SDR tone-map fallback
+A. Depth map compression simulation
 
-10. The most important design principles are:
+입력:
+- 원본 depth map sequence
+- 포맷: yuv420p10le
+- Y plane에 depth sample 저장
+- U/V는 dummy 512
 
-- Strongly separate common viewer functionality from OS-specific rendering backends.
-- Do not break the existing Windows functionality.
-- First stabilize Linux SDR playback, then add Linux HDR as a capability-probed experimental path.
-- The viewer must still work normally on Linux even when native HDR output is unavailable.
-- Playlist JSON, options, metadata, prefetch, fullscreen, and playback behavior should work the same way on Windows and Linux.
+출력:
+- reconstructed depth map
+- frame별 bit estimate
+- block별 mode/candidate 선택 결과
+- reconstructed depth yuv
+- summary csv/json
 
-11. A realistic development target is:
+B. Projection PSNR evaluation
 
-Phase 1:
-- Separate the renderer interface.
-- Preserve the existing Windows D3D11 backend behavior.
-- Add OS detection and a backend factory.
+입력:
+- externally reconstructed depth map
+  - 예: VTM으로 압축 후 복원한 depth map
+  - 또는 simulation에서 복원한 depth map
+- GT video sequence
+- camera parameter JSON/JSONL/TXT
+- frame resolution and frame range
 
-Phase 2:
-- Add the Linux Vulkan backend.
-- Implement Linux SDR playback.
-- Support packed 10-bit YUV420 upload/rendering.
-- Display PQ/HLG content through SDR tone-mapped preview.
+출력:
+- backward projected prediction video
+- current GT video와 비교한 PSNR
+- valid region PSNR
+- frame별 CSV
+- 전체 평균 JSON
 
-Phase 3:
-- Add Linux Vulkan HDR capability probing.
-- Check HDR surface formats and color spaces in Wayland/Vulkan environments.
-- Use experimental native HDR output when supported.
-- Automatically fall back to SDR when native HDR is not supported.
 
-Final target:
-- One codebase supports both Windows and Linux.
-- On Windows, the viewer behaves like the existing D3D11 HDR viewer.
-- On Linux, the viewer runs through a Vulkan backend.
-- Linux native HDR is used only when the environment supports it.
-- Otherwise, the Linux viewer safely falls back to SDR preview.
-- Users can use the same playlist JSON and the same UI regardless of OS.
+============================================================
+3. Depth Map Representation
+============================================================
+
+처음에는 depth map을 linear depth plane으로 모델링했다.
+
+Linear depth plane:
+
+    Z(x, y) = a * (x - cx) + b * (y - cy) + c
+
+여기서:
+- x, y: pixel coordinate
+- cx, cy: block center
+- a, b: plane slope
+- c: block center depth
+- Z: stored depth sample 또는 actual linear depth
+
+하지만 camera projection 관점에서는 linear depth보다 inverse depth가 더 적합하다.
+
+Perspective projection에서 실제 3D plane은 image domain에서 inverse depth가 affine plane 형태로 나타난다.
+
+3D plane:
+
+    n_x X + n_y Y + n_z Z + d = 0
+
+Camera normalized coordinate:
+
+    X = x_n * Z
+    Y = y_n * Z
+
+대입하면:
+
+    n_x * x_n * Z + n_y * y_n * Z + n_z * Z + d = 0
+
+따라서:
+
+    1 / Z = -(n_x * x_n + n_y * y_n + n_z) / d
+
+즉 image domain에서:
+
+    inverse_depth(x, y) = alpha * x + beta * y + gamma
+
+형태가 된다.
+
+그래서 최종 simulation에서는 inverse-depth plane을 사용한다.
+
+Inverse-depth plane:
+
+    invY(x, y) = a * (x - cx) + b * (y - cy) + c
+
+여기서:
+- Y는 depth yuv의 stored depth sample
+- actual linear depth는 보통 다음처럼 복원한다.
+
+    linear_depth = Y * nearClipPlane
+
+inverse-depth plane에서 reconstructed depth sample은:
+
+    Y_recon = 1 / invY
+
+
+============================================================
+4. 왜 inverse depth가 중요한가?
+============================================================
+
+Projection에서 depth quantization error가 pixel reprojection error로 바뀌는 민감도는 depth에 따라 다르다.
+
+만약 linear depth Z를 uniform quantization하면 절대 depth error가 일정하다.
+
+    delta Z = constant
+
+Projection 위치 오차는 대략:
+
+    pixel_error ∝ |T| * deltaZ / Z^2
+
+즉 가까운 물체일수록 projection error가 훨씬 커진다.
+
+반면 inverse depth r = 1/Z를 uniform quantization하면:
+
+    deltaZ ≈ Z^2 * delta r
+
+이를 projection error 식에 넣으면:
+
+    pixel_error ∝ |T| * delta r
+
+즉 depth에 따른 민감도가 상당히 완화된다.
+
+정리:
+
+- linear Z uniform quantization:
+  - 가까운 물체에서 projection error가 매우 커짐
+  - error sensitivity ∝ 1/Z^2
+
+- inverse depth uniform quantization:
+  - projection error가 depth에 대해 비교적 균일해짐
+  - camera projection predictor에 더 적합
+
+그래서 depth map compression이 texture prediction 또는 camera projection에 쓰이는 목적이라면, inverse-depth plane modeling이 더 자연스럽다.
+
+
+============================================================
+5. Block-Level Plane Simulation
+============================================================
+
+Depth map을 fixed root block 단위로 나누고, 각 block에서 plane fitting을 수행한다.
+
+Root block size 예:
+- 64x64
+- 128x128
+- 256x256
+
+각 block은 필요하면 recursive split이 가능하다.
+
+지원하는 split type:
+
+1. leaf
+   - split하지 않고 하나의 plane으로 coding
+
+2. binary horizontal split (bh)
+   - top/bottom으로 분할
+
+3. binary vertical split (bv)
+   - left/right로 분할
+
+4. quad split (qt)
+   - 4개의 sub-block으로 분할
+   - max_qt_depth까지 recursive 가능
+
+각 leaf block은 다음 mode 중 하나를 RD cost로 선택한다.
+
+Mode 1: direct
+- 현재 block의 actual inverse-depth plane을 직접 quantize해서 coding
+- q values:
+  - qa = round(a / qstep_a)
+  - qb = round(b / qstep_b)
+  - qc = round(c / qstep_c)
+
+Mode 2: copy
+- candidate plane을 그대로 사용
+- candidate index만 coding
+- residual 없음
+
+Mode 3: delta
+- candidate plane과 actual plane의 차이를 quantize해서 coding
+- q values:
+  - qda = round((actual.a - pred.a) / qa)
+  - qdb = round((actual.b - pred.b) / qb)
+  - qdc = round((actual.c - pred.c) / qc)
+
+RD cost:
+
+    cost = SSE + lambda * bits
+
+여기서:
+- SSE는 original depth block과 reconstructed depth block 사이의 squared error
+- bits는 mode, candidate index, residual coefficient bit estimate
+- lambda는 RD trade-off
+
+
+============================================================
+6. Candidate Types
+============================================================
+
+현재 simulation에서 사용하는 candidate는 다음과 같다.
+
+1. temporal candidate
+- 이전 frame의 reconstructed leaf plane 중 현재 block center를 포함하는 leaf를 찾는다.
+- 해당 plane을 현재 block center 기준으로 변환한다.
+- 카메라 움직임이 작으면 매우 강한 predictor가 될 수 있다.
+- 하지만 camera translation이나 parallax가 커지면 same-position temporal candidate는 약해진다.
+
+2. spatial candidates
+- 이미 coding된 현재 frame의 주변 reconstructed plane을 사용한다.
+- decoder에서도 이미 복원된 정보이므로 실제 codec 구조에 적합하다.
+
+Spatial candidates:
+- left
+- top
+- top_left
+- top_right
+- avg_left_top
+
+3. plane_warp candidate
+- 이전 frame의 reconstructed inverse-depth plane을 3D plane으로 변환한다.
+- camera parameter를 사용해 previous camera coordinate에서 current camera coordinate로 plane을 변환한다.
+- current block 영역에 해당 3D plane을 ray-plane intersection으로 render한다.
+- rendered depth block을 다시 inverse-depth image plane으로 fitting한다.
+- 이 결과를 현재 block의 candidate plane으로 넣는다.
+
+Candidate priority example:
+
+    0: plane_warp
+    1: temporal
+    2: left
+    3: top
+    4: top_left
+    5: top_right
+    6: avg_left_top
+
+
+============================================================
+7. Plane Warp Candidate: Geometry Flow
+============================================================
+
+plane_warp candidate의 목적은 previous reconstructed depth plane을 camera motion에 맞게 current frame으로 예측하는 것이다.
+
+Step 1. Previous leaf plane sampling
+
+이전 frame의 reconstructed inverse-depth plane에서 여러 sample point를 선택한다.
+
+예:
+- leaf block 내부에서 5x5 grid sample
+- 각 sample 위치 (u, v)에 대해 depth sample 계산:
+
+    invY = a * (u - cx) + b * (v - cy) + c
+    Y = 1 / invY
+    linear_depth = Y * nearClipPlane_source
+
+Step 2. Source camera ray 생성
+
+source camera의 inverse projection matrix를 사용한다.
+
+Pixel coordinate to NDC:
+
+    x_ndc = (u + 0.5) / width * 2 - 1
+    y_ndc = 1 - (v + 0.5) / height * 2
+
+NDC point:
+
+    p_ndc = [x_ndc, y_ndc, 1, 1]
+
+View space direction:
+
+    p_view_h = p_ndc @ InvProjectionMatrix.T
+    p_view = p_view_h.xyz / p_view_h.w
+
+기존 코드 convention:
+
+    ray = p_view / abs(p_view.z)
+
+3D point:
+
+    P_source = ray * linear_depth
+
+Step 3. 3D plane fitting
+
+sampled 3D points에 대해 SVD로 3D plane을 fitting한다.
+
+3D plane representation:
+
+    plane = [n_x, n_y, n_z, d]
+
+where:
+
+    n_x X + n_y Y + n_z Z + d = 0
+
+Step 4. Plane transform
+
+source camera coordinate의 plane을 target/current camera coordinate로 변환한다.
+
+Source camera → world → target camera:
+
+    M = WorldToCamera_current @ CameraToWorld_source
+
+Point transform:
+
+    P_current = M * P_source
+
+Plane transform:
+
+    plane_current = inverse(M).T * plane_source
+
+Step 5. Current block rendering
+
+current block의 각 pixel에서 current camera ray를 만든다.
+
+Ray-plane intersection:
+
+    scale = -d / dot(n, ray)
+
+이때 ray는 abs(z)=1로 normalized되어 있으므로 scale이 linear depth로 해석된다.
+
+Stored depth sample:
+
+    Y_current = scale / nearClipPlane_current
+
+Step 6. Refit inverse-depth plane
+
+rendered current depth block을 다시 inverse-depth plane으로 fitting한다.
+
+    invY_current = 1 / Y_current
+    invY_current ≈ a*x + b*y + c
+
+이 plane이 current block의 plane_warp candidate가 된다.
+
+
+============================================================
+8. Camera Parameter Format and Convention
+============================================================
+
+Camera parameter 파일은 JSON, JSON object, JSON array, JSONL 형태를 지원하도록 구성했다.
+
+지원하는 matrix key aliases:
+
+InvProjectionMatrix:
+- InvProjectionMatrix
+- invProjectionMatrix
+- InverseProjectionMatrix
+
+ProjectionMatrix:
+- ProjectionMatrix
+- projectionMatrix
+
+WorldToCameraMatrix:
+- WorldToCameraMatrix
+- worldToCameraMatrix
+- ViewMatrix
+
+CameraToWorldMatrix:
+- CameraToWorldMatrix
+- cameraToWorldMatrix
+- CameraToWorldMarix
+- cameraToWorldMarix
+- InvViewMatrix
+
+near clip:
+- nearClipPlane
+- NearClipPlane
+- near_clip_plane
+- near
+- Near
+
+중요한 convention:
+
+Matrix가 dict 형태로 저장되어 있을 때:
+
+    e00, e01, ..., e33
+
+이 경우 기존 검증된 forward-warp 코드에서는 matrix를 읽은 뒤 transpose해서 사용했다.
+
+    return mat.T
+
+따라서 이번 코드에서도 dict e00~e33 matrix는 mat.T로 반환한다.
+
+Projection convention:
+
+    p_view_h = p_ndc @ P_inv.T
+    p_view = p_view_h[..., :3] / p_view_h[..., 3:4]
+    ray = p_view / abs(p_view.z)
+    point = ray * linear_depth
+
+이 convention은 기존에 잘 동작하던 forward projection 코드와 맞춘 것이다.
+
+
+============================================================
+9. Backward Projection PSNR Evaluation
+============================================================
+
+Depth map simulation은 depth bit를 줄이는 데 초점이 있다. 하지만 depth map이 실제로 유용한지 확인하려면, 복원된 depth map으로 texture/video prediction을 해봐야 한다.
+
+이를 위해 별도의 evaluation script를 만들었다.
+
+목적:
+- VTM으로 압축/복원한 depth map을 입력으로 받는다.
+- 해당 recon depth를 사용해서 이전 GT frame을 현재 view로 backward warp한다.
+- warped prediction과 current GT frame 사이의 PSNR을 측정한다.
+
+입력:
+- recon_depth.yuv
+  - 외부에서 복원된 depth map
+  - 예: VTM recon depth
+  - yuv420p10le
+- gt_video.yuv
+  - 원본 texture/video sequence
+  - yuv420p10le
+- camera parameter file
+  - JSON/JSONL/TXT
+- width, height
+- frame range
+- ref offset
+
+기본 reference:
+
+    ref_frame = current_frame - 1
+
+즉:
+
+    GT video(t-1) + recon depth(t) + camera(t-1), camera(t)
+    → predicted video(t)
+
+Backward projection 과정:
+
+1. Current pixel (x, y)와 recon depth(t)를 사용해 current camera의 3D point를 복원한다.
+
+    linear_depth_cur = recon_depth_y(t) * nearClipPlane_cur
+
+2. current camera coordinate → world coordinate
+
+    P_world = CameraToWorld_cur * P_cur
+
+3. world coordinate → reference camera coordinate
+
+    P_ref = WorldToCamera_ref * P_world
+
+4. reference camera projection
+
+    clip_ref = ProjectionMatrix_ref * P_ref
+
+5. NDC → reference pixel coordinate
+
+    map_x = (ndc_x + 1) * 0.5 * width - 0.5
+    map_y = (1 - ndc_y) * 0.5 * height - 0.5
+
+6. reference GT frame에서 bilinear sampling
+
+    pred(t, x, y) = sample(GT(t-1), map_x, map_y)
+
+7. current GT frame과 비교
+
+    PSNR(pred(t), GT(t))
+
+출력:
+- backward predicted YUV
+- per-frame CSV
+- summary JSON
+- Y PSNR
+- U PSNR
+- V PSNR
+- weighted YUV420 PSNR
+- valid region PSNR
+- valid pixel ratio
+
+
+============================================================
+10. Why Backward Projection Instead of Forward Projection?
+============================================================
+
+Forward projection은 source frame의 pixel을 target frame으로 splat한다.
+
+문제:
+- holes 발생
+- disocclusion region 발생
+- 여러 source pixel이 같은 target pixel에 splat될 수 있음
+- z-buffer 필요
+- target pixel coverage가 불완전함
+- hole filling 결과가 PSNR에 큰 영향을 줄 수 있음
+
+Backward projection은 target/current pixel마다 필요한 source/reference coordinate를 직접 찾는다.
+
+장점:
+- target pixel grid 전체에 대해 prediction 가능
+- sampling 위치가 명확함
+- cv2.remap 또는 bilinear sampling과 잘 맞음
+- predictor quality 평가에 더 안정적
+
+단점:
+- current frame의 depth가 필요함
+- occlusion/disocclusion region에서는 reference에 대응점이 없을 수 있음
+- invalid region 처리 방식이 필요함
+
+이번 evaluation에서는 current reconstructed depth를 사용하므로 backward projection이 자연스럽다.
+
+
+============================================================
+11. Invalid Pixel Handling
+============================================================
+
+Backward projection에서 reference coordinate가 frame 밖으로 나가거나, projection이 invalid인 pixel이 있을 수 있다.
+
+invalid 조건:
+- clip w가 너무 작음
+- projected x/y가 NaN 또는 inf
+- projected coordinate가 reference frame 밖
+- depth가 non-positive
+- bilinear sampling에 필요한 x1/y1이 frame 밖
+
+지원하는 invalid fill mode:
+
+1. ref_same
+- reference frame의 same-position pixel로 채움
+- default
+- 완전히 검정으로 채우는 것보다 PSNR이 안정적
+
+2. zero
+- invalid pixel을 0으로 채움
+- valid ratio 영향이 PSNR에 크게 반영됨
+
+3. neutral
+- invalid pixel을 중간값으로 채움
+- 10bit이면 512 근처
+
+CSV에는 전체 PSNR과 valid-region PSNR을 모두 저장한다.
+
+- y_psnr
+- y_valid_psnr
+- yuv420_psnr
+- yuv420_valid_psnr
+- valid_y_ratio
+- valid_uv_ratio
+
+
+============================================================
+12. AI / LD / RA Depth Coding Observation
+============================================================
+
+Depth map을 VVC로 압축했을 때 다음 관찰이 있었다.
+
+- All Intra(AI)에서는 프레임당 bit가 약 1000 bit 수준으로 유지됨
+- Low Delay(LD)에서는 같은 QP라도 더 큰 bit가 나오는 경우가 있음
+- 첫 frame만 IDR이고 이후는 CRA로 표시되는 경우가 있음
+- CRA라고 해서 inter를 사용한다는 뜻은 아니며, CRA I-slice일 수 있음
+
+AI에서 매 frame마다 들어가는 것은:
+- NAL header
+- picture header
+- slice header
+- QP / QP delta
+- SAO/ALF/LMCS/deblocking 관련 syntax
+- slice/tile 관련 syntax
+- intra mode / split / residual syntax
+
+VPS/SPS/PPS 같은 parameter set은 보통 매 frame마다 전부 반복되지는 않는다.
+
+1000 bit 중 header가 전부를 설명하기는 어렵고, 대부분은 block-level coding syntax, split, intra mode, residual coefficient bit일 가능성이 크다.
+
+LD/RA와 AI의 차이:
+- LD/RA는 reference picture list, inter mode, merge, MVP, refIdx, motion vector, interDir 등 추가 syntax가 들어간다.
+- depth map에서는 일반 texture video와 달리 inter coding이 항상 효율적이지 않을 수 있다.
+- 특히 depth map의 구조가 piecewise smooth하고 edge discontinuity가 강하면, AI intra/plane coding이 더 효율적인 상황이 생길 수 있다.
+
+따라서 depth map 전송에서는 일반 VVC inter coding보다 geometry-aware plane predictor가 더 적합할 수 있다.
+
+
+============================================================
+13. Expected Benefit of Camera-Aware Plane Predictor
+============================================================
+
+camera-aware depth predictor가 가장 유리한 상황:
+
+1. camera translation이 있음
+- 특히 lateral translation Tx, Ty
+- foreground/background parallax 발생
+- block MV 하나로 설명하기 어려운 depth-dependent motion 발생
+
+2. depth variation이 큼
+- 가까운 물체와 먼 배경이 함께 있음
+- depth edge가 뚜렷함
+
+3. previous reconstructed plane이 안정적임
+- 이전 frame depth plane이 잘 복원되어 있음
+- plane_warp candidate가 current block plane과 가까움
+
+4. copy/delta mode 선택률이 높아짐
+- direct mode보다 candidate 기반 coding이 많이 선택됨
+- delta residual이 작아짐
+- zero delta block 비율 증가
+
+camera-aware predictor가 덜 유리한 상황:
+
+1. pure rotation
+- depth 없이도 homography로 motion을 설명할 수 있음
+- depth map 자체의 추가 가치는 작음
+
+2. camera motion이 매우 작음
+- same-position temporal candidate만으로도 충분할 수 있음
+- camera plane warp의 추가 이득이 작음
+
+3. natural video에서 AI-estimated depth가 noisy함
+- inaccurate depth/camera relationship
+- plane fitting이 불안정
+- predictor mismatch 발생 가능
+
+4. occlusion/disocclusion이 큼
+- source plane이 current block을 제대로 설명하지 못할 수 있음
+
+
+============================================================
+14. Key Experiments
+============================================================
+
+Experiment 1. Linear plane vs inverse-depth plane
+
+비교:
+- Z = ax + by + c
+- 1/Z = ax + by + c
+
+측정:
+- depth reconstruction PSNR
+- bit estimate
+- copy/delta/direct ratio
+- projection PSNR
+
+예상:
+- depth sample PSNR은 linear plane이 더 높을 수도 있음
+- 하지만 projection PSNR은 inverse-depth plane이 유리할 수 있음
+
+Experiment 2. Temporal candidate vs plane_warp candidate
+
+조건:
+- temporal only
+- plane_warp only
+- temporal + plane_warp
+- spatial only
+- all candidates
+
+측정:
+- candidate_plane_warp_count
+- candidate_temporal_count
+- copy ratio
+- delta ratio
+- zero delta ratio
+- depth bits
+- projection PSNR
+
+예상:
+- small camera motion: temporal이 강함
+- translation/parallax: plane_warp가 유리할 가능성
+
+Experiment 3. VTM recon depth projection evaluation
+
+입력:
+- VTM reconstructed depth
+- GT texture video
+- camera parameter
+
+측정:
+- backward projection Y PSNR
+- valid Y PSNR
+- YUV420 PSNR
+- valid ratio
+
+목적:
+- depth map 자체의 PSNR이 아니라, 실제 camera projection predictor로서의 성능을 평가
+- 같은 depth PSNR이라도 projection PSNR이 다를 수 있음
+
+Experiment 4. QP별 projection PSNR
+
+입력:
+- recon depth at QP 22, 27, 32, 37, 42 등
+- 동일 GT video
+- 동일 camera parameter
+
+측정:
+- depth bit
+- depth PSNR
+- projection PSNR
+
+목적:
+- depth map bit를 줄였을 때 실제 texture prediction 성능이 얼마나 유지되는지 확인
+- depth PSNR과 projection PSNR의 상관관계 확인
+
+Experiment 5. Motion type별 분석
+
+frame별로 camera motion metric을 계산한다.
+
+Possible metrics:
+- translation magnitude |T|
+- rotation angle
+- projected displacement p90/p95
+- depth-dependent displacement variation
+
+측정:
+- projection PSNR
+- candidate selection ratio
+- depth bit saving
+
+예상:
+- translation/parallax metric과 plane_warp benefit 사이의 correlation이 클 가능성
+- pure rotation은 depth plane warp보다는 homography predictor가 더 적합
+
+
+============================================================
+15. Generated Scripts
+============================================================
+
+Script 1. depth_inv_plane_backward_warp_sim.py
+
+목적:
+- inverse-depth plane compression simulation
+- temporal/spatial/plane_warp candidates
+- reconstructed depth map 생성
+- reconstructed depth를 사용한 backward projection PSNR 평가도 포함
+
+주요 기능:
+- input-depth yuv420
+- optional input-video yuv420
+- camera-param JSON/JSONL
+- inverse-depth plane fitting
+- recursive split
+- direct/copy/delta coding
+- adaptive probability model
+- plane_warp candidate
+- backward projection predictor output
+
+Script 2. eval_recon_depth_backward_warp_psnr.py
+
+목적:
+- 외부에서 복원된 depth map을 받아서 backward projection PSNR만 측정
+- 예: VTM recon depth map evaluation
+
+주요 기능:
+- recon-depth yuv420
+- gt-video yuv420
+- camera-param JSON/JSONL
+- no depth coding simulation
+- no plane fitting
+- only projection evaluation
+- output predicted yuv, csv, json
+
+실행 예:
+
+    python eval_recon_depth_backward_warp_psnr.py ^
+      --recon-depth vtm_recon_depth.yuv ^
+      --gt-video texture_1920x1080_10bit.yuv ^
+      --camera-param camera.txt ^
+      --width 1920 ^
+      --height 1080 ^
+      --start-frame 0 ^
+      --num-frames 16 ^
+      --ref-offset 1 ^
+      --out-pred-yuv pred_from_recon_depth.yuv ^
+      --out-csv projection_psnr.csv ^
+      --out-json projection_psnr_summary.json
+
+
+============================================================
+16. PPT Figure Suggestions
+============================================================
+
+Figure 1. Overall pipeline
+
+Title:
+Depth Map Compression and Projection Evaluation Pipeline
+
+Blocks:
+1. Original Depth Map
+2. Block Partitioning
+3. Inverse-Depth Plane Fitting
+4. Candidate Generation
+   - Spatial
+   - Temporal
+   - Camera Plane Warp
+5. RD Mode Decision
+   - Direct
+   - Copy
+   - Delta
+6. Reconstructed Depth Map
+7. Backward Projection using Camera Parameter
+8. Predicted Current Frame
+9. PSNR vs Current GT Frame
+
+Figure style:
+- left-to-right flowchart
+- use blue blocks for depth processing
+- use orange blocks for camera geometry
+- use green blocks for evaluation
+
+Figure 2. Linear depth vs inverse depth
+
+Show two panels:
+
+Left:
+- Linear depth quantization
+- uniform deltaZ
+- near object has large reprojection error
+- far object has small reprojection error
+
+Right:
+- inverse depth quantization
+- uniform delta(1/Z)
+- reprojection error more balanced across depth
+
+Include formulas:
+
+    pixel_error ∝ |T| * deltaZ / Z^2
+
+    if r = 1/Z:
+    deltaZ ≈ Z^2 * delta r
+    pixel_error ∝ |T| * delta r
+
+Figure 3. Plane model
+
+Show a block of depth map with a slanted surface.
+
+Equation:
+
+    invY(x,y) = a(x-cx) + b(y-cy) + c
+
+Show:
+- block center (cx, cy)
+- slope a in x direction
+- slope b in y direction
+- center value c
+- reconstructed depth by inverse transform Y = 1/invY
+
+Figure 4. Candidate list for current block
+
+Draw current block in the center.
+
+Candidate sources:
+- left block
+- top block
+- top-left
+- top-right
+- average left/top
+- previous same-position block
+- camera-warped previous plane
+
+Show candidate list:
+
+    plane_warp
+    temporal
+    left
+    top
+    top_left
+    top_right
+    avg_left_top
+
+Figure 5. Plane warp candidate geometry
+
+Steps:
+1. Previous reconstructed inverse-depth plane
+2. Sample points on previous plane
+3. Back-project to 3D points
+4. Fit 3D plane
+5. Transform plane with camera motion
+6. Ray-plane intersection in current view
+7. Refit current inverse-depth plane candidate
+
+Formula:
+    plane_current = inverse(W2C_current * C2W_previous).T * plane_previous
+
+Figure 6. Backward projection PSNR evaluation
+
+Show:
+- current recon depth map
+- current camera
+- current pixel back-projects to 3D
+- 3D point projects to previous/reference camera
+- previous GT frame is sampled
+- prediction compared with current GT frame
+
+Key message:
+This evaluates whether reconstructed depth is useful for view-projection prediction, not just whether depth sample PSNR is high.
+
+Figure 7. Forward vs backward projection
+
+Forward:
+- source pixels splat into target
+- holes appear
+- z-buffer and hole filling required
+
+Backward:
+- each target pixel queries source coordinate
+- dense target prediction
+- invalid/out-of-view mask still required
+
+Figure 8. Expected results table
+
+Columns:
+- Method
+- Depth bits
+- Depth PSNR
+- Projection Y PSNR
+- Valid Y PSNR
+- Valid ratio
+- Copy ratio
+- Delta ratio
+- Plane-warp selection ratio
+
+Rows:
+- VTM AI depth
+- VTM LD depth
+- Linear plane simulation
+- Inverse-depth plane simulation
+- Temporal candidate
+- Plane-warp candidate
+- Temporal + plane-warp
+
+Figure 9. Motion condition analysis
+
+Plot:
+- x-axis: projected displacement p95 or translation magnitude
+- y-axis: bit saving or projection PSNR gain
+
+Expected interpretation:
+- larger translation/parallax → camera plane predictor more useful
+- pure rotation → depth map less important
+
+Figure 10. Codec relevance
+
+Show decoder-side availability:
+
+Available at decoder:
+- previous reconstructed depth planes
+- current already-decoded spatial neighbor planes
+- camera parameter from bitstream
+- candidate index and delta residual
+
+Not available:
+- original depth
+- current block actual plane before decoding
+
+This demonstrates that the proposed predictor is decoder-side reproducible and codec-friendly.
+
+
+============================================================
+17. Key Takeaways
+============================================================
+
+1. Depth map should not necessarily be coded like ordinary texture video.
+2. VVC LD/RA inter tools may not be optimal for depth maps, especially when inter syntax overhead is large.
+3. Block-wise plane representation is a more geometry-aware way to code depth.
+4. Inverse-depth plane is more compatible with perspective camera geometry than linear-depth plane.
+5. Camera parameter can transform previous reconstructed plane into a current-view predictor.
+6. Good camera-aware plane candidates can reduce bits through copy or small delta modes.
+7. Projection PSNR is essential, because depth PSNR alone does not fully measure usefulness for view prediction.
+8. Backward projection with reconstructed depth is the key evaluation method for checking whether coded depth is useful for texture prediction.
+9. Translation/parallax scenes are the most promising cases for depth-camera predictors.
+10. Pure rotation is less favorable for depth map coding because rotation can often be handled by homography-like predictors without depth.
+
+
+============================================================
+18. Short Abstract for PPT
+============================================================
+
+We investigate a geometry-aware depth map compression framework for video coding. Instead of coding depth maps as ordinary texture frames, each block is represented by an inverse-depth plane. The encoder selects among direct coding, copy mode, and delta mode using RD optimization. Candidate planes are generated from spatial neighbors, temporal same-position blocks, and camera-parameter-based plane warping from previous reconstructed depth. Since perspective projection maps 3D planes to affine inverse-depth surfaces, inverse-depth plane coding is better aligned with camera geometry than linear-depth plane coding. To evaluate the practical value of reconstructed depth, we use it for backward projection of a previous GT video frame into the current view and measure projection PSNR. This evaluates whether the compressed depth map remains useful for view prediction, not only whether the depth map itself has high PSNR.
+
+
+============================================================
+19. One-Slide Summary
+============================================================
+
+Problem:
+- Depth maps require extra bits.
+- Standard VVC inter coding may be inefficient for depth maps.
+- Depth PSNR alone does not guarantee good view prediction.
+
+Proposed direction:
+- Represent depth blocks as inverse-depth planes.
+- Use copy/delta modes with predictor candidates.
+- Generate a camera-aware plane predictor from previous reconstructed depth and camera parameters.
+
+Main geometry:
+- 3D plane under perspective projection is affine in inverse depth.
+- Plane transform:
+    plane_cur = inverse(W2C_cur * C2W_prev).T * plane_prev
+- Reconstructed depth is evaluated by backward projection:
+    GT(t-1) + recon depth(t) + cameras → prediction(t)
+
+Evaluation:
+- Measure depth bits, depth PSNR, projection PSNR, valid-region PSNR, candidate selection ratios.
+
+Expected benefit:
+- Strongest in translation/parallax scenes.
+- Less effective in pure rotation or very small motion.
