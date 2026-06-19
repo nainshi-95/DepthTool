@@ -29,9 +29,17 @@ def calc_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top):
     return pad_right, pad_bottom
 
 
-def validate_yuv420_padding(src_w, src_h, coded_w, coded_h,
-                            pad_left, pad_top, pad_right, pad_bottom):
-    values = {
+def validate_yuv420_padding(
+    src_w,
+    src_h,
+    coded_w,
+    coded_h,
+    pad_left,
+    pad_top,
+    pad_right,
+    pad_bottom,
+):
+    vals = {
         "src_w": src_w,
         "src_h": src_h,
         "coded_w": coded_w,
@@ -42,28 +50,19 @@ def validate_yuv420_padding(src_w, src_h, coded_w, coded_h,
         "pad_bottom": pad_bottom,
     }
 
-    for name, v in values.items():
+    for name, v in vals.items():
         if v < 0:
             raise ValueError(f"{name} must be non-negative: {v}")
 
-    # 4:2:0 chroma plane 때문에 padding도 짝수 단위가 안전함.
-    for name, v in values.items():
+    for name, v in vals.items():
         if v % 2 != 0:
-            raise ValueError(
-                f"{name} must be even for YUV420 padding: {v}"
-            )
+            raise ValueError(f"{name} must be even for YUV420: {v}")
 
 
 def pad_2d_edge(arr, coded_w, coded_h, pad_left, pad_top):
     h, w = arr.shape
     pad_right = coded_w - w - pad_left
     pad_bottom = coded_h - h - pad_top
-
-    if pad_right < 0 or pad_bottom < 0:
-        raise ValueError(
-            f"Cannot pad array {w}x{h} to {coded_w}x{coded_h} "
-            f"with pad_left={pad_left}, pad_top={pad_top}"
-        )
 
     return np.pad(
         arr,
@@ -95,9 +94,10 @@ def pad_yuv420_edge(y, u, v, coded_w, coded_h, pad_left, pad_top):
 
 
 def active_slice(src_w, src_h, pad_left, pad_top):
-    ys = slice(pad_top, pad_top + src_h)
-    xs = slice(pad_left, pad_left + src_w)
-    return ys, xs
+    return (
+        slice(pad_top, pad_top + src_h),
+        slice(pad_left, pad_left + src_w),
+    )
 
 
 # ============================================================
@@ -184,10 +184,6 @@ def quant_u(value, lo, hi, bits):
 
 
 def signed_q_abs_max(bits):
-    """
-    bits=8이면 signed residual range는 [-127, 127].
-    2's complement의 [-128, 127]이 아니라 symmetric range를 사용.
-    """
     if bits < 2:
         raise ValueError("ext-bits must be >= 2")
     return (1 << (bits - 1)) - 1
@@ -209,13 +205,8 @@ def quant_s(value, step, bits):
 
 def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
     """
-    원본 image coordinate 기준 intrinsic을 padded image coordinate 기준으로 변환.
-
-    오른쪽/아래쪽 padding만 있으면 pad_left=pad_top=0이므로 그대로.
-    왼쪽 padding이 있으면 cx += pad_left.
-    위쪽 padding이 있으면 cy += pad_top.
-    아래쪽 padding은 cy를 바꾸지 않음.
-    오른쪽 padding은 cx를 바꾸지 않음.
+    오른쪽/아래쪽 padding이면 pad_left=0, pad_top=0이므로 intrinsic 변경 없음.
+    왼쪽/위쪽 padding이 있으면 principal point만 이동.
     """
     return {
         "fx": float(intr["fx"]),
@@ -228,13 +219,8 @@ def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
 
 def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
     """
-    intrinsic은 고정 16bit 양자화.
-
-    여기서 w, h는 decoder가 아는 coded picture size를 넣는다.
-    즉 padded projection을 하려면 coded_w, coded_h 기준으로 quant/dequant한다.
-
-    fx, fy는 각각 width/height로 normalize.
-    cx, cy도 각각 width/height로 normalize.
+    w, h는 decoder가 아는 coded size 사용.
+    right/bottom padding만이면 cx, cy 자체는 그대로지만 normalize denominator는 coded_w/h.
     """
     fx_n = intr["fx"] / w
     fy_n = intr["fy"] / h
@@ -284,15 +270,6 @@ def rt_from_param6(p, depth_scale):
 # ============================================================
 
 def signed_to_code_num(x):
-    """
-    signed Exp-Golomb mapping:
-       0 -> 0
-      +1 -> 1
-      -1 -> 2
-      +2 -> 3
-      -2 -> 4
-      ...
-    """
     x = int(x)
     if x == 0:
         return 0
@@ -302,12 +279,6 @@ def signed_to_code_num(x):
 
 
 def ue_exp_golomb_bits(code_num):
-    """
-    unsigned Exp-Golomb code length.
-    code_num=0 -> 1 bit
-    code_num=1,2 -> 3 bits
-    code_num=3~6 -> 5 bits
-    """
     code_num = int(code_num)
     if code_num < 0:
         raise ValueError("code_num must be non-negative")
@@ -317,10 +288,6 @@ def ue_exp_golomb_bits(code_num):
 
 
 def signed_truncated_exp_golomb_bits(x, q_abs_max):
-    """
-    signed residual x in [-q_abs_max, q_abs_max]의 bit 수 계산.
-    truncated range 밖이면 error.
-    """
     x = int(x)
 
     if x < -q_abs_max or x > q_abs_max:
@@ -353,10 +320,6 @@ def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
 # ============================================================
 
 def predict_from_history(decoded_hist, pred_n, pred_degree):
-    """
-    decoded_hist에는 이미 복원된 param6만 저장됨.
-    predictor도 반드시 decoded 값만 사용.
-    """
     if not decoded_hist:
         return np.zeros(6, dtype=np.float32)
 
@@ -381,75 +344,109 @@ def predict_from_history(decoded_hist, pred_n, pred_degree):
 
 
 # ============================================================
-# Pixel-coordinate Backward Warp
+# Fast Pixel-coordinate Projection
 # ============================================================
 
-def make_grid(w, h):
-    x, y = np.meshgrid(
-        np.arange(w, dtype=np.float32),
-        np.arange(h, dtype=np.float32),
-    )
-    return x, y
-
-
-def backward_map_from_depth_and_params_pixel_coord(
-    depth_linear,
-    intr,
-    rt,
-    w,
-    h,
-):
+def make_projection_precompute(w, h, intr):
     """
-    NDC / ProjectionMatrix / InvProjectionMatrix를 전혀 사용하지 않는 방식.
+    picture size와 intrinsic이 고정이면 한 번만 계산.
 
-    target padded pixel (x, y)와 target depth z로 target camera space 점을 만들고,
-    decoded Rt로 previous camera space로 보낸 뒤,
-    같은 intrinsic으로 previous image coordinate에 project한다.
-
-    x_cam = (x - cx) / fx * z
-    y_cam = (y - cy) / fy * z
-    z_cam = z_sign * z
-
-    padding이 있더라도 intr이 padded coordinate 기준이면 그대로 동작한다.
+    NDC 아님.
+    pixel-coordinate 기반:
+      x_norm = (x - cx) / fx
+      y_norm = (y - cy) / fy
     """
-    x, y = make_grid(w, h)
-
     fx = float(intr["fx"])
     fy = float(intr["fy"])
     cx = float(intr["cx"])
     cy = float(intr["cy"])
     z_sign = float(intr["z_sign"])
 
+    x, y = np.meshgrid(
+        np.arange(w, dtype=np.float32),
+        np.arange(h, dtype=np.float32),
+    )
+
+    x_norm = (x - cx) / fx
+    y_norm = (y - cy) / fy
+
+    return {
+        "w": int(w),
+        "h": int(h),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "z_sign": z_sign,
+        "x_norm": x_norm.astype(np.float32),
+        "y_norm": y_norm.astype(np.float32),
+    }
+
+
+def backward_map_fast_pixel_coord(depth_linear, precomp, rt):
+    """
+    NDC / ProjectionMatrix / InvProjectionMatrix 미사용.
+
+    target pixel + target depth -> target camera coord -> previous camera coord
+    -> previous pixel coordinate.
+
+    기존:
+      X = x_norm * z
+      Y = y_norm * z
+      Z = z_sign * z
+      Xp = R * [X,Y,Z] + t
+
+    최적화:
+      Xp = z * (R00*x_norm + R01*y_norm + R02*z_sign) + tx
+      Yp = z * (R10*x_norm + R11*y_norm + R12*z_sign) + ty
+      Zp = z * (R20*x_norm + R21*y_norm + R22*z_sign) + tz
+    """
+    w = precomp["w"]
+    h = precomp["h"]
+
+    fx = precomp["fx"]
+    fy = precomp["fy"]
+    cx = precomp["cx"]
+    cy = precomp["cy"]
+    z_sign = precomp["z_sign"]
+
+    x_norm = precomp["x_norm"]
+    y_norm = precomp["y_norm"]
+
     z = depth_linear.astype(np.float32)
 
-    X = np.empty((h, w, 3), dtype=np.float32)
-    X[..., 0] = (x - cx) / fx * z
-    X[..., 1] = (y - cy) / fy * z
-    X[..., 2] = z_sign * z
-
     rvec = np.array(rt["rvec"], dtype=np.float32).reshape(3, 1)
-    tvec = np.array(rt["tvec"], dtype=np.float32).reshape(1, 1, 3)
+    tvec = np.array(rt["tvec"], dtype=np.float32)
 
     R, _ = cv2.Rodrigues(rvec)
+    R = R.astype(np.float32)
 
-    # 기존 코드와 동일한 convention 유지:
-    # Xp = X @ R.T + t
-    Xp = X @ R.T + tvec
+    tx = float(tvec[0])
+    ty = float(tvec[1])
+    tz = float(tvec[2])
 
-    zprev = np.maximum(np.abs(Xp[..., 2]), 1e-8)
+    kx = R[0, 0] * x_norm + R[0, 1] * y_norm + R[0, 2] * z_sign
+    ky = R[1, 0] * x_norm + R[1, 1] * y_norm + R[1, 2] * z_sign
+    kz = R[2, 0] * x_norm + R[2, 1] * y_norm + R[2, 2] * z_sign
 
-    map_x = fx * (Xp[..., 0] / zprev) + cx
-    map_y = fy * (Xp[..., 1] / zprev) + cy
+    Xp = z * kx + tx
+    Yp = z * ky + ty
+    Zp = z * kz + tz
+
+    denom = np.maximum(np.abs(Zp), 1e-8)
+
+    map_x = fx * (Xp / denom) + cx
+    map_y = fy * (Yp / denom) + cy
 
     valid = (
         np.isfinite(map_x)
         & np.isfinite(map_y)
-        & (Xp[..., 2] * z_sign > 0)
-        & (map_x >= 0)
+        & (Zp * z_sign > 0)
+        & (map_x >= 0.0)
         & (map_x <= w - 1)
-        & (map_y >= 0)
+        & (map_y >= 0.0)
         & (map_y <= h - 1)
-        & (z > 0)
+        & (z > 0.0)
     )
 
     map_x = map_x.astype(np.float32)
@@ -481,16 +478,6 @@ def remap_plane(src, map_x, map_y, bit_depth, border_value):
 
 
 def downsample_luma_map_to_chroma_map(map_x, map_y):
-    """
-    4:2:0용 luma map -> chroma map 변환.
-
-    기존처럼 cv2.resize 후 0.5를 곱하면 invalid=-1이 주변과 섞일 수 있다.
-    여기서는 2x2 luma block의 valid sample만 평균낸 뒤 chroma coordinate로 변환한다.
-
-    luma coordinate -> chroma coordinate:
-      x_uv = x_luma * 0.5
-      y_uv = y_luma * 0.5
-    """
     h, w = map_x.shape
     if h % 2 != 0 or w % 2 != 0:
         raise ValueError("luma map size must be even for YUV420")
@@ -502,7 +489,6 @@ def downsample_luma_map_to_chroma_map(map_x, map_y):
     my = map_y.reshape(uv_h, 2, uv_w, 2)
 
     valid = (mx >= 0.0) & (my >= 0.0)
-
     cnt = np.sum(valid, axis=(1, 3)).astype(np.float32)
 
     sum_x = np.sum(np.where(valid, mx, 0.0), axis=(1, 3))
@@ -512,6 +498,7 @@ def downsample_luma_map_to_chroma_map(map_x, map_y):
     avg_y = np.full((uv_h, uv_w), -1.0, dtype=np.float32)
 
     ok = cnt > 0
+
     avg_x[ok] = sum_x[ok] / cnt[ok]
     avg_y[ok] = sum_y[ok] / cnt[ok]
 
@@ -525,8 +512,6 @@ def downsample_luma_map_to_chroma_map(map_x, map_y):
 
 
 def backward_warp_yuv420(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
-    h, w = prev_y.shape
-
     y = remap_plane(prev_y, map_x, map_y, bit_depth, 0)
 
     map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
@@ -550,18 +535,12 @@ def main():
     ap.add_argument("--depth-yuv", required=True)
     ap.add_argument("--param-jsonl", required=True)
 
-    # 원본 source size
     ap.add_argument("--width", type=int, required=True)
     ap.add_argument("--height", type=int, required=True)
 
-    # decoder/coded picture size
-    # 생략하면 pad_left/pad_top을 포함한 뒤 4의 배수로 자동 align
     ap.add_argument("--coded-width", type=int, default=None)
     ap.add_argument("--coded-height", type=int, default=None)
 
-    # padding 위치
-    # 일반적인 right/bottom padding이면 둘 다 0.
-    # left/top padding을 시뮬레이션하려면 여기에 값 지정.
     ap.add_argument("--pad-left", type=int, default=0)
     ap.add_argument("--pad-top", type=int, default=0)
 
@@ -643,12 +622,6 @@ def main():
     depth_scale = float(header["depth_scale"])
     intr_gt_original = header["intrinsic"]
 
-    # ------------------------------------------------------------
-    # 핵심:
-    # 원본 intrinsic을 padded image coordinate 기준으로 변환한 뒤
-    # coded_w/coded_h 기준으로 quant/dequant한다.
-    # decoder는 원본 W/H 없이 coded_w/coded_h만 알면 됨.
-    # ------------------------------------------------------------
     intr_gt_padded = make_padded_intrinsic_from_original(
         intr_gt_original,
         pad_left=pad_left,
@@ -664,15 +637,21 @@ def main():
         c_max=args.intr_c_max,
     )
 
+    # ------------------------------------------------------------
+    # 핵심 precompute
+    # ------------------------------------------------------------
+    projection_precomp = make_projection_precompute(
+        coded_w,
+        coded_h,
+        intr_dec,
+    )
+
     seq_count = count_frames(seq_yuv, src_w, src_h, bit_depth)
     depth_count = count_frames(depth_yuv, src_w, src_h, 10)
     max_poc = min(seq_count, depth_count, max(frames.keys()) + 1)
 
     decoded_hist = []
 
-    # ------------------------------------------------------------
-    # Bit count constants
-    # ------------------------------------------------------------
     q_abs_max = signed_q_abs_max(args.ext_bits)
 
     intrinsic_bits = 4 * 16
@@ -708,7 +687,12 @@ def main():
                 "bottom": pad_bottom,
             },
 
-            "projection_mode": "pixel_coordinate_no_ndc",
+            "projection_mode": "fast_pixel_coordinate_no_ndc",
+            "precompute": [
+                "x_norm=(x-cx)/fx",
+                "y_norm=(y-cy)/fy",
+                "fx,fy,cx,cy,z_sign cached",
+            ],
             "depth_padding": "edge",
             "image_padding": "edge",
 
@@ -785,12 +769,8 @@ def main():
             if poc not in frames:
                 raise RuntimeError(f"POC {poc} not found in param jsonl")
 
-            # ------------------------------------------------------------
-            # GT camera parameter
-            # ------------------------------------------------------------
             p_gt = param6_from_frame(frames[poc], depth_scale)
 
-            # predictor uses decoded parameters only
             p_pred = predict_from_history(
                 decoded_hist,
                 pred_n=args.pred_n,
@@ -833,9 +813,7 @@ def main():
             rt_dec = rt_from_param6(p_dec, depth_scale)
 
             # ------------------------------------------------------------
-            # Depth:
-            # 원본 depth를 읽고, coded picture size로 edge padding.
-            # projection은 padded depth 전체에 대해 수행.
+            # depth padding
             # ------------------------------------------------------------
             depth_y, _, _ = read_yuv420(
                 depth_yuv,
@@ -856,22 +834,18 @@ def main():
             ).astype(np.float32)
 
             # ------------------------------------------------------------
-            # Pixel-coordinate backward projection.
-            # NDC / ProjectionMatrix 사용 안 함.
+            # Fast projection
+            # NDC 없음.
+            # ProjectionMatrix 없음.
+            # InvProjectionMatrix 없음.
+            # x_norm/y_norm precompute 사용.
             # ------------------------------------------------------------
-            map_x, map_y = backward_map_from_depth_and_params_pixel_coord(
+            map_x, map_y = backward_map_fast_pixel_coord(
                 depth_linear=depth_linear_pad,
-                intr=intr_dec,
+                precomp=projection_precomp,
                 rt=rt_dec,
-                w=coded_w,
-                h=coded_h,
             )
 
-            # ------------------------------------------------------------
-            # Reference picture:
-            # 이전 GT frame을 읽고 coded picture size로 edge padding.
-            # decoder 입장에서는 padded picture 전체가 참조 가능.
-            # ------------------------------------------------------------
             prev_y, prev_u, prev_v = read_yuv420(
                 seq_yuv,
                 poc - 1,
@@ -948,7 +922,8 @@ def main():
         f"L={pad_left}, T={pad_top}, "
         f"R={pad_right}, B={pad_bottom}"
     )
-    print("projection            : pixel-coordinate, no NDC")
+    print("projection            : fast pixel-coordinate, no NDC")
+    print("precompute            : x_norm, y_norm")
     print("image/depth padding   : edge")
     print("------------------------------------------------------------")
     print("Intrinsic")
