@@ -1,18 +1,48 @@
-printf("[DEC_CU] POC=%d x=%d y=%d w=%d h=%d "
-       "predMode=%d skip=%d merge=%d affine=%d geo=%d "
-       "interDir=%d refL0=%d refL1=%d "
-       "mvL0=(%d,%d) mvL1=(%d,%d)\n",
-       cs.slice->getPOC(),
-       cu.Y().x, cu.Y().y, cu.Y().width, cu.Y().height,
-       cu.predMode,
-       cu.skip,
-       cu.mergeFlag,
-       cu.affine,
-       cu.geoFlag,
-       cu.interDir,
-       cu.refIdx[REF_PIC_LIST_0],
-       cu.refIdx[REF_PIC_LIST_1],
-       cu.mv[REF_PIC_LIST_0].hor,
-       cu.mv[REF_PIC_LIST_0].ver,
-       cu.mv[REF_PIC_LIST_1].hor,
-       cu.mv[REF_PIC_LIST_1].ver);
+#include <fstream>
+#include <mutex>
+
+static std::mutex g_depthDbgMutex;
+
+static void depthDbgLog(const std::string& msg)
+{
+  std::lock_guard<std::mutex> lock(g_depthDbgMutex);
+  std::ofstream ofs("depth_mismatch_debug.log", std::ios::app);
+  ofs << msg << '\n';
+}
+
+
+
+
+
+
+std::ostringstream oss;
+oss << "[ENC_CU] POC=" << cs.slice->getPOC()
+    << " x=" << cu.Y().x
+    << " y=" << cu.Y().y
+    << " w=" << cu.Y().width
+    << " h=" << cu.Y().height
+    << " skip=" << cu.skip
+    << " merge=" << cu.mergeFlag
+    << " affine=" << cu.affine
+    << " geo=" << cu.geoFlag
+    << " interDir=" << (int)cu.interDir
+    << " refL0=" << cu.refIdx[REF_PIC_LIST_0]
+    << " mvL0=(" << cu.mv[REF_PIC_LIST_0].hor << "," << cu.mv[REF_PIC_LIST_0].ver << ")";
+
+depthDbgLog(oss.str());
+
+
+
+
+
+
+
+
+
+
+
+std::ofstream ofs("enc_depth_debug.log", std::ios::app);
+
+
+
+
