@@ -46,3 +46,37 @@ std::ofstream ofs("enc_depth_debug.log", std::ios::app);
 
 
 
+
+
+
+
+
+
+
+
+
+
+Please modify the bi-directional part of the camera projection tool to avoid evaluating all L0×L1 reference pairs.
+
+Use the VTM-style structure as a reference, not a full algorithmic rewrite. In VTM, check these code locations:
+
+* EncoderLib/InterSearch.cpp, predInterSearch()
+    * uni L0/L1 reference search: lines 2844–2927
+    * per-list best storage: lines 2919–2927
+    * bi initialization from best L0 + best L1: lines 2966–2972
+    * alternating bi refinement with early break: lines 3031–3151
+* EncoderLib/InterSearch.cpp, xMotionEstimation()
+    * smaller bi search range: line 3894
+* EncoderLib/EncCu.cpp, xCheckRDCostInter()
+    * final residual RDO only after motion selection: lines 3475–3496
+
+For our camera projection tool, apply the same high-level policy:
+
+1. Evaluate L0 references independently and keep the best L0 candidate.
+2. Evaluate L1 references independently and keep the best L1 candidate.
+3. Initialize bi-prediction from best L0 + best L1.
+4. Refine bi by alternating one side at a time, keeping the other side fixed.
+5. Stop refinement when there is no improvement.
+6. Do not run full projection/RDO for every L0×L1 pair.
+
+Please keep the implementation simple and localized to the bi-directional candidate search path.
