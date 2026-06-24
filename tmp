@@ -274,145 +274,127 @@ Please output:
 
 
 
+Please review the current implementation and check whether it satisfies the following requirements. Do not modify code yet. First, produce a checklist report with PASS / FAIL / PARTIAL for each item, and mention the exact files/functions involved.
 
-Please use the following method to derive per-pixel MV from the camera projection tool.
+Context:
+Camera projection coded blocks were previously treated as unavailable when deriving merge candidates. The new goal is to make camera projection blocks usable by neighboring blocks through regular merge, MMVD, GPM/Geo, affine merge, and optionally HMVP.
 
-Goal:
-After camera projection, each current-frame pixel should have a motion vector that points to the projected position in the reference frame. This MV will later be reused for regular merge MotionInfo and affine merge control-point generation.
+Checklist:
 
-Definition:
-For each current pixel (x_cur, y_cur), project it into the selected reference frame using the current depth and camera parameters.
+1. Per-pixel MV derivation
 
-If the projected reference-frame coordinate is:
+* Verify that camera projection derives MV using backward projection per current pixel.
+* MV direction must be:
+    MV = projected reference position - current pixel position
+* Do not derive MV from forward splatting.
+* For bi-directional projection, L0 and L1 MVs must be computed independently.
+* Invalid projection pixels must be handled deterministically.
 
-(x_ref, y_ref)
+2. 4x4 MotionInfo cache
 
-then the motion vector is:
+* Verify that camera projection results are converted into 4x4-level MotionInfo.
+* For each 4x4 block, MV should be averaged from valid corner pixel motions or an equivalent deterministic local average.
+* Required fields:
+    * isInter = true
+    * interDir
+    * mv[RPL0/RPL1]
+    * refIdx[RPL0/RPL1]
+    * sliceIdx
+    * usesLIC = false unless explicitly supported
+    * useAltHpelIf = false unless explicitly needed
+* Invalid 4x4 entries should not produce unsafe merge candidates.
 
-mv_x = x_ref - x_cur;
-mv_y = y_ref - y_cur;
+3. spanMotionInfo() behavior
 
-This is the same direction as a normal inter MV: from the current block/pixel position to the reference-frame sampling position.
+* Check CommonLib/UnitTools.cpp, PU::spanMotionInfo().
+* Camera projection CUs should not simply call mb.fill(mi) with one CU-level MV.
+* They should populate cu.getMotionBuf() using the precomputed 4x4 MotionInfo cache.
+* Confirm that neighboring blocks can read camera projection motion via getMotionInfo(pos).
 
-Use backward projection, not forward splatting:
-For each current pixel:
+4. Regular merge
 
-current pixel + current depth
-  -> current camera-space 3D point
-  -> world-space 3D point
-  -> reference camera-space 3D point
-  -> reference image coordinate
-  -> MV = reference coordinate - current coordinate
+* Check CommonLib/UnitTools.cpp, PU::getInterMergeCandidates().
+* Camera projection neighbors should no longer be treated as unavailable.
+* Existing merge candidate derivation should be able to read:
+    * interDir
+    * MvField
+    * refIdx
+    * bcwIdx
+    * LICFlags
+* Prefer keeping the regular merge path unchanged except for making camera projection MotionInfo available.
 
-Do not derive MV from forward-projected splat positions, because forward projection can create holes, duplicates, and ambiguous ownership. The MV cache should be defined per current pixel.
+5. MMVD
 
-Pseudo-code:
+* Check PU::getInterMMVDMergeCandidates() and MergeCtx::setMmvdMergeCandiInfo().
+* Confirm MMVD uses camera projection candidates through the normal MergeCtx.
+* No special camera/depth information should be required by MMVD.
+* Confirm that refIdx is valid, because MMVD depends on reference POC distance through the slice/reference list.
 
-for each current pixel (x, y):
-{
-    depth = getCurrentDepth(x, y);
-    // 1. Back-project current pixel to 3D using current camera and depth
-    P_cur_cam = unprojectCurrentPixel(x, y, depth);
-    // 2. Transform current camera point to world
-    P_world = curCameraToWorld * P_cur_cam;
-    // 3. Transform world point to reference camera
-    P_ref_cam = refWorldToCamera * P_world;
-    // 4. Project to reference image plane
-    (x_ref, y_ref, valid) = projectToReferenceImage(P_ref_cam);
-    if (valid)
-    {
-        float mvx = x_ref - float(x);
-        float mvy = y_ref - float(y);
-        storePixelMotion(x, y, mvx, mvy);
-    }
-    else
-    {
-        markPixelMotionInvalid(x, y);
-    }
-}
+6. GPM / Geo
 
-Conversion to VTM internal MV precision:
-After computing the floating-point pixel displacement, convert it to VTM MV precision.
+* Check PU::getGeoMergeCandidates().
+* Confirm GPM/Geo can receive camera projection candidates through regular merge candidates.
+* Confirm that uni candidates are correctly derived from camera projection merge candidates.
+* For bi camera projection candidates, confirm L0 and L1 can be split into valid uni candidates if the existing GPM path expects that.
 
-Example:
+7. Affine merge candidate support
 
-Mv mv;
-mv.hor = round(mvx * (1 << MV_FRACTIONAL_BITS_INTERNAL));
-mv.ver = round(mvy * (1 << MV_FRACTIONAL_BITS_INTERNAL));
+* Check PU::getAffineMergeCand() and AffineMergeCtx.
+* Verify whether camera projection blocks can provide affine merge candidates.
+* Affine control points should be derived from the 4x4 MV cache, not least-squares fitting.
+* Use:
+    * CP0 / LT = top-left 4x4 MV
+    * CP1 / RT = top-right 4x4 MV
+    * CP2 / LB = bottom-left 4x4 MV
+* If all three CPs are valid, use 6-parameter affine:
+    affineType = AffineModel::_6_PARAMS
+* For bi candidates, fill CPs independently for RPL0 and RPL1.
+* Confirm refIdx, interDir, bcwIdx, and LICFlags are filled consistently.
 
-If the internal MV precision is 1/16 pel, then:
+8. HMVP
 
-mv.hor = round(mvx * 16);
-mv.ver = round(mvy * 16);
+* Do not increase the HMVP maximum size.
+* If camera projection CUs are added to HMVP, add at most one representative MotionInfo per camera projection CU.
+* Do not insert every 4x4 MV into HMVP.
+* Representative MV preference:
+    1. center 4x4 MV
+    2. block average MV
+    3. top-left 4x4 MV
+* Add only if validity is high enough.
+* Perform duplicate or similarity checks to avoid pushing out useful existing HMVP entries unnecessarily.
+* Keep anchor comparison fair by preserving the original HMVP max size.
 
-Example:
-If current pixel is (100, 50) and its projected reference coordinate is (96.25, 51.5), then:
+9. Affine HMVP
 
-mvx = 96.25 - 100 = -3.75;
-mvy = 51.5  - 50  =  1.5;
+* Check whether camera projection affine CP candidates are also saved into affine HMVP.
+* If not implemented, report whether this is intentionally skipped.
+* This is optional, but useful if later blocks should reuse camera projection affine candidates through history.
 
-With 1/16-pel internal precision:
+10. Safety checks
 
-mv.hor = round(-3.75 * 16) = -60;
-mv.ver = round( 1.5  * 16) =  24;
+* Confirm all derivation is deterministic on encoder and decoder side.
+* Confirm no encoder-only data is used in decoder-side merge derivation.
+* Confirm refIdx is valid for the current slice.
+* Confirm L1 fields are only filled when the current slice and camera projection mode actually use L1.
+* Confirm unavailable lists use refIdx = NOT_VALID and zero MV.
+* Confirm projection-invalid areas do not expose garbage MVs.
+* Add or verify CHECK() statements for invalid interDir, invalid refIdx, and mismatched affine CP reference indices.
 
-For bi-directional camera projection:
-Compute this separately for each reference list.
+Expected report format:
 
-L0 MV = projected position in L0 reference - current position;
-L1 MV = projected position in L1 reference - current position;
-
-Store each list independently with its own refIdx.
-
-For 4x4 MotionInfo:
-After per-pixel MV is available, create a 4x4-level MV cache.
-
-For each 4x4 subblock, sample the four luma corner pixels:
-
-top-left
-top-right
-bottom-left
-bottom-right
-
-Average their valid projected MVs:
-
-mv4x4 = average(valid corner MVs);
-
-Then store this as the 4x4 MotionInfo MV:
-
-mi.isInter = true;
-mi.interDir = cameraProjInterDir;
-mi.refIdx[RPL0] = refIdx0;
-mi.refIdx[RPL1] = refIdx1;
-mi.mv[RPL0] = mv4x4_L0;
-mi.mv[RPL1] = mv4x4_L1;
-
-For affine merge control points:
-Reuse the 4x4 MV cache instead of doing least-squares fitting.
-
-Use:
-
-CP0 / LT = top-left 4x4 MV;
-CP1 / RT = top-right 4x4 MV;
-CP2 / LB = bottom-left 4x4 MV;
-
-Then fill affine merge candidate fields:
-
-affMrgCtx.mvFieldNeighbours[cand][0][list] = MvField(mvLT, refIdx);
-affMrgCtx.mvFieldNeighbours[cand][1][list] = MvField(mvRT, refIdx);
-affMrgCtx.mvFieldNeighbours[cand][2][list] = MvField(mvLB, refIdx);
-
-Use 6-parameter affine when all three control points are valid:
-
-affMrgCtx.affineType[cand] = AffineModel::_6_PARAMS;
-
-Important notes:
-
-* The MV direction must be reference position - current position.
-* Use backward projection per current pixel.
-* Do not use forward splatting to derive MV.
-* Keep invalid projection handling deterministic.
-* For invalid pixels or invalid 4x4 corners, either skip that MotionInfo entry or average only valid samples.
-* For merge candidate usage, make sure interDir, refIdx, and MV list fields are consistent with the current slice.
-* For L1, only fill it when the slice and camera projection mode actually use L1.
-* This MV cache must be derivable identically on encoder and decoder side.
+Camera Projection Merge Integration Checklist
+1. Per-pixel MV derivation: PASS / FAIL / PARTIAL
+   Evidence:
+   - File/function:
+   - Notes:
+2. 4x4 MotionInfo cache: PASS / FAIL / PARTIAL
+   Evidence:
+   - File/function:
+   - Notes:
+...
+Final summary:
+- Fully satisfied:
+- Partially satisfied:
+- Missing:
+- Risky implementation points:
+- Recommended minimal fixes:
