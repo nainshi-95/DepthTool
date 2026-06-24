@@ -228,3 +228,191 @@ Please output:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Please use the following method to derive per-pixel MV from the camera projection tool.
+
+Goal:
+After camera projection, each current-frame pixel should have a motion vector that points to the projected position in the reference frame. This MV will later be reused for regular merge MotionInfo and affine merge control-point generation.
+
+Definition:
+For each current pixel (x_cur, y_cur), project it into the selected reference frame using the current depth and camera parameters.
+
+If the projected reference-frame coordinate is:
+
+(x_ref, y_ref)
+
+then the motion vector is:
+
+mv_x = x_ref - x_cur;
+mv_y = y_ref - y_cur;
+
+This is the same direction as a normal inter MV: from the current block/pixel position to the reference-frame sampling position.
+
+Use backward projection, not forward splatting:
+For each current pixel:
+
+current pixel + current depth
+  -> current camera-space 3D point
+  -> world-space 3D point
+  -> reference camera-space 3D point
+  -> reference image coordinate
+  -> MV = reference coordinate - current coordinate
+
+Do not derive MV from forward-projected splat positions, because forward projection can create holes, duplicates, and ambiguous ownership. The MV cache should be defined per current pixel.
+
+Pseudo-code:
+
+for each current pixel (x, y):
+{
+    depth = getCurrentDepth(x, y);
+    // 1. Back-project current pixel to 3D using current camera and depth
+    P_cur_cam = unprojectCurrentPixel(x, y, depth);
+    // 2. Transform current camera point to world
+    P_world = curCameraToWorld * P_cur_cam;
+    // 3. Transform world point to reference camera
+    P_ref_cam = refWorldToCamera * P_world;
+    // 4. Project to reference image plane
+    (x_ref, y_ref, valid) = projectToReferenceImage(P_ref_cam);
+    if (valid)
+    {
+        float mvx = x_ref - float(x);
+        float mvy = y_ref - float(y);
+        storePixelMotion(x, y, mvx, mvy);
+    }
+    else
+    {
+        markPixelMotionInvalid(x, y);
+    }
+}
+
+Conversion to VTM internal MV precision:
+After computing the floating-point pixel displacement, convert it to VTM MV precision.
+
+Example:
+
+Mv mv;
+mv.hor = round(mvx * (1 << MV_FRACTIONAL_BITS_INTERNAL));
+mv.ver = round(mvy * (1 << MV_FRACTIONAL_BITS_INTERNAL));
+
+If the internal MV precision is 1/16 pel, then:
+
+mv.hor = round(mvx * 16);
+mv.ver = round(mvy * 16);
+
+Example:
+If current pixel is (100, 50) and its projected reference coordinate is (96.25, 51.5), then:
+
+mvx = 96.25 - 100 = -3.75;
+mvy = 51.5  - 50  =  1.5;
+
+With 1/16-pel internal precision:
+
+mv.hor = round(-3.75 * 16) = -60;
+mv.ver = round( 1.5  * 16) =  24;
+
+For bi-directional camera projection:
+Compute this separately for each reference list.
+
+L0 MV = projected position in L0 reference - current position;
+L1 MV = projected position in L1 reference - current position;
+
+Store each list independently with its own refIdx.
+
+For 4x4 MotionInfo:
+After per-pixel MV is available, create a 4x4-level MV cache.
+
+For each 4x4 subblock, sample the four luma corner pixels:
+
+top-left
+top-right
+bottom-left
+bottom-right
+
+Average their valid projected MVs:
+
+mv4x4 = average(valid corner MVs);
+
+Then store this as the 4x4 MotionInfo MV:
+
+mi.isInter = true;
+mi.interDir = cameraProjInterDir;
+mi.refIdx[RPL0] = refIdx0;
+mi.refIdx[RPL1] = refIdx1;
+mi.mv[RPL0] = mv4x4_L0;
+mi.mv[RPL1] = mv4x4_L1;
+
+For affine merge control points:
+Reuse the 4x4 MV cache instead of doing least-squares fitting.
+
+Use:
+
+CP0 / LT = top-left 4x4 MV;
+CP1 / RT = top-right 4x4 MV;
+CP2 / LB = bottom-left 4x4 MV;
+
+Then fill affine merge candidate fields:
+
+affMrgCtx.mvFieldNeighbours[cand][0][list] = MvField(mvLT, refIdx);
+affMrgCtx.mvFieldNeighbours[cand][1][list] = MvField(mvRT, refIdx);
+affMrgCtx.mvFieldNeighbours[cand][2][list] = MvField(mvLB, refIdx);
+
+Use 6-parameter affine when all three control points are valid:
+
+affMrgCtx.affineType[cand] = AffineModel::_6_PARAMS;
+
+Important notes:
+
+* The MV direction must be reference position - current position.
+* Use backward projection per current pixel.
+* Do not use forward splatting to derive MV.
+* Keep invalid projection handling deterministic.
+* For invalid pixels or invalid 4x4 corners, either skip that MotionInfo entry or average only valid samples.
+* For merge candidate usage, make sure interDir, refIdx, and MV list fields are consistent with the current slice.
+* For L1, only fill it when the slice and camera projection mode actually use L1.
+* This MV cache must be derivable identically on encoder and decoder side.
