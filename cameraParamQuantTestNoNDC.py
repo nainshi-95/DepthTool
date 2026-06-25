@@ -1006,17 +1006,10 @@ if __name__ == "__main__":
 
 
 
+import torch
+import torch.nn.functional as F
 
-
-
-
-# ============================================================
-# 4x4 subblock MV + 6-tap interpolation
-# ============================================================
-
-# From VTM InterpolationFilter::m_lumaIntraFilter
-# 32 phases, 6 taps, coeff sum = 256
-LUMA_6TAP_32 = np.array([
+LUMA_6TAP_32_NP = np.array([
     [0,   0, 256,   0,   0, 0],
     [0,  -4, 253,   9,  -2, 0],
     [1,  -7, 249,  17,  -4, 0],
@@ -1049,185 +1042,168 @@ LUMA_6TAP_32 = np.array([
     [1,  -6,  25, 245, -10, 1],
     [0,  -4,  17, 249,  -7, 1],
     [0,  -2,   9, 253,  -4, 0],
-], dtype=np.int32)
+], dtype=np.float32)
 
 
-def make_subblk4_avg_flow_map(map_x, map_y, block_size=4):
-    """
-    map_x/map_y: pixel-wise projected source coordinate.
-    For each 4x4 block:
-      flow = map - current_pixel_position
-      representative flow = average of 4 corner flows
-      new map = current_pixel_position + representative flow
-
-    Invalid block -> map = -1.
-    """
+def make_subblk4_avg_flow_map_fast(map_x, map_y):
     h, w = map_x.shape
+    assert h % 4 == 0 and w % 4 == 0
 
-    x_grid, y_grid = np.meshgrid(
-        np.arange(w, dtype=np.float32),
+    yy, xx = np.meshgrid(
         np.arange(h, dtype=np.float32),
+        np.arange(w, dtype=np.float32),
+        indexing="ij",
     )
 
-    out_x = np.full_like(map_x, -1.0, dtype=np.float32)
-    out_y = np.full_like(map_y, -1.0, dtype=np.float32)
+    flow_x = map_x - xx
+    flow_y = map_y - yy
+    valid = (map_x >= 0.0) & (map_y >= 0.0)
 
-    for by in range(0, h, block_size):
-        for bx in range(0, w, block_size):
-            y0 = by
-            x0 = bx
-            y1 = min(by + block_size - 1, h - 1)
-            x1 = min(bx + block_size - 1, w - 1)
+    bh = h // 4
+    bw = w // 4
 
-            corners = [
-                (y0, x0),
-                (y0, x1),
-                (y1, x0),
-                (y1, x1),
-            ]
+    fx4 = flow_x.reshape(bh, 4, bw, 4)
+    fy4 = flow_y.reshape(bh, 4, bw, 4)
+    vd4 = valid.reshape(bh, 4, bw, 4)
 
-            flows_x = []
-            flows_y = []
+    corner_valid = (
+        vd4[:, 0, :, 0]
+        & vd4[:, 0, :, 3]
+        & vd4[:, 3, :, 0]
+        & vd4[:, 3, :, 3]
+    )
 
-            valid_block = True
+    avg_fx = (
+        fx4[:, 0, :, 0]
+        + fx4[:, 0, :, 3]
+        + fx4[:, 3, :, 0]
+        + fx4[:, 3, :, 3]
+    ) * 0.25
 
-            for cy, cx in corners:
-                mx = map_x[cy, cx]
-                my = map_y[cy, cx]
+    avg_fy = (
+        fy4[:, 0, :, 0]
+        + fy4[:, 0, :, 3]
+        + fy4[:, 3, :, 0]
+        + fy4[:, 3, :, 3]
+    ) * 0.25
 
-                if mx < 0.0 or my < 0.0:
-                    valid_block = False
-                    break
+    avg_fx = np.repeat(np.repeat(avg_fx, 4, axis=0), 4, axis=1)
+    avg_fy = np.repeat(np.repeat(avg_fy, 4, axis=0), 4, axis=1)
+    blk_valid = np.repeat(np.repeat(corner_valid, 4, axis=0), 4, axis=1)
 
-                flows_x.append(mx - float(cx))
-                flows_y.append(my - float(cy))
+    out_x = xx + avg_fx
+    out_y = yy + avg_fy
 
-            if not valid_block:
-                continue
+    out_x[~blk_valid] = -1.0
+    out_y[~blk_valid] = -1.0
 
-            avg_fx = float(np.mean(flows_x))
-            avg_fy = float(np.mean(flows_y))
-
-            ys = slice(by, min(by + block_size, h))
-            xs = slice(bx, min(bx + block_size, w))
-
-            out_x[ys, xs] = x_grid[ys, xs] + avg_fx
-            out_y[ys, xs] = y_grid[ys, xs] + avg_fy
-
-    return out_x, out_y
+    return out_x.astype(np.float32), out_y.astype(np.float32)
 
 
-def sample_6tap_one(src, sx, sy, bit_depth):
+def remap_plane_subblk4_6tap_torch(src, map_x, map_y, bit_depth, device=None):
     """
-    Separable 6-tap interpolation.
-    Fraction precision: 1/32.
-    Filter coeff precision: 8 bits.
-    Final shift: 16 bits.
-    Border inside valid region: edge clamp.
+    src: numpy 2D, uint16/uint8
+    map_x/map_y: luma pixel-wise map
+    output: numpy 2D, same dtype as src
+
+    4x4 대표 flow + 6tap interpolation.
     """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     h, w = src.shape
+    maxv = (1 << bit_depth) - 1
 
-    ix = int(np.floor(sx))
-    iy = int(np.floor(sy))
+    sub_x, sub_y = make_subblk4_avg_flow_map_fast(map_x, map_y)
 
-    fx = int(np.round((sx - ix) * 32.0))
-    fy = int(np.round((sy - iy) * 32.0))
+    valid_np = (
+        (sub_x >= 0.0)
+        & (sub_y >= 0.0)
+        & (sub_x <= w - 1)
+        & (sub_y <= h - 1)
+    )
 
-    if fx >= 32:
-        ix += 1
-        fx = 0
-    if fy >= 32:
-        iy += 1
-        fy = 0
+    sx = torch.from_numpy(sub_x).to(device=device, dtype=torch.float32)
+    sy = torch.from_numpy(sub_y).to(device=device, dtype=torch.float32)
+    valid = torch.from_numpy(valid_np).to(device=device)
 
-    if fx < 0:
-        ix -= 1
-        fx += 32
-    if fy < 0:
-        iy -= 1
-        fy += 32
+    ix = torch.floor(sx).to(torch.long)
+    iy = torch.floor(sy).to(torch.long)
 
-    coeff_x = LUMA_6TAP_32[fx]
-    coeff_y = LUMA_6TAP_32[fy]
+    frac_x = torch.round((sx - ix.float()) * 32.0).to(torch.long)
+    frac_y = torch.round((sy - iy.float()) * 32.0).to(torch.long)
 
-    acc = 0
+    carry_x = frac_x >= 32
+    carry_y = frac_y >= 32
 
-    for j in range(6):
-        yy = np.clip(iy + j - 2, 0, h - 1)
-        cy = int(coeff_y[j])
+    ix = ix + carry_x.long()
+    iy = iy + carry_y.long()
 
-        for i in range(6):
-            xx = np.clip(ix + i - 2, 0, w - 1)
-            cx = int(coeff_x[i])
+    frac_x = torch.where(carry_x, torch.zeros_like(frac_x), frac_x)
+    frac_y = torch.where(carry_y, torch.zeros_like(frac_y), frac_y)
 
-            acc += cy * cx * int(src[yy, xx])
+    ix = ix.clamp(0, w - 1)
+    iy = iy.clamp(0, h - 1)
+
+    src_t = torch.from_numpy(src.astype(np.float32)).to(device)
+    src_t = src_t.view(1, 1, h, w)
+
+    # tap range: ix-2 ... ix+3
+    # asymmetric pad: left/top=2, right/bottom=3
+    src_pad = F.pad(src_t, (2, 3, 2, 3), mode="replicate")
+
+    # patches: [1, 36, h*w]
+    patches_all = F.unfold(src_pad, kernel_size=(6, 6), stride=1)
+
+    # each output pixel wants patch whose top-left corresponds to ix, iy
+    col_idx = (iy * w + ix).reshape(-1)
+    patches = patches_all[0, :, col_idx]  # [36, h*w]
+
+    coeff = torch.from_numpy(LUMA_6TAP_32_NP).to(device)
+
+    cx = coeff[frac_x.reshape(-1)]  # [N, 6]
+    cy = coeff[frac_y.reshape(-1)]  # [N, 6]
+
+    # 2D separable filter coeff: cy outer cx
+    weight = (cy[:, :, None] * cx[:, None, :]).reshape(-1, 36)  # [N, 36]
+
+    val = torch.sum(patches.transpose(0, 1) * weight, dim=1)
 
     # coeff precision 8 + 8 = 16
-    val = (acc + (1 << 15)) >> 16
+    val = torch.round(val / 65536.0)
+    val = val.clamp(0, maxv)
 
-    maxv = (1 << bit_depth) - 1
-    val = max(0, min(maxv, val))
+    val = val.reshape(h, w)
+    val = torch.where(valid, val, torch.zeros_like(val))
 
-    return val
-
-
-def remap_plane_subblk4_6tap(src, map_x, map_y, bit_depth, border_value=0):
-    """
-    4x4 representative flow + 6-tap interpolation.
-    """
-    h, w = src.shape
-
-    sub_map_x, sub_map_y = make_subblk4_avg_flow_map(
-        map_x,
-        map_y,
-        block_size=4,
-    )
-
-    dst = np.full((h, w), border_value, dtype=np.int32)
-
-    for y in range(h):
-        for x in range(w):
-            sx = float(sub_map_x[y, x])
-            sy = float(sub_map_y[y, x])
-
-            if sx < 0.0 or sy < 0.0:
-                continue
-
-            if sx < 0.0 or sx > w - 1 or sy < 0.0 or sy > h - 1:
-                continue
-
-            dst[y, x] = sample_6tap_one(src, sx, sy, bit_depth)
+    out = val.detach().cpu().numpy()
 
     if bit_depth <= 8:
-        return dst.astype(np.uint8)
-    return dst.astype(np.uint16)
+        return out.astype(np.uint8)
+    return out.astype(np.uint16)
 
 
-def backward_warp_yuv420_subblk4_6tap(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
-    """
-    Y: 4x4 subblock representative flow + 6-tap
-    U/V: keep current bilinear path for now
-    """
-    y = remap_plane_subblk4_6tap(
+
+
+
+
+
+def backward_warp_yuv420_subblk4_6tap_torch(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
+    wy = remap_plane_subblk4_6tap_torch(
         prev_y,
         map_x,
         map_y,
         bit_depth,
-        border_value=0,
     )
 
-    # Chroma는 일단 기존 방식 유지.
-    # Y PSNR/SATD 비교가 목적이면 이걸로 충분함.
+    # U/V는 일단 기존 bilinear 유지
     map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
-
     neutral = 128 if bit_depth <= 8 else 512
 
-    u = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
-    v = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
+    wu = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
+    wv = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
 
-    return y, u, v
-
-
+    return wy, wu, wv
 
 
 
@@ -1236,15 +1212,6 @@ def backward_warp_yuv420_subblk4_6tap(prev_y, prev_u, prev_v, map_x, map_y, bit_
 
 
 
-
-wy, wu, wv = backward_warp_yuv420_subblk4_6tap(
-    prev_y_pad,
-    prev_u_pad,
-    prev_v_pad,
-    map_x,
-    map_y,
-    bit_depth,
-)
 
 
 
