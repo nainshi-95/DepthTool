@@ -1,198 +1,117 @@
+// DecCu.cpp 상단 include 근처
 #include <fstream>
 #include <mutex>
+#include <iomanip>
 
-static std::mutex g_depthDbgMutex;
+static std::mutex g_decCuLogMutex;
 
-static void depthDbgLog(const std::string& msg)
+static const char* predModeName( PredMode mode )
 {
-  std::lock_guard<std::mutex> lock(g_depthDbgMutex);
-  std::ofstream ofs("depth_mismatch_debug.log", std::ios::app);
-  ofs << msg << '\n';
+  switch( mode )
+  {
+  case MODE_INTER: return "INTER";
+  case MODE_INTRA: return "INTRA";
+#if JVET_S0078
+  case MODE_IBC:   return "IBC";
+#endif
+  default:         return "UNKNOWN";
+  }
 }
 
+static void dumpMv( std::ofstream& ofs, const char* name, const Mv& mv )
+{
+  ofs << name << "=(" << mv.getHor() << "," << mv.getVer() << ") ";
+}
 
+static void dumpDecCuInfo( const CodingUnit& cu, const char* tag )
+{
+  std::lock_guard<std::mutex> lock( g_decCuLogMutex );
 
+  std::ofstream ofs( "dec_cu_debug.txt", std::ios::app );
+  if( !ofs.is_open() ) return;
 
+  const Position pos  = cu.lumaPos();
+  const Size     size = cu.lumaSize();
 
+  const int poc = cu.slice ? cu.slice->getPOC() : -999;
 
-std::ostringstream oss;
-oss << "[ENC_CU] POC=" << cs.slice->getPOC()
-    << " x=" << cu.Y().x
-    << " y=" << cu.Y().y
-    << " w=" << cu.Y().width
-    << " h=" << cu.Y().height
-    << " skip=" << cu.skip
-    << " merge=" << cu.mergeFlag
-    << " affine=" << cu.affine
-    << " geo=" << cu.geoFlag
-    << " interDir=" << (int)cu.interDir
-    << " refL0=" << cu.refIdx[REF_PIC_LIST_0]
-    << " mvL0=(" << cu.mv[REF_PIC_LIST_0].hor << "," << cu.mv[REF_PIC_LIST_0].ver << ")";
+  ofs << "==============================\n";
+  ofs << "[DEC_CU] tag=" << tag
+      << " POC=" << poc
+      << " x=" << pos.x
+      << " y=" << pos.y
+      << " w=" << size.width
+      << " h=" << size.height
+      << "\n";
 
-depthDbgLog(oss.str());
+  ofs << "CU_SYNTAX "
+      << "predMode=" << predModeName( cu.predMode )
+      << " qp=" << (int)cu.qp
+      << " skip=" << (int)cu.skip
+      << " rootCbf=" << (int)cu.rootCbf
+      << " affine=" << (int)cu.affine
+      << " affineType=" << (int)cu.affineType
+      << " imv=" << (int)cu.imv
+      << " mmvdSkip=" << (int)cu.mmvdSkip
+      << "\n";
 
+  // 네가 추가한 depth tool flag가 있으면 여기에 추가
+  // 예:
+  // ofs << "DEPTH "
+  //     << "depthFlag=" << (int)cu.depthFlag
+  //     << " depthMerge=" << (int)cu.depthMergeFlag
+  //     << " depthSkip=" << (int)cu.depthSkipFlag
+  //     << "\n";
 
+  int puIdx = 0;
 
+  for( const PredictionUnit* pu = cu.firstPU; pu != nullptr; pu = pu->next, puIdx++ )
+  {
+    ofs << "PU[" << puIdx << "] "
+        << "x=" << pu->lumaPos().x
+        << " y=" << pu->lumaPos().y
+        << " w=" << pu->lumaSize().width
+        << " h=" << pu->lumaSize().height
+        << " mergeFlag=" << (int)pu->mergeFlag
+        << " regularMergeFlag=" << (int)pu->regularMergeFlag
+        << " mmvdMergeFlag=" << (int)pu->mmvdMergeFlag
+        << " mmvdMergeIdx=" << (int)pu->mmvdMergeIdx
+        << " mergeIdx=" << (int)pu->mergeIdx
+        << " interDir=" << (int)pu->interDir
+        << " refIdxL0=" << (int)pu->refIdx[REF_PIC_LIST_0]
+        << " refIdxL1=" << (int)pu->refIdx[REF_PIC_LIST_1]
+        << " ciipFlag=" << (int)pu->ciipFlag
+        << " geoFlag=" << (int)pu->geoFlag
+        << "\n";
 
+    ofs << "  MV ";
+    dumpMv( ofs, "mvL0",  pu->mv [REF_PIC_LIST_0] );
+    dumpMv( ofs, "mvL1",  pu->mv [REF_PIC_LIST_1] );
+    dumpMv( ofs, "mvdL0", pu->mvd[REF_PIC_LIST_0] );
+    dumpMv( ofs, "mvdL1", pu->mvd[REF_PIC_LIST_1] );
+    ofs << "\n";
 
+    if( cu.affine )
+    {
+      ofs << "  AFFINE ";
+      for( int l = 0; l < 2; l++ )
+      {
+        const RefPicList eRefList = ( l == 0 ) ? REF_PIC_LIST_0 : REF_PIC_LIST_1;
 
+        ofs << "L" << l << " refIdx=" << (int)pu->refIdx[eRefList] << " ";
 
+        dumpMv( ofs, "CP0", pu->mvAffi[eRefList][0] );
+        dumpMv( ofs, "CP1", pu->mvAffi[eRefList][1] );
+        dumpMv( ofs, "CP2", pu->mvAffi[eRefList][2] );
 
+#if AFFINE_MMVD
+        // 필요한 경우 사용
+#endif
+        ofs << " ";
+      }
+      ofs << "\n";
+    }
+  }
 
-
-
-std::ofstream ofs("enc_depth_debug.log", std::ios::app);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Please implement the remaining Camera Projection merge integration in two separate stages. Do not implement HMVP for now.
-
-Important:
-Do not combine Stage 1 and Stage 2 in one patch. Finish Stage 1 first, build/test it, and only then proceed to Stage 2.
-
-Current status:
-
-* Camera Projection CUs are no longer completely unavailable for merge.
-* However, the current implementation only computes one block-level MV and writes the same MV into all 4x4 MotionInfo entries.
-* There is no direct 3-control-point affine merge candidate derived from Camera Projection.
-* HMVP representative Camera Projection MV is not implemented, and should remain excluded for now.
-
-Stage 1: 4x4 Camera Projection MotionInfo cache
-
-Goal:
-Replace the current block-level MV replication with true 4x4-level projected MotionInfo.
-
-Requirements:
-
-1. For each Camera Projection coded CU, derive projected motion at 4x4 granularity.
-2. For each 4x4 subblock, compute its MV from local projected motion, preferably by averaging the valid projected MVs of the four luma corner pixels.
-3. MV direction must remain:
-    MV = projected reference position - current pixel position
-4. Use backward projection from each current pixel to the reference frame. Do not use forward splatting.
-5. For bi-directional Camera Projection, compute L0 and L1 MVs independently.
-6. Populate cu.getMotionBuf() with the per-4x4 MotionInfo entries.
-7. Do not fill the whole CU with one identical MotionInfo unless the projected 4x4 MVs are actually identical.
-8. Preserve existing regular merge/MMVD/GPM paths as much as possible. They should naturally consume the improved getMotionInfo(pos) result.
-9. Handle invalid projected pixels deterministically:
-    * average only valid corner samples
-    * if too few samples are valid, mark the 4x4 MotionInfo unavailable or use a clearly defined fallback
-    * never expose garbage MV/refIdx values
-10. Required MotionInfo fields:
-
-* isInter
-* interDir
-* mv[RPL0/RPL1]
-* refIdx[RPL0/RPL1]
-* sliceIdx
-* usesLIC = false unless explicitly supported
-* useAltHpelIf = false unless explicitly required
-
-Suggested files/functions to inspect:
-
-* CommonLib/UnitTools.cpp
-    * PU::spanMotionInfo()
-    * any current Camera Projection branch added there
-* CommonLib/MotionInfo.h
-    * MotionInfo
-* Camera Projection projection/MV derivation code
-    * find where block-level projected MV is currently computed
-    * replace or extend it with per-4x4 projected MV generation
-
-Stage 1 validation:
-
-* Build successfully.
-* Verify that a Camera Projection CU writes different 4x4 MotionInfo values when the projected motion field varies spatially.
-* Verify that neighboring regular merge candidates can read those 4x4 MVs via getMotionInfo(pos).
-* Verify MMVD and GPM still work through the normal merge context.
-* Verify no decoder mismatch.
-
-After Stage 1 is complete, stop and report:
-
-* Modified files/functions
-* How 4x4 MV is computed
-* Invalid projection handling
-* Whether regular merge/MMVD/GPM can now consume the per-4x4 motion
-
-Stage 2: Direct Camera Projection affine merge candidate
-
-Only start this after Stage 1 is completed and validated.
-
-Goal:
-Add a direct affine merge candidate derived from the Camera Projection 4x4 MotionInfo cache.
-
-Requirements:
-
-1. Do not use least-squares fitting.
-2. Derive affine control-point MVs directly from the 4x4 MotionInfo cache:
-    * CP0 / LT = top-left 4x4 MV
-    * CP1 / RT = top-right 4x4 MV
-    * CP2 / LB = bottom-left 4x4 MV
-3. If desired for stability, use a small local average around each corner, but keep it simple and deterministic.
-4. If all three CPs are valid, add a 6-parameter affine merge candidate:
-    affineType = AffineModel::_6_PARAMS
-5. For bi-directional Camera Projection, fill CPs independently for RPL0 and RPL1.
-6. Fill affine merge context consistently:
-    * mvFieldNeighbours[cand][0][list] = LT
-    * mvFieldNeighbours[cand][1][list] = RT
-    * mvFieldNeighbours[cand][2][list] = LB
-    * interDirNeighbours[cand]
-    * affineType[cand]
-    * bcwIdx[cand] = BCW_DEFAULT
-    * LICFlags[cand] = false unless explicitly supported
-7. Check that all CPs for the same reference list use the same valid refIdx.
-8. Add redundancy/similarity checks if the existing affine merge candidate path has them.
-9. Keep this path separate from HMVP. Do not add Camera Projection affine candidates to affine HMVP in this stage.
-10. Keep the change localized to affine merge candidate derivation.
-
-Suggested files/functions to inspect:
-
-* CommonLib/UnitTools.cpp
-    * PU::getAffineMergeCand()
-    * inherited affine candidate path
-    * constructed affine candidate path
-    * PU::setAllAffineMvField()
-    * PU::setAllAffineMv()
-* CommonLib/InterPrediction.h
-    * AffineMergeCtx
-* Any helper currently used to identify Camera Projection CUs
-
-Stage 2 validation:
-
-* Build successfully.
-* Confirm Camera Projection neighboring blocks can produce a direct 6-parameter affine merge candidate.
-* Confirm regular constructed affine candidates still work.
-* Confirm no decoder mismatch.
-* Confirm CP refIdx/interDir are valid and consistent.
-* Compare coding results for:
-    * Stage 1 only
-    * Stage 1 + Stage 2
-
-Do not implement:
-
-* HMVP representative Camera Projection MV
-* Affine HMVP insertion
-* Increasing HMVP max size
-* Any encoder-only data dependency in decoder-side merge derivation
-
-Expected output before coding:
-
-1. Brief implementation plan for Stage 1 only.
-2. Exact files/functions to modify for Stage 1.
-3. Risks and assumptions.
-4. After Stage 1 patch and validation, ask before starting Stage 2.
+  ofs << std::flush;
+}
