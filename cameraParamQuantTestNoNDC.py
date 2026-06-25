@@ -1222,3 +1222,96 @@ def backward_warp_yuv420_subblk4_6tap_torch(prev_y, prev_u, prev_v, map_x, map_y
 
 
 
+
+
+def calc_psnr(a, b, bit_depth):
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+
+    mse = np.mean((a - b) ** 2)
+
+    if mse == 0:
+        return float("inf")
+
+    maxv = (1 << bit_depth) - 1
+    return 10.0 * np.log10((maxv * maxv) / mse)
+
+
+
+
+
+
+psnr_y_coded = calc_psnr(
+    wy,
+    cur_y_pad,
+    bit_depth,
+)
+
+psnr_y_active = calc_psnr(
+    wy[ys_active, xs_active],
+    cur_y_pad[ys_active, xs_active],
+    bit_depth,
+)
+
+
+
+
+
+
+fq.write(json.dumps({
+    "poc": poc,
+    "q_residual": q_residual.astype(int).tolist(),
+    "q_residual_bits": q_bits_each,
+    "q_residual_total_bits": q_bits_total,
+    "param6_pred": p_pred.astype(float).tolist(),
+    "param6_dec": p_dec.astype(float).tolist(),
+    "param6_gt": p_gt.astype(float).tolist(),
+    "clipped": clipped,
+    "mae_y_active": mae_y_active,
+    "mae_y_coded": mae_y_coded,
+    "psnr_y_active": psnr_y_active,
+    "psnr_y_coded": psnr_y_coded,
+}) + "\n")
+
+
+
+
+
+
+print(
+    f"[{poc:04d}/{max_poc - 1:04d}] "
+    f"Y-PSNR-active={psnr_y_active:.3f} dB, "
+    f"Y-PSNR-coded={psnr_y_coded:.3f} dB, "
+    f"Y-MAE-active={mae_y_active:.3f}, "
+    f"Y-MAE-coded={mae_y_coded:.3f}, "
+    f"clipped={clipped}, "
+    f"param_bits={q_bits_total}, "
+    f"bits_each={q_bits_each}"
+)
+
+
+
+
+
+
+fq.write(json.dumps({
+    "poc": 0,
+    "q_residual": [0, 0, 0, 0, 0, 0],
+    "q_residual_bits": [0, 0, 0, 0, 0, 0],
+    "q_residual_total_bits": 0,
+    "param6_dec": p0_dec.astype(float).tolist(),
+    "mae_y_active": 0.0,
+    "mae_y_coded": 0.0,
+    "psnr_y_active": float("inf"),
+    "psnr_y_coded": float("inf"),
+}) + "\n")
+
+
+
+
+
+
+
+
+
+
