@@ -976,3 +976,282 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 4x4 subblock MV + 6-tap interpolation
+# ============================================================
+
+# From VTM InterpolationFilter::m_lumaIntraFilter
+# 32 phases, 6 taps, coeff sum = 256
+LUMA_6TAP_32 = np.array([
+    [0,   0, 256,   0,   0, 0],
+    [0,  -4, 253,   9,  -2, 0],
+    [1,  -7, 249,  17,  -4, 0],
+    [1, -10, 245,  25,  -6, 1],
+    [1, -13, 241,  34,  -8, 1],
+    [2, -16, 235,  44, -10, 1],
+    [2, -18, 229,  53, -12, 2],
+    [2, -20, 223,  63, -14, 2],
+    [2, -22, 217,  72, -15, 2],
+    [3, -23, 209,  82, -17, 2],
+    [3, -24, 202,  92, -19, 2],
+    [3, -25, 194, 101, -20, 3],
+    [3, -25, 185, 111, -21, 3],
+    [3, -26, 178, 121, -23, 3],
+    [3, -25, 168, 131, -24, 3],
+    [3, -25, 159, 141, -25, 3],
+    [3, -25, 150, 150, -25, 3],
+    [3, -25, 141, 159, -25, 3],
+    [3, -24, 131, 168, -25, 3],
+    [3, -23, 121, 178, -26, 3],
+    [3, -21, 111, 185, -25, 3],
+    [3, -20, 101, 194, -25, 3],
+    [2, -19,  92, 202, -24, 3],
+    [2, -17,  82, 209, -23, 3],
+    [2, -15,  72, 217, -22, 2],
+    [2, -14,  63, 223, -20, 2],
+    [2, -12,  53, 229, -18, 2],
+    [1, -10,  44, 235, -16, 2],
+    [1,  -8,  34, 241, -13, 1],
+    [1,  -6,  25, 245, -10, 1],
+    [0,  -4,  17, 249,  -7, 1],
+    [0,  -2,   9, 253,  -4, 0],
+], dtype=np.int32)
+
+
+def make_subblk4_avg_flow_map(map_x, map_y, block_size=4):
+    """
+    map_x/map_y: pixel-wise projected source coordinate.
+    For each 4x4 block:
+      flow = map - current_pixel_position
+      representative flow = average of 4 corner flows
+      new map = current_pixel_position + representative flow
+
+    Invalid block -> map = -1.
+    """
+    h, w = map_x.shape
+
+    x_grid, y_grid = np.meshgrid(
+        np.arange(w, dtype=np.float32),
+        np.arange(h, dtype=np.float32),
+    )
+
+    out_x = np.full_like(map_x, -1.0, dtype=np.float32)
+    out_y = np.full_like(map_y, -1.0, dtype=np.float32)
+
+    for by in range(0, h, block_size):
+        for bx in range(0, w, block_size):
+            y0 = by
+            x0 = bx
+            y1 = min(by + block_size - 1, h - 1)
+            x1 = min(bx + block_size - 1, w - 1)
+
+            corners = [
+                (y0, x0),
+                (y0, x1),
+                (y1, x0),
+                (y1, x1),
+            ]
+
+            flows_x = []
+            flows_y = []
+
+            valid_block = True
+
+            for cy, cx in corners:
+                mx = map_x[cy, cx]
+                my = map_y[cy, cx]
+
+                if mx < 0.0 or my < 0.0:
+                    valid_block = False
+                    break
+
+                flows_x.append(mx - float(cx))
+                flows_y.append(my - float(cy))
+
+            if not valid_block:
+                continue
+
+            avg_fx = float(np.mean(flows_x))
+            avg_fy = float(np.mean(flows_y))
+
+            ys = slice(by, min(by + block_size, h))
+            xs = slice(bx, min(bx + block_size, w))
+
+            out_x[ys, xs] = x_grid[ys, xs] + avg_fx
+            out_y[ys, xs] = y_grid[ys, xs] + avg_fy
+
+    return out_x, out_y
+
+
+def sample_6tap_one(src, sx, sy, bit_depth):
+    """
+    Separable 6-tap interpolation.
+    Fraction precision: 1/32.
+    Filter coeff precision: 8 bits.
+    Final shift: 16 bits.
+    Border inside valid region: edge clamp.
+    """
+    h, w = src.shape
+
+    ix = int(np.floor(sx))
+    iy = int(np.floor(sy))
+
+    fx = int(np.round((sx - ix) * 32.0))
+    fy = int(np.round((sy - iy) * 32.0))
+
+    if fx >= 32:
+        ix += 1
+        fx = 0
+    if fy >= 32:
+        iy += 1
+        fy = 0
+
+    if fx < 0:
+        ix -= 1
+        fx += 32
+    if fy < 0:
+        iy -= 1
+        fy += 32
+
+    coeff_x = LUMA_6TAP_32[fx]
+    coeff_y = LUMA_6TAP_32[fy]
+
+    acc = 0
+
+    for j in range(6):
+        yy = np.clip(iy + j - 2, 0, h - 1)
+        cy = int(coeff_y[j])
+
+        for i in range(6):
+            xx = np.clip(ix + i - 2, 0, w - 1)
+            cx = int(coeff_x[i])
+
+            acc += cy * cx * int(src[yy, xx])
+
+    # coeff precision 8 + 8 = 16
+    val = (acc + (1 << 15)) >> 16
+
+    maxv = (1 << bit_depth) - 1
+    val = max(0, min(maxv, val))
+
+    return val
+
+
+def remap_plane_subblk4_6tap(src, map_x, map_y, bit_depth, border_value=0):
+    """
+    4x4 representative flow + 6-tap interpolation.
+    """
+    h, w = src.shape
+
+    sub_map_x, sub_map_y = make_subblk4_avg_flow_map(
+        map_x,
+        map_y,
+        block_size=4,
+    )
+
+    dst = np.full((h, w), border_value, dtype=np.int32)
+
+    for y in range(h):
+        for x in range(w):
+            sx = float(sub_map_x[y, x])
+            sy = float(sub_map_y[y, x])
+
+            if sx < 0.0 or sy < 0.0:
+                continue
+
+            if sx < 0.0 or sx > w - 1 or sy < 0.0 or sy > h - 1:
+                continue
+
+            dst[y, x] = sample_6tap_one(src, sx, sy, bit_depth)
+
+    if bit_depth <= 8:
+        return dst.astype(np.uint8)
+    return dst.astype(np.uint16)
+
+
+def backward_warp_yuv420_subblk4_6tap(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
+    """
+    Y: 4x4 subblock representative flow + 6-tap
+    U/V: keep current bilinear path for now
+    """
+    y = remap_plane_subblk4_6tap(
+        prev_y,
+        map_x,
+        map_y,
+        bit_depth,
+        border_value=0,
+    )
+
+    # Chroma는 일단 기존 방식 유지.
+    # Y PSNR/SATD 비교가 목적이면 이걸로 충분함.
+    map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
+
+    neutral = 128 if bit_depth <= 8 else 512
+
+    u = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
+    v = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
+
+    return y, u, v
+
+
+
+
+
+
+
+
+
+
+
+wy, wu, wv = backward_warp_yuv420_subblk4_6tap(
+    prev_y_pad,
+    prev_u_pad,
+    prev_v_pad,
+    map_x,
+    map_y,
+    bit_depth,
+)
+
+
+
+
+
+
+
+
+
+
