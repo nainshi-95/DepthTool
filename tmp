@@ -1,117 +1,301 @@
-// DecCu.cpp 상단 include 근처
-#include <fstream>
-#include <mutex>
-#include <iomanip>
+Plan Request: Adaptive Camera-Projection Prediction with Subblock Filters
 
-static std::mutex g_decCuLogMutex;
+We currently have a camera/depth projection tool that can generate pixel-wise projected flow and a pixel-wise bilinear predictor. However, experiments show that bilinear pixel-wise prediction is not always better than subblock-based filtered prediction. In many frames, a 4x4 representative-flow predictor with a 6-tap filter gives better MAE/SATD than pixel-wise bilinear, even when PSNR is sometimes lower.
 
-static const char* predModeName( PredMode mode )
+Please inspect the current camProj/depth tool implementation and prepare an implementation plan. Do not start coding immediately. First produce a staged plan with exact files/functions to modify, expected syntax impact, decoder-side derivation, and logging/validation points.
+
+Goal
+
+Implement an initial deterministic adaptive camProj predictor that chooses between:
+
+1. 8x8 subblock representative MV + 8-tap interpolation
+2. 4x4 subblock representative MV + 6-tap interpolation
+3. pixel-wise camProj + bilinear interpolation
+
+The choice should be derived deterministically from the camera/depth projected flow. Avoid adding a new per-block submode flag if possible. The encoder and decoder must derive the same internal submode from reconstructed depth, decoded camera parameters, and block geometry.
+
+Key Motivation
+
+Not every block needs fully pixel-wise geometry warping. If the projected flow is close to translational within a block, using a representative MV with a high-quality interpolation filter may be better than pixel-wise bilinear. If the projected flow varies strongly within the block, pixel-wise bilinear may still be preferable because it preserves the local geometry.
+
+Therefore, use local flow deformation to select the prediction type.
+
+Flow Derivation
+
+For a CU or subblock, compute the projected flow at the four luma corner pixels:
+
+MV_TL = projected_ref_pos(TL) - current_pos(TL)
+MV_TR = projected_ref_pos(TR) - current_pos(TR)
+MV_BL = projected_ref_pos(BL) - current_pos(BL)
+MV_BR = projected_ref_pos(BR) - current_pos(BR)
+
+Use reconstructed depth and decoded camera parameters only. The result must be decoder-reproducible.
+
+For the initial implementation, define a simple deformation metric:
+
+minX = min(MV_TL.x, MV_TR.x, MV_BL.x, MV_BR.x);
+maxX = max(MV_TL.x, MV_TR.x, MV_BL.x, MV_BR.x);
+minY = min(MV_TL.y, MV_TR.y, MV_BL.y, MV_BR.y);
+maxY = max(MV_TL.y, MV_TR.y, MV_BL.y, MV_BR.y);
+flowDiff = (maxX - minX) + (maxY - minY);
+
+This is an L1 range metric. It is faster and more deterministic than using square roots.
+
+Use internal MV units consistently. If internal MV precision is 1/16 pel:
+
+0.25 pel = 4
+0.50 pel = 8
+1.00 pel = 16
+
+Suggested initial thresholds:
+
+T0 = 8;   // about 0.5 pel
+T1 = 16;  // about 1.0 pel
+
+These are heuristic starting points and should be compile-time constants or encoder config parameters for easy tuning.
+
+Initial Decision Rule
+
+For each camProj-predicted CU:
+
+if (flowDiff <= T0)
 {
-  switch( mode )
-  {
-  case MODE_INTER: return "INTER";
-  case MODE_INTRA: return "INTRA";
-#if JVET_S0078
-  case MODE_IBC:   return "IBC";
-#endif
-  default:         return "UNKNOWN";
-  }
+    use 8x8 subblock representative MV + 8-tap interpolation;
+}
+else if (flowDiff <= T1)
+{
+    use 4x4 subblock representative MV + 6-tap interpolation;
+}
+else
+{
+    use pixel-wise camProj + bilinear interpolation;
 }
 
-static void dumpMv( std::ofstream& ofs, const char* name, const Mv& mv )
+If the CU is smaller than 8x8 and the first case is selected, use the whole available block or the smallest valid subblock size with 8-tap interpolation.
+
+If any required corner projection is invalid, use a safe fallback. For the initial version:
+
+invalid corner in subblock-level mode -> fallback to pixel-wise bilinear
+invalid pixel in pixel-wise mode -> use the existing invalid/border behavior
+
+Subblock Representative MV
+
+For 8x8 or 4x4 subblock prediction, split the CU into subblocks.
+
+For each subblock:
+
+1. Compute the projected flow at its four luma corners.
+2. Average the four corner flows:
+
+repMv = (MV_TL + MV_TR + MV_BL + MV_BR) / 4;
+
+3. Use this representative MV for all pixels in that subblock.
+4. Generate prediction using interpolation filtering from the reference picture.
+
+The representative MV should be rounded to the same internal fractional precision used by the interpolation path.
+
+Filter Usage
+
+Use existing VTM interpolation infrastructure as much as possible. Avoid writing a parallel filtering path unless necessary.
+
+8-tap mode
+
+For the 8x8 representative-MV mode, use the normal VVC luma interpolation filter path if possible. This should be equivalent to using InterpolationFilter::m_lumaFilter.
+
+For IF_12TAP-enabled builds, the 8-tap table in InterpolationFilter::m_lumaFilter is scaled by 4 and sums to 256. The 16 phases are:
+
+static const int LUMA_8TAP_16[16][8] =
 {
-  ofs << name << "=(" << mv.getHor() << "," << mv.getVer() << ") ";
-}
+  {   0,   0,    0, 256,   0,    0,   0,   0 },
+  {   0,   4,  -12, 252,  16,   -8,   4,   0 },
+  {  -4,   8,  -20, 248,  32,  -12,   4,   0 },
+  {  -4,  12,  -32, 240,  52,  -16,   4,   0 },
+  {  -4,  16,  -40, 232,  68,  -20,   4,   0 },
+  {  -4,  16,  -44, 208, 104,  -32,  12,  -4 },
+  {  -4,  12,  -36, 188, 124,  -40,  16,  -4 },
+  {  -4,  16,  -44, 180, 136,  -40,  16,  -4 },
+  {  -4,  16,  -44, 160, 160,  -44,  16,  -4 },
+  {  -4,  16,  -40, 136, 180,  -44,  16,  -4 },
+  {  -4,  16,  -40, 124, 188,  -36,  12,  -4 },
+  {  -4,  12,  -32, 104, 208,  -44,  16,  -4 },
+  {   0,   4,  -20,  68, 232,  -40,  16,  -4 },
+  {   0,   4,  -16,  52, 240,  -32,  12,  -4 },
+  {   0,   4,  -12,  32, 248,  -20,   8,  -4 },
+  {   0,   4,   -8,  16, 252,  -12,   4,   0 }
+};
 
-static void dumpDecCuInfo( const CodingUnit& cu, const char* tag )
+If the current build uses non-IF_12TAP precision, use the existing VTM table directly instead of manually copying this table.
+
+6-tap mode
+
+For the 4x4 representative-MV mode, use the 6-tap luma intra-style filter table from InterpolationFilter::m_lumaIntraFilter. It has 32 phases and each row sums to 256:
+
+static const int LUMA_6TAP_32[32][6] =
 {
-  std::lock_guard<std::mutex> lock( g_decCuLogMutex );
+  { 0,   0, 256,   0,   0, 0 },
+  { 0,  -4, 253,   9,  -2, 0 },
+  { 1,  -7, 249,  17,  -4, 0 },
+  { 1, -10, 245,  25,  -6, 1 },
+  { 1, -13, 241,  34,  -8, 1 },
+  { 2, -16, 235,  44, -10, 1 },
+  { 2, -18, 229,  53, -12, 2 },
+  { 2, -20, 223,  63, -14, 2 },
+  { 2, -22, 217,  72, -15, 2 },
+  { 3, -23, 209,  82, -17, 2 },
+  { 3, -24, 202,  92, -19, 2 },
+  { 3, -25, 194, 101, -20, 3 },
+  { 3, -25, 185, 111, -21, 3 },
+  { 3, -26, 178, 121, -23, 3 },
+  { 3, -25, 168, 131, -24, 3 },
+  { 3, -25, 159, 141, -25, 3 },
+  { 3, -25, 150, 150, -25, 3 },
+  { 3, -25, 141, 159, -25, 3 },
+  { 3, -24, 131, 168, -25, 3 },
+  { 3, -23, 121, 178, -26, 3 },
+  { 3, -21, 111, 185, -25, 3 },
+  { 3, -20, 101, 194, -25, 3 },
+  { 2, -19,  92, 202, -24, 3 },
+  { 2, -17,  82, 209, -23, 3 },
+  { 2, -15,  72, 217, -22, 2 },
+  { 2, -14,  63, 223, -20, 2 },
+  { 2, -12,  53, 229, -18, 2 },
+  { 1, -10,  44, 235, -16, 2 },
+  { 1,  -8,  34, 241, -13, 1 },
+  { 1,  -6,  25, 245, -10, 1 },
+  { 0,  -4,  17, 249,  -7, 1 },
+  { 0,  -2,   9, 253,  -4, 0 }
+};
 
-  std::ofstream ofs( "dec_cu_debug.txt", std::ios::app );
-  if( !ofs.is_open() ) return;
+For separable 2D filtering, horizontal and vertical filters are applied separately. If implemented manually, total coefficient precision is 8 bits per direction. Use VTM’s existing rounding/shift conventions where possible to avoid mismatch.
 
-  const Position pos  = cu.lumaPos();
-  const Size     size = cu.lumaSize();
+Pixel-wise bilinear mode
 
-  const int poc = cu.slice ? cu.slice->getPOC() : -999;
+Keep the current pixel-wise camProj + bilinear path as the fallback for large flow deformation. Do not remove it.
 
-  ofs << "==============================\n";
-  ofs << "[DEC_CU] tag=" << tag
-      << " POC=" << poc
-      << " x=" << pos.x
-      << " y=" << pos.y
-      << " w=" << size.width
-      << " h=" << size.height
-      << "\n";
+Syntax Requirement
 
-  ofs << "CU_SYNTAX "
-      << "predMode=" << predModeName( cu.predMode )
-      << " qp=" << (int)cu.qp
-      << " skip=" << (int)cu.skip
-      << " rootCbf=" << (int)cu.rootCbf
-      << " affine=" << (int)cu.affine
-      << " affineType=" << (int)cu.affineType
-      << " imv=" << (int)cu.imv
-      << " mmvdSkip=" << (int)cu.mmvdSkip
-      << "\n";
+The adaptive internal submode should ideally not be signaled.
 
-  // 네가 추가한 depth tool flag가 있으면 여기에 추가
-  // 예:
-  // ofs << "DEPTH "
-  //     << "depthFlag=" << (int)cu.depthFlag
-  //     << " depthMerge=" << (int)cu.depthMergeFlag
-  //     << " depthSkip=" << (int)cu.depthSkipFlag
-  //     << "\n";
+The bitstream should signal only the existing camProj tool/mode decision, then derive the internal interpolation/subblock strategy deterministically.
 
-  int puIdx = 0;
+Expected syntax:
 
-  for( const PredictionUnit* pu = cu.firstPU; pu != nullptr; pu = pu->next, puIdx++ )
-  {
-    ofs << "PU[" << puIdx << "] "
-        << "x=" << pu->lumaPos().x
-        << " y=" << pu->lumaPos().y
-        << " w=" << pu->lumaSize().width
-        << " h=" << pu->lumaSize().height
-        << " mergeFlag=" << (int)pu->mergeFlag
-        << " regularMergeFlag=" << (int)pu->regularMergeFlag
-        << " mmvdMergeFlag=" << (int)pu->mmvdMergeFlag
-        << " mmvdMergeIdx=" << (int)pu->mmvdMergeIdx
-        << " mergeIdx=" << (int)pu->mergeIdx
-        << " interDir=" << (int)pu->interDir
-        << " refIdxL0=" << (int)pu->refIdx[REF_PIC_LIST_0]
-        << " refIdxL1=" << (int)pu->refIdx[REF_PIC_LIST_1]
-        << " ciipFlag=" << (int)pu->ciipFlag
-        << " geoFlag=" << (int)pu->geoFlag
-        << "\n";
+camProjFlag or existing camProj mode syntax
+// no additional 8x8/4x4/bilinear submode flag in the final version
 
-    ofs << "  MV ";
-    dumpMv( ofs, "mvL0",  pu->mv [REF_PIC_LIST_0] );
-    dumpMv( ofs, "mvL1",  pu->mv [REF_PIC_LIST_1] );
-    dumpMv( ofs, "mvdL0", pu->mvd[REF_PIC_LIST_0] );
-    dumpMv( ofs, "mvdL1", pu->mvd[REF_PIC_LIST_1] );
-    ofs << "\n";
+For debugging only, it is acceptable to add compile-time encoder options:
 
-    if( cu.affine )
-    {
-      ofs << "  AFFINE ";
-      for( int l = 0; l < 2; l++ )
-      {
-        const RefPicList eRefList = ( l == 0 ) ? REF_PIC_LIST_0 : REF_PIC_LIST_1;
+forceCamProjSubMode = AUTO / SUBBLK8_8TAP / SUBBLK4_6TAP / PIXEL_BILINEAR
 
-        ofs << "L" << l << " refIdx=" << (int)pu->refIdx[eRefList] << " ";
+Do not make this a normative syntax flag unless explicitly requested later.
 
-        dumpMv( ofs, "CP0", pu->mvAffi[eRefList][0] );
-        dumpMv( ofs, "CP1", pu->mvAffi[eRefList][1] );
-        dumpMv( ofs, "CP2", pu->mvAffi[eRefList][2] );
+Motion Info / Decoder State
 
-#if AFFINE_MMVD
-        // 필요한 경우 사용
-#endif
-        ofs << " ";
-      }
-      ofs << "\n";
-    }
-  }
+When using 8x8 or 4x4 representative-MV modes, ensure that decoder-side motion information is consistent with the actual prediction:
 
-  ofs << std::flush;
-}
+* Span motionInfo over the corresponding subblock grid.
+* Use the representative MV for each subblock.
+* Preserve correct interDir and refIdx.
+* Ensure deblocking/TMVP/HMVP-related state does not become inconsistent.
+
+If this cannot be represented cleanly as regular merge/AMVP motionInfo, document what extra state is needed.
+
+Integration Points to Inspect
+
+Please inspect and identify exact modification points for:
+
+1. camProj AMVP-like prediction path
+2. camProj merge/inheritance path
+3. prediction generation function currently using pixel-wise bilinear
+4. motionInfo span function
+5. decoder CU reconstruction path
+6. CABAC syntax read/write if any syntax currently exists for camProj
+
+The first plan should state whether the adaptive predictor should be implemented under the existing camProj AMVP-like mode, existing camProj merge mode, or as a shared predictor backend used by both.
+
+Logging and Validation
+
+Add logs under a compile-time debug flag.
+
+For each selected camProj CU, log:
+
+POC
+CU x, y, w, h
+flowDiff
+selected internal submode
+T0, T1
+valid corner count
+average representative MV
+regular merge best MV if available
+SATD or distortion for:
+  8x8+8tap
+  4x4+6tap
+  pixel-wise bilinear
+final selected mode
+
+Also collect frame-level statistics:
+
+number of camProj CUs
+ratio of 8x8+8tap
+ratio of 4x4+6tap
+ratio of pixel-wise bilinear
+average flowDiff
+average SATD difference vs bilinear
+average SATD difference vs regular merge
+
+Initial Acceptance Tests
+
+1. Bit-exact encode/decode for a short sequence.
+2. No decoder mismatch with deblocking on.
+3. Frame-level stats show all three submodes are reachable.
+4. Force-mode experiments:
+    * force 8x8+8tap
+    * force 4x4+6tap
+    * force pixel-wise bilinear
+    * auto mode
+5. Compare Y SATD/MAE/PSNR against the current pixel-wise bilinear baseline.
+6. Check whether regular merge is still beating camProj and whether the gap changes.
+
+Implementation Staging
+
+Please produce a plan using these stages:
+
+Stage 1: Refactor
+
+Refactor current camProj prediction generation so that projection-flow derivation and sampling/filtering are separated:
+
+deriveCamProjFlow(...)
+generateCamProjPredPixelBilinear(...)
+generateCamProjPredSubblk4_6tap(...)
+generateCamProjPredSubblk8_8tap(...)
+selectCamProjInternalSubmode(...)
+
+Stage 2: Add deterministic flowDiff decision
+
+Implement four-corner flowDiff and deterministic submode selection using T0/T1.
+
+Stage 3: Add 4x4 + 6-tap predictor
+
+Implement subblock representative MV derivation and 6-tap luma prediction. Keep chroma simple initially; either reuse current bilinear chroma or document the chroma handling.
+
+Stage 4: Add 8x8 + 8-tap predictor
+
+Implement 8x8 representative MV prediction using the existing VVC 8-tap interpolation path.
+
+Stage 5: MotionInfo and decoder consistency
+
+Ensure spanMotionInfo and CU/PU fields match the selected internal predictor.
+
+Stage 6: Logging and experiments
+
+Add debug logs and force-mode controls. Run short encode/decode tests and compare BD-rate/selection stats.
+
+Important Constraints
+
+* Do not add per-block submode signaling for 8x8/4x4/bilinear unless absolutely necessary.
+* Encoder and decoder must derive the same internal submode.
+* Avoid increasing reference list size.
+* Avoid changing max merge candidate count in this stage.
+* Use reconstructed depth and decoded camera parameters only.
+* Prefer existing VTM interpolation functions over manually duplicated filtering code.
+* If exact VTM filtering cannot be reused for 6-tap, document the reason and implement a bit-exact helper using the coefficient table above.
