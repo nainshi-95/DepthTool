@@ -6,7 +6,7 @@
 # Main idea:
 #   1. Estimate pairwise R,t between many frame pairs using ORB + Essential matrix.
 #   2. Build a pose graph over frames in the GOP.
-#   3. Anchor one frame as identity.
+#   3. Anchor one frame as identity, usually GOP first frame.
 #   4. Estimate global poses T_anchor_frame for all frames.
 #   5. Export consistent R_ref_target, t_ref_target for any target/ref pair.
 #
@@ -22,18 +22,22 @@
 #
 # Translation scale note:
 #   Monocular Essential matrix gives translation direction only.
-#   All exported t vectors are normalized to unit length.
+#   All exported pairwise t vectors are normalized to unit length.
 #   Later, block-wise inverse-depth scalar c_b can absorb translation scale:
 #     p_ref ~ K * ( R * K^-1 * p_target + c_b * t )
 #
-# Example:
+# Recommended for your use:
 #   python estimate_gop_rt_from_yuv420.py \
 #     --input input.yuv \
 #     --width 1920 --height 1080 \
 #     --bitdepth 10 \
 #     --gop-start 0 --gop-size 33 \
-#     --edge-mode hierarchical \
-#     --output gop_rt.json
+#     --anchor-idx 0 \
+#     --edge-mode all \
+#     --max-edge-dist 32 \
+#     --pose-iters 10 \
+#     --export-pairs all \
+#     --output gop_rt_anchor0_all.json
 
 import argparse
 import json
@@ -73,6 +77,13 @@ class PoseEdge:
     essential_inliers: int
     pose_inliers: int
 
+    # Pairwise epipolar geometry quality.
+    # Smaller is better.
+    # Roughly pixel^2.
+    sampson_error_mean: float
+    sampson_error_median: float
+    sampson_error_p90: float
+
 
 # ============================================================
 # Basic utilities
@@ -104,11 +115,12 @@ def invert_rt(R: np.ndarray, t: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     If:
       X_b = R_b_a * X_a + t_b_a
+
     return inverse:
       X_a = R_a_b * X_b + t_a_b
     """
     R_inv = R.T
-    t_inv = -R_inv @ t.reshape(3)
+    t_inv = -R_inv @ np.asarray(t, dtype=np.float64).reshape(3)
     return R_inv, t_inv
 
 
@@ -127,22 +139,31 @@ def compose_rt(
       X_b = R_b_c * X_c + t_b_c
     """
     R_b_c = R_b_a @ R_a_c
-    t_b_c = R_b_a @ t_a_c.reshape(3) + t_b_a.reshape(3)
+    t_b_c = R_b_a @ np.asarray(t_a_c, dtype=np.float64).reshape(3) + np.asarray(t_b_a, dtype=np.float64).reshape(3)
     return project_rotation_to_so3(R_b_c), t_b_c
 
 
 def rt_to_4x4(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
-    T[:3, 3] = t.reshape(3)
+    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
     return T
 
 
-def rt_to_json(R: np.ndarray, t: np.ndarray) -> dict:
-    return {
-        "R": np.asarray(R, dtype=np.float64).tolist(),
-        "t": np.asarray(t, dtype=np.float64).reshape(3).tolist(),
-    }
+def skew(t: np.ndarray) -> np.ndarray:
+    """
+    Return skew-symmetric matrix [t]_x such that:
+      [t]_x @ x = t cross x
+    """
+    tx, ty, tz = np.asarray(t, dtype=np.float64).reshape(3)
+    return np.array(
+        [
+            [0.0, -tz,  ty],
+            [tz,   0.0, -tx],
+            [-ty,  tx,   0.0],
+        ],
+        dtype=np.float64,
+    )
 
 
 # ============================================================
@@ -158,6 +179,7 @@ def get_yuv420_frame_size_bytes(width: int, height: int, bitdepth: int) -> int:
     if bitdepth == 8:
         return num_samples
     if bitdepth == 10:
+        # yuv420p10le: each sample stored as uint16 little-endian.
         return num_samples * 2
 
     raise ValueError("Only bitdepth 8 or 10 is supported.")
@@ -223,7 +245,7 @@ def y_to_8bit_for_features(y: np.ndarray, bitdepth: int) -> np.ndarray:
     if bitdepth == 8:
         return y.astype(np.uint8)
 
-    # yuv420p10le: usually 10-bit value in low 10 bits.
+    # yuv420p10le normally stores the 10-bit value in the low 10 bits.
     return (y.astype(np.uint16) >> 2).astype(np.uint8)
 
 
@@ -234,6 +256,7 @@ def y_to_8bit_for_features(y: np.ndarray, bitdepth: int) -> np.ndarray:
 def build_default_K(width: int, height: int) -> np.ndarray:
     """
     Rough default intrinsic.
+
     Real fx/fy/cx/cy should be used when available.
     """
     f = float(max(width, height))
@@ -283,6 +306,7 @@ def detect_and_match_orb(
       pts_ref:    Nx2
     """
 
+    # CLAHE helps low-contrast Y-only frames.
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img_t = clahe.apply(img_target_8)
     img_r = clahe.apply(img_ref_8)
@@ -309,7 +333,10 @@ def detect_and_match_orb(
     for pair in knn:
         if len(pair) < 2:
             continue
+
         m, n = pair
+
+        # Lowe ratio test.
         if m.distance < ratio * n.distance:
             good.append(m)
 
@@ -334,7 +361,7 @@ def choose_best_pose_from_E(
 
     Direction:
       recoverPose(E, pts_target, pts_ref, K)
-      gives R,t such that target camera -> ref camera.
+      gives R,t such that target camera coord -> ref camera coord.
     """
 
     if E is None:
@@ -372,6 +399,81 @@ def choose_best_pose_from_E(
     t = normalize_vec(t)
 
     return project_rotation_to_so3(R.astype(np.float64)), t, pose_mask, int(inlier_count)
+
+
+def compute_sampson_error_pixels(
+    pts_target: np.ndarray,
+    pts_ref: np.ndarray,
+    K: np.ndarray,
+    R_ref_target: np.ndarray,
+    t_ref_target: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute Sampson error for matched points.
+
+    pts_target: Nx2 points in target image
+    pts_ref:    Nx2 points in reference image
+
+    Smaller is better.
+    Unit is roughly pixel^2.
+    """
+
+    t_ref_target = normalize_vec(t_ref_target)
+
+    # Essential matrix from estimated pose.
+    # For X_ref = R * X_target + t:
+    #   E = [t]_x R
+    E = skew(t_ref_target) @ R_ref_target
+
+    Kinv = np.linalg.inv(K)
+
+    # Fundamental matrix in pixel coordinates.
+    F = Kinv.T @ E @ Kinv
+
+    ones = np.ones((pts_target.shape[0], 1), dtype=np.float64)
+
+    x1 = np.concatenate([pts_target.astype(np.float64), ones], axis=1)  # target
+    x2 = np.concatenate([pts_ref.astype(np.float64), ones], axis=1)     # ref
+
+    Fx1 = (F @ x1.T).T
+    Ftx2 = (F.T @ x2.T).T
+
+    numerator = np.sum(x2 * Fx1, axis=1) ** 2
+    denominator = (
+        Fx1[:, 0] ** 2
+        + Fx1[:, 1] ** 2
+        + Ftx2[:, 0] ** 2
+        + Ftx2[:, 1] ** 2
+        + 1e-12
+    )
+
+    return numerator / denominator
+
+
+def summarize_sampson_error(
+    sampson_error: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> Tuple[float, float, float]:
+    """
+    Return mean, median, p90 Sampson error.
+    If mask is given, compute only on masked inliers.
+    """
+
+    e = np.asarray(sampson_error, dtype=np.float64).reshape(-1)
+
+    if mask is not None:
+        m = np.asarray(mask).reshape(-1) != 0
+        if m.shape[0] == e.shape[0] and np.count_nonzero(m) > 0:
+            e = e[m]
+
+    if e.size == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    return (
+        float(np.mean(e)),
+        float(np.median(e)),
+        float(np.percentile(e, 90)),
+    )
 
 
 def estimate_pair_edge(
@@ -422,6 +524,19 @@ def estimate_pair_edge(
 
     essential_inliers = int(np.count_nonzero(inlier_mask_E)) if inlier_mask_E is not None else 0
 
+    sampson_error = compute_sampson_error_pixels(
+        pts_target=pts_target,
+        pts_ref=pts_ref,
+        K=K,
+        R_ref_target=R,
+        t_ref_target=t,
+    )
+
+    sampson_mean, sampson_median, sampson_p90 = summarize_sampson_error(
+        sampson_error,
+        mask=inlier_mask_E,
+    )
+
     return PoseEdge(
         target_idx=target_idx,
         ref_idx=ref_idx,
@@ -430,6 +545,9 @@ def estimate_pair_edge(
         num_matches=int(num_matches),
         essential_inliers=essential_inliers,
         pose_inliers=int(pose_inliers),
+        sampson_error_mean=sampson_mean,
+        sampson_error_median=sampson_median,
+        sampson_error_p90=sampson_p90,
     )
 
 
@@ -451,6 +569,15 @@ def parse_frames(args) -> List[int]:
     return list(range(args.gop_start, args.gop_start + args.gop_size))
 
 
+def edge_dist_ok(target: int, ref: int, max_edge_dist: int) -> bool:
+    """
+    max_edge_dist <= 0 means unlimited.
+    """
+    if max_edge_dist <= 0:
+        return True
+    return abs(target - ref) <= max_edge_dist
+
+
 def generate_edge_pairs(
     frames: List[int],
     edge_mode: str,
@@ -470,7 +597,7 @@ def generate_edge_pairs(
         for i in range(1, len(frames)):
             target = frames[i]
             ref = frames[i - 1]
-            if abs(target - ref) <= max_edge_dist:
+            if edge_dist_ok(target, ref, max_edge_dist):
                 pairs.add((target, ref))
 
     elif edge_mode == "all":
@@ -478,8 +605,17 @@ def generate_edge_pairs(
             for j in range(i):
                 target = frames[i]
                 ref = frames[j]
-                if abs(target - ref) <= max_edge_dist:
+                if edge_dist_ok(target, ref, max_edge_dist):
                     pairs.add((target, ref))
+
+    elif edge_mode == "anchor_all":
+        # Directly connect every frame to the first GOP frame.
+        anchor = frames[0]
+        for f in frames:
+            if f == anchor:
+                continue
+            if edge_dist_ok(f, anchor, max_edge_dist):
+                pairs.add((f, anchor))
 
     elif edge_mode == "hierarchical":
         def rec(lo: int, hi: int):
@@ -492,9 +628,9 @@ def generate_edge_pairs(
             center = frames[mid]
             right = frames[hi]
 
-            if abs(center - left) <= max_edge_dist:
+            if edge_dist_ok(center, left, max_edge_dist):
                 pairs.add((center, left))
-            if abs(center - right) <= max_edge_dist:
+            if edge_dist_ok(center, right, max_edge_dist):
                 pairs.add((center, right))
 
             rec(lo, mid)
@@ -506,7 +642,7 @@ def generate_edge_pairs(
         for i in range(1, len(frames)):
             target = frames[i]
             ref = frames[i - 1]
-            if abs(target - ref) <= max_edge_dist:
+            if edge_dist_ok(target, ref, max_edge_dist):
                 pairs.add((target, ref))
 
     else:
@@ -567,6 +703,7 @@ def build_directed_transform_graph(
 ) -> Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray, float]]:
     """
     directed[(src, dst)] = (R_dst_src, t_dst_src, weight)
+
     meaning:
       X_dst = R_dst_src * X_src + t_dst_src
     """
@@ -574,6 +711,8 @@ def build_directed_transform_graph(
     directed = {}
 
     for e in edges:
+        # Basic confidence weight.
+        # You can make this more robust later using Sampson error.
         w = float(max(e.pose_inliers, 1))
 
         # target -> ref
@@ -671,7 +810,10 @@ def refine_global_poses(
 
         for i in frames:
             if i == anchor_idx:
-                new_poses[i] = (np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64))
+                new_poses[i] = (
+                    np.eye(3, dtype=np.float64),
+                    np.zeros(3, dtype=np.float64),
+                )
                 continue
 
             if i not in poses:
@@ -685,7 +827,7 @@ def refine_global_poses(
                 if j not in poses:
                     continue
 
-                # We need transform from i -> j.
+                # Need transform from i -> j.
                 key = (i, j)
                 if key not in directed:
                     continue
@@ -693,6 +835,7 @@ def refine_global_poses(
                 R_j_i, t_j_i, w = directed[key]
                 R_anchor_j, t_anchor_j = poses[j]
 
+                # P_i_pred = P_j ◦ T_j_i
                 R_anchor_i_pred, t_anchor_i_pred = compose_rt(
                     R_anchor_j,
                     t_anchor_j,
@@ -715,12 +858,13 @@ def refine_global_poses(
             t_avg = np.sum(t_stack * w_np[:, None], axis=0) / np.sum(w_np)
 
             # Optional mild temporal smoothing on translation only.
-            # This is intentionally weak; translation scale is arbitrary.
+            # Translation scale is arbitrary, so keep this weak.
             if temporal_smooth > 0.0:
                 temporal_preds = []
                 for j in (i - 1, i + 1):
                     if j in poses:
                         temporal_preds.append(poses[j][1])
+
                 if len(temporal_preds) > 0:
                     t_temporal = np.mean(np.stack(temporal_preds, axis=0), axis=0)
                     alpha = float(np.clip(temporal_smooth, 0.0, 1.0))
@@ -741,7 +885,10 @@ def refine_global_poses(
             reanchored[i] = (R_new, t_new)
 
         poses = reanchored
-        poses[anchor_idx] = (np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64))
+        poses[anchor_idx] = (
+            np.eye(3, dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+        )
 
     return poses
 
@@ -784,487 +931,8 @@ def relative_from_global_poses(
 
 
 # ============================================================
-# Main
+# Evaluation helpers
 # ============================================================
-
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--input", required=True, help="Input YUV420 file")
-    parser.add_argument("--width", type=int, required=True)
-    parser.add_argument("--height", type=int, required=True)
-    parser.add_argument("--bitdepth", type=int, choices=[8, 10], required=True)
-
-    parser.add_argument("--frames", default=None,
-                        help="Comma-separated frame indices, e.g. 0,1,2,4,8,16,32")
-    parser.add_argument("--gop-start", type=int, default=None)
-    parser.add_argument("--gop-size", type=int, default=None)
-
-    parser.add_argument("--anchor-idx", type=int, default=None)
-
-    parser.add_argument("--fx", type=float, default=None)
-    parser.add_argument("--fy", type=float, default=None)
-    parser.add_argument("--cx", type=float, default=None)
-    parser.add_argument("--cy", type=float, default=None)
-
-    parser.add_argument("--pad-multiple", type=int, default=8)
-    parser.add_argument("--max-features", type=int, default=8000)
-    parser.add_argument("--match-ratio", type=float, default=0.75)
-
-    parser.add_argument("--ransac-threshold", type=float, default=1.0)
-    parser.add_argument("--ransac-prob", type=float, default=0.999)
-
-    parser.add_argument("--edge-mode", choices=["adjacent", "hierarchical", "all"], default="hierarchical")
-    parser.add_argument("--max-edge-dist", type=int, default=32)
-
-    parser.add_argument("--min-pose-inliers", type=int, default=30)
-    parser.add_argument("--pose-iters", type=int, default=5)
-    parser.add_argument("--temporal-smooth", type=float, default=0.0)
-
-    parser.add_argument("--export-pairs", choices=["none", "edges", "all"], default="all")
-
-    parser.add_argument("--output", required=True)
-
-    args = parser.parse_args()
-
-    frames = parse_frames(args)
-    anchor_idx = args.anchor_idx if args.anchor_idx is not None else frames[0]
-
-    if anchor_idx not in frames:
-        raise ValueError(f"anchor_idx {anchor_idx} is not in frames: {frames}")
-
-    K = build_K_from_args(args)
-
-    padded_width = ceil_to_multiple(args.width, args.pad_multiple)
-    padded_height = ceil_to_multiple(args.height, args.pad_multiple)
-
-    print(f"[INFO] frames = {frames}")
-    print(f"[INFO] anchor_idx = {anchor_idx}")
-    print(f"[INFO] padded = {padded_width}x{padded_height}")
-    print(f"[INFO] K =\n{K}")
-
-    # Lazy frame cache.
-    frame_cache: Dict[int, FrameY] = {}
-
-    def get_frame(idx: int) -> FrameY:
-        if idx not in frame_cache:
-            frame_cache[idx] = read_y_frame(
-                args.input,
-                args.width,
-                args.height,
-                args.bitdepth,
-                idx,
-                pad_multiple=args.pad_multiple,
-            )
-        return frame_cache[idx]
-
-    edge_pairs = generate_edge_pairs(
-        frames=frames,
-        edge_mode=args.edge_mode,
-        max_edge_dist=args.max_edge_dist,
-    )
-
-    print(f"[INFO] estimating {len(edge_pairs)} pairwise edges...")
-
-    edges: List[PoseEdge] = []
-    failed_edges = []
-
-    for n, (target_idx, ref_idx) in enumerate(edge_pairs):
-        print(f"[EDGE {n+1:4d}/{len(edge_pairs):4d}] target={target_idx}, ref={ref_idx}")
-
-        try:
-            target = get_frame(target_idx)
-            ref = get_frame(ref_idx)
-
-            edge = estimate_pair_edge(
-                target_idx=target_idx,
-                ref_idx=ref_idx,
-                target_y=target.y,
-                ref_y=ref.y,
-                bitdepth=args.bitdepth,
-                K=K,
-                max_features=args.max_features,
-                ransac_threshold=args.ransac_threshold,
-                ransac_prob=args.ransac_prob,
-                ratio=args.match_ratio,
-            )
-
-            if edge.pose_inliers < args.min_pose_inliers:
-                print(
-                    f"  [SKIP] pose_inliers={edge.pose_inliers} "
-                    f"< min_pose_inliers={args.min_pose_inliers}"
-                )
-                failed_edges.append({
-                    "target_idx": target_idx,
-                    "ref_idx": ref_idx,
-                    "reason": "too_few_pose_inliers",
-                    "pose_inliers": edge.pose_inliers,
-                })
-                continue
-
-            print(
-                f"  [OK] matches={edge.num_matches}, "
-                f"E_inliers={edge.essential_inliers}, "
-                f"pose_inliers={edge.pose_inliers}"
-            )
-
-            edges.append(edge)
-
-        except Exception as e:
-            print(f"  [FAIL] {e}")
-            failed_edges.append({
-                "target_idx": target_idx,
-                "ref_idx": ref_idx,
-                "reason": str(e),
-            })
-
-    if len(edges) == 0:
-        raise RuntimeError("No valid pairwise pose edges were estimated.")
-
-    print(f"[INFO] valid edges = {len(edges)}")
-
-    directed = build_directed_transform_graph(edges)
-
-    poses = initialize_global_poses_bfs(
-        frames=frames,
-        directed=directed,
-        anchor_idx=anchor_idx,
-    )
-
-    missing = [f for f in frames if f not in poses]
-    if len(missing) > 0:
-        print(f"[WARN] Some frames are disconnected from the pose graph: {missing}")
-
-    poses = refine_global_poses(
-        frames=frames,
-        directed=directed,
-        poses=poses,
-        anchor_idx=anchor_idx,
-        num_iters=args.pose_iters,
-        temporal_smooth=args.temporal_smooth,
-    )
-
-    # Export direct pairwise edges.
-    direct_edges_json = []
-    for e in edges:
-        rvec, _ = cv2.Rodrigues(e.R_ref_target)
-        direct_edges_json.append({
-            "target_idx": e.target_idx,
-            "ref_idx": e.ref_idx,
-            "num_matches": e.num_matches,
-            "essential_inliers": e.essential_inliers,
-            "pose_inliers": e.pose_inliers,
-            "R_ref_target": e.R_ref_target.tolist(),
-            "t_ref_target_unit": normalize_vec(e.t_ref_target).tolist(),
-            "rvec_ref_target": rvec.reshape(3).tolist(),
-        })
-
-    # Export global poses.
-    global_poses_json = {}
-    for f in frames:
-        if f not in poses:
-            continue
-
-        R_anchor_frame, t_anchor_frame = poses[f]
-        rvec, _ = cv2.Rodrigues(R_anchor_frame)
-
-        global_poses_json[str(f)] = {
-            "R_anchor_frame": R_anchor_frame.tolist(),
-            "t_anchor_frame_arbitrary_scale": t_anchor_frame.reshape(3).tolist(),
-            "rvec_anchor_frame": rvec.reshape(3).tolist(),
-        }
-
-    # Export consistent pair transforms.
-    pair_transforms_json = []
-
-    if args.export_pairs != "none":
-        if args.export_pairs == "edges":
-            export_pair_list = [(e.target_idx, e.ref_idx) for e in edges]
-        else:
-            export_pair_list = []
-            for target_idx in frames:
-                for ref_idx in frames:
-                    if target_idx == ref_idx:
-                        continue
-                    if target_idx in poses and ref_idx in poses:
-                        export_pair_list.append((target_idx, ref_idx))
-
-        for target_idx, ref_idx in export_pair_list:
-            if target_idx not in poses or ref_idx not in poses:
-                continue
-
-            R_ref_target, t_ref_target = relative_from_global_poses(
-                poses=poses,
-                target_idx=target_idx,
-                ref_idx=ref_idx,
-                normalize_translation=True,
-            )
-
-            rvec, _ = cv2.Rodrigues(R_ref_target)
-
-            pair_transforms_json.append({
-                "target_idx": target_idx,
-                "ref_idx": ref_idx,
-                "R_ref_target": R_ref_target.tolist(),
-                "t_ref_target_unit": t_ref_target.reshape(3).tolist(),
-                "rvec_ref_target": rvec.reshape(3).tolist(),
-                "source": "gop_consistent_pose_graph",
-            })
-
-    result = {
-        "input": args.input,
-        "width": args.width,
-        "height": args.height,
-        "bitdepth": args.bitdepth,
-        "frames": frames,
-        "anchor_idx": anchor_idx,
-        "padded_width": padded_width,
-        "padded_height": padded_height,
-        "pad_multiple": args.pad_multiple,
-        "block_size_ready": 8,
-
-        "K": K.tolist(),
-
-        "edge_mode": args.edge_mode,
-        "max_edge_dist": args.max_edge_dist,
-        "min_pose_inliers": args.min_pose_inliers,
-        "pose_iters": args.pose_iters,
-        "temporal_smooth": args.temporal_smooth,
-
-        "direct_pairwise_edges": direct_edges_json,
-        "failed_edges": failed_edges,
-        "global_poses_anchor_from_frame": global_poses_json,
-        "consistent_pair_transforms": pair_transforms_json,
-
-        "notes": [
-            "Global pose convention: X_anchor = R_anchor_frame * X_frame + t_anchor_frame.",
-            "Pair transform convention: X_ref = R_ref_target * X_target + t_ref_target.",
-            "All pairwise and exported translations are normalized or arbitrary scale because monocular Essential matrix does not recover metric translation scale.",
-            "Use R_ref_target and t_ref_target_unit for later backward projection with block-wise inverse-depth scalar c_b.",
-        ],
-    }
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-
-    print(f"[DONE] wrote {args.output}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@dataclass
-class PoseEdge:
-    target_idx: int
-    ref_idx: int
-
-    # Maps target camera coordinates to ref camera coordinates:
-    #   X_ref = R_ref_target * X_target + t_ref_target
-    R_ref_target: np.ndarray
-    t_ref_target: np.ndarray
-
-    num_matches: int
-    essential_inliers: int
-    pose_inliers: int
-
-    # Pairwise epipolar geometry quality.
-    # Smaller is better.
-    sampson_error_mean: float
-    sampson_error_median: float
-    sampson_error_p90: float
-
-
-
-
-
-
-
-
-
-def skew(t: np.ndarray) -> np.ndarray:
-    """
-    Return skew-symmetric matrix [t]_x such that:
-      [t]_x @ x = t cross x
-    """
-    tx, ty, tz = np.asarray(t, dtype=np.float64).reshape(3)
-    return np.array(
-        [
-            [0.0, -tz,  ty],
-            [tz,   0.0, -tx],
-            [-ty,  tx,   0.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def compute_sampson_error_pixels(
-    pts_target: np.ndarray,
-    pts_ref: np.ndarray,
-    K: np.ndarray,
-    R_ref_target: np.ndarray,
-    t_ref_target: np.ndarray,
-) -> np.ndarray:
-    """
-    Compute Sampson error for matched points.
-
-    pts_target: Nx2 points in target image
-    pts_ref:    Nx2 points in reference image
-
-    Smaller is better.
-    Unit is roughly pixel^2.
-    """
-
-    t_ref_target = normalize_vec(t_ref_target)
-
-    # Essential matrix from estimated pose.
-    E = skew(t_ref_target) @ R_ref_target
-
-    Kinv = np.linalg.inv(K)
-
-    # Fundamental matrix in pixel coordinates.
-    F = Kinv.T @ E @ Kinv
-
-    ones = np.ones((pts_target.shape[0], 1), dtype=np.float64)
-
-    x1 = np.concatenate([pts_target.astype(np.float64), ones], axis=1)  # target
-    x2 = np.concatenate([pts_ref.astype(np.float64), ones], axis=1)     # ref
-
-    Fx1 = (F @ x1.T).T
-    Ftx2 = (F.T @ x2.T).T
-
-    numerator = np.sum(x2 * Fx1, axis=1) ** 2
-    denominator = (
-        Fx1[:, 0] ** 2
-        + Fx1[:, 1] ** 2
-        + Ftx2[:, 0] ** 2
-        + Ftx2[:, 1] ** 2
-        + 1e-12
-    )
-
-    return numerator / denominator
-
-
-def summarize_sampson_error(
-    sampson_error: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> Tuple[float, float, float]:
-    """
-    Return mean, median, p90 Sampson error.
-    If mask is given, compute only on masked inliers.
-    """
-
-    e = np.asarray(sampson_error, dtype=np.float64).reshape(-1)
-
-    if mask is not None:
-        m = np.asarray(mask).reshape(-1).astype(bool)
-        if m.shape[0] == e.shape[0] and np.count_nonzero(m) > 0:
-            e = e[m]
-
-    if e.size == 0:
-        return float("nan"), float("nan"), float("nan")
-
-    return (
-        float(np.mean(e)),
-        float(np.median(e)),
-        float(np.percentile(e, 90)),
-    )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-R, t, pose_mask, pose_inliers = choose_best_pose_from_E(
-    E,
-    pts_target,
-    pts_ref,
-    K,
-)
-
-essential_inliers = int(np.count_nonzero(inlier_mask_E)) if inlier_mask_E is not None else 0
-
-# Evaluate pairwise epipolar geometry quality.
-sampson_error = compute_sampson_error_pixels(
-    pts_target=pts_target,
-    pts_ref=pts_ref,
-    K=K,
-    R_ref_target=R,
-    t_ref_target=t,
-)
-
-sampson_mean, sampson_median, sampson_p90 = summarize_sampson_error(
-    sampson_error,
-    mask=inlier_mask_E,
-)
-
-return PoseEdge(
-    target_idx=target_idx,
-    ref_idx=ref_idx,
-    R_ref_target=R,
-    t_ref_target=t,
-    num_matches=int(num_matches),
-    essential_inliers=essential_inliers,
-    pose_inliers=int(pose_inliers),
-    sampson_error_mean=sampson_mean,
-    sampson_error_median=sampson_median,
-    sampson_error_p90=sampson_p90,
-)
-
-
-
-
-
-
-
-
-
-
-
 
 def rotation_angle_error_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
     """
@@ -1335,6 +1003,7 @@ def evaluate_pose_graph_edges(
             {
                 "target_idx": int(e.target_idx),
                 "ref_idx": int(e.ref_idx),
+
                 "num_matches": int(e.num_matches),
                 "essential_inliers": int(e.essential_inliers),
                 "pose_inliers": int(e.pose_inliers),
@@ -1342,6 +1011,17 @@ def evaluate_pose_graph_edges(
                 "sampson_error_mean": float(e.sampson_error_mean),
                 "sampson_error_median": float(e.sampson_error_median),
                 "sampson_error_p90": float(e.sampson_error_p90),
+
+                "sampson_error_sqrt_median_px": (
+                    float(np.sqrt(e.sampson_error_median))
+                    if np.isfinite(e.sampson_error_median) and e.sampson_error_median >= 0.0
+                    else float("nan")
+                ),
+                "sampson_error_sqrt_p90_px": (
+                    float(np.sqrt(e.sampson_error_p90))
+                    if np.isfinite(e.sampson_error_p90) and e.sampson_error_p90 >= 0.0
+                    else float("nan")
+                ),
 
                 "rotation_error_deg": float(rot_err),
                 "translation_dir_error_deg": float(trans_err),
@@ -1365,20 +1045,27 @@ def summarize_pose_graph_residuals(residuals: List[dict]) -> dict:
             "translation_dir_error_deg_mean": None,
             "translation_dir_error_deg_median": None,
             "translation_dir_error_deg_p90": None,
+            "sampson_error_median_mean": None,
+            "sampson_error_median_median": None,
+            "sampson_error_median_p90": None,
         }
 
     rot = np.array(
         [r["rotation_error_deg"] for r in residuals],
         dtype=np.float64,
     )
-
     trans = np.array(
         [r["translation_dir_error_deg"] for r in residuals],
+        dtype=np.float64,
+    )
+    samp_med = np.array(
+        [r["sampson_error_median"] for r in residuals],
         dtype=np.float64,
     )
 
     rot = rot[np.isfinite(rot)]
     trans = trans[np.isfinite(trans)]
+    samp_med = samp_med[np.isfinite(samp_med)]
 
     def safe_summary(x: np.ndarray):
         if x.size == 0:
@@ -1391,6 +1078,7 @@ def summarize_pose_graph_residuals(residuals: List[dict]) -> dict:
 
     rot_mean, rot_median, rot_p90 = safe_summary(rot)
     trans_mean, trans_median, trans_p90 = safe_summary(trans)
+    samp_mean, samp_median, samp_p90 = safe_summary(samp_med)
 
     return {
         "num_edges": int(len(residuals)),
@@ -1402,142 +1090,396 @@ def summarize_pose_graph_residuals(residuals: List[dict]) -> dict:
         "translation_dir_error_deg_mean": trans_mean,
         "translation_dir_error_deg_median": trans_median,
         "translation_dir_error_deg_p90": trans_p90,
+
+        "sampson_error_median_mean": samp_mean,
+        "sampson_error_median_median": samp_median,
+        "sampson_error_median_p90": samp_p90,
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-pose_graph_residuals = evaluate_pose_graph_edges(
-    edges=edges,
-    poses=poses,
-)
-
-pose_graph_residual_summary = summarize_pose_graph_residuals(
-    pose_graph_residuals
-)
-
-print("[INFO] pose graph residual summary:")
-print(json.dumps(pose_graph_residual_summary, indent=2))
-
-
-
-
-
-
-
-
-
-
-
-
-direct_edges_json.append({
-    "target_idx": e.target_idx,
-    "ref_idx": e.ref_idx,
-    "num_matches": e.num_matches,
-    "essential_inliers": e.essential_inliers,
-    "pose_inliers": e.pose_inliers,
-
-    "sampson_error_mean": e.sampson_error_mean,
-    "sampson_error_median": e.sampson_error_median,
-    "sampson_error_p90": e.sampson_error_p90,
-
-    "R_ref_target": e.R_ref_target.tolist(),
-    "t_ref_target_unit": normalize_vec(e.t_ref_target).tolist(),
-    "rvec_ref_target": rvec.reshape(3).tolist(),
-})
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-"direct_pairwise_edges": direct_edges_json,
-"failed_edges": failed_edges,
-
-"pose_graph_residual_summary": pose_graph_residual_summary,
-"pose_graph_residuals": pose_graph_residuals,
-
-"global_poses_anchor_from_frame": global_poses_json,
-"consistent_pair_transforms": pair_transforms_json,
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import json
-
-with open("gop_rt.json", "r") as f:
-    data = json.load(f)
-
-res = data["pose_graph_residuals"]
-
-res_sorted = sorted(
-    res,
-    key=lambda x: x["translation_dir_error_deg"],
-    reverse=True,
-)
-
-for r in res_sorted[:20]:
-    print(
-        f'target={r["target_idx"]:3d}, ref={r["ref_idx"]:3d}, '
-        f'rot={r["rotation_error_deg"]:.4f} deg, '
-        f'trans={r["translation_dir_error_deg"]:.4f} deg, '
-        f'matches={r["num_matches"]}, '
-        f'inliers={r["pose_inliers"]}, '
-        f'sampson_med={r["sampson_error_median"]:.4f}'
+def get_top_outlier_edges(
+    residuals: List[dict],
+    top_k: int,
+) -> List[dict]:
+    if top_k <= 0:
+        return []
+
+    finite_res = [
+        r for r in residuals
+        if np.isfinite(r.get("translation_dir_error_deg", float("nan")))
+    ]
+
+    sorted_res = sorted(
+        finite_res,
+        key=lambda x: x["translation_dir_error_deg"],
+        reverse=True,
     )
 
+    return sorted_res[:top_k]
 
 
+# ============================================================
+# Main
+# ============================================================
 
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--input", required=True, help="Input YUV420 file")
+    parser.add_argument("--width", type=int, required=True)
+    parser.add_argument("--height", type=int, required=True)
+    parser.add_argument("--bitdepth", type=int, choices=[8, 10], required=True)
+
+    parser.add_argument(
+        "--frames",
+        default=None,
+        help="Comma-separated frame indices, e.g. 0,1,2,4,8,16,32",
+    )
+    parser.add_argument("--gop-start", type=int, default=None)
+    parser.add_argument("--gop-size", type=int, default=None)
+
+    parser.add_argument("--anchor-idx", type=int, default=None)
+
+    parser.add_argument("--fx", type=float, default=None)
+    parser.add_argument("--fy", type=float, default=None)
+    parser.add_argument("--cx", type=float, default=None)
+    parser.add_argument("--cy", type=float, default=None)
+
+    parser.add_argument("--pad-multiple", type=int, default=8)
+    parser.add_argument("--max-features", type=int, default=8000)
+    parser.add_argument("--match-ratio", type=float, default=0.75)
+
+    parser.add_argument("--ransac-threshold", type=float, default=1.0)
+    parser.add_argument("--ransac-prob", type=float, default=0.999)
+
+    parser.add_argument(
+        "--edge-mode",
+        choices=["adjacent", "hierarchical", "all", "anchor_all"],
+        default="all",
+    )
+    parser.add_argument(
+        "--max-edge-dist",
+        type=int,
+        default=32,
+        help="Maximum frame distance for pairwise edge estimation. <=0 means unlimited.",
+    )
+
+    parser.add_argument("--min-pose-inliers", type=int, default=30)
+    parser.add_argument("--pose-iters", type=int, default=10)
+    parser.add_argument("--temporal-smooth", type=float, default=0.0)
+
+    parser.add_argument(
+        "--export-pairs",
+        choices=["none", "edges", "all"],
+        default="all",
+    )
+
+    parser.add_argument("--top-outliers", type=int, default=20)
+
+    parser.add_argument("--output", required=True)
+
+    args = parser.parse_args()
+
+    frames = parse_frames(args)
+    anchor_idx = args.anchor_idx if args.anchor_idx is not None else frames[0]
+
+    if anchor_idx not in frames:
+        raise ValueError(f"anchor_idx {anchor_idx} is not in frames: {frames}")
+
+    K = build_K_from_args(args)
+
+    padded_width = ceil_to_multiple(args.width, args.pad_multiple)
+    padded_height = ceil_to_multiple(args.height, args.pad_multiple)
+
+    print(f"[INFO] frames = {frames}")
+    print(f"[INFO] anchor_idx = {anchor_idx}")
+    print(f"[INFO] padded = {padded_width}x{padded_height}")
+    print(f"[INFO] edge_mode = {args.edge_mode}")
+    print(f"[INFO] max_edge_dist = {args.max_edge_dist}")
+    print(f"[INFO] K =\n{K}")
+
+    # Lazy frame cache.
+    frame_cache: Dict[int, FrameY] = {}
+
+    def get_frame(idx: int) -> FrameY:
+        if idx not in frame_cache:
+            frame_cache[idx] = read_y_frame(
+                args.input,
+                args.width,
+                args.height,
+                args.bitdepth,
+                idx,
+                pad_multiple=args.pad_multiple,
+            )
+        return frame_cache[idx]
+
+    edge_pairs = generate_edge_pairs(
+        frames=frames,
+        edge_mode=args.edge_mode,
+        max_edge_dist=args.max_edge_dist,
+    )
+
+    print(f"[INFO] estimating {len(edge_pairs)} pairwise edges...")
+
+    edges: List[PoseEdge] = []
+    failed_edges = []
+
+    for n, (target_idx, ref_idx) in enumerate(edge_pairs):
+        print(f"[EDGE {n + 1:4d}/{len(edge_pairs):4d}] target={target_idx}, ref={ref_idx}")
+
+        try:
+            target = get_frame(target_idx)
+            ref = get_frame(ref_idx)
+
+            edge = estimate_pair_edge(
+                target_idx=target_idx,
+                ref_idx=ref_idx,
+                target_y=target.y,
+                ref_y=ref.y,
+                bitdepth=args.bitdepth,
+                K=K,
+                max_features=args.max_features,
+                ransac_threshold=args.ransac_threshold,
+                ransac_prob=args.ransac_prob,
+                ratio=args.match_ratio,
+            )
+
+            if edge.pose_inliers < args.min_pose_inliers:
+                print(
+                    f"  [SKIP] pose_inliers={edge.pose_inliers} "
+                    f"< min_pose_inliers={args.min_pose_inliers}"
+                )
+                failed_edges.append(
+                    {
+                        "target_idx": int(target_idx),
+                        "ref_idx": int(ref_idx),
+                        "reason": "too_few_pose_inliers",
+                        "num_matches": int(edge.num_matches),
+                        "essential_inliers": int(edge.essential_inliers),
+                        "pose_inliers": int(edge.pose_inliers),
+                        "sampson_error_median": float(edge.sampson_error_median),
+                        "sampson_error_p90": float(edge.sampson_error_p90),
+                    }
+                )
+                continue
+
+            print(
+                f"  [OK] matches={edge.num_matches}, "
+                f"E_inliers={edge.essential_inliers}, "
+                f"pose_inliers={edge.pose_inliers}, "
+                f"sampson_med={edge.sampson_error_median:.4f}"
+            )
+
+            edges.append(edge)
+
+        except Exception as e:
+            print(f"  [FAIL] {e}")
+            failed_edges.append(
+                {
+                    "target_idx": int(target_idx),
+                    "ref_idx": int(ref_idx),
+                    "reason": str(e),
+                }
+            )
+
+    if len(edges) == 0:
+        raise RuntimeError("No valid pairwise pose edges were estimated.")
+
+    print(f"[INFO] valid edges = {len(edges)}")
+
+    directed = build_directed_transform_graph(edges)
+
+    poses = initialize_global_poses_bfs(
+        frames=frames,
+        directed=directed,
+        anchor_idx=anchor_idx,
+    )
+
+    missing = [f for f in frames if f not in poses]
+    if len(missing) > 0:
+        print(f"[WARN] Some frames are disconnected from the pose graph: {missing}")
+
+    poses = refine_global_poses(
+        frames=frames,
+        directed=directed,
+        poses=poses,
+        anchor_idx=anchor_idx,
+        num_iters=args.pose_iters,
+        temporal_smooth=args.temporal_smooth,
+    )
+
+    pose_graph_residuals = evaluate_pose_graph_edges(
+        edges=edges,
+        poses=poses,
+    )
+
+    pose_graph_residual_summary = summarize_pose_graph_residuals(
+        pose_graph_residuals
+    )
+
+    top_outlier_edges = get_top_outlier_edges(
+        pose_graph_residuals,
+        top_k=args.top_outliers,
+    )
+
+    print("[INFO] pose graph residual summary:")
+    print(json.dumps(pose_graph_residual_summary, indent=2))
+
+    if len(top_outlier_edges) > 0:
+        print(f"[INFO] top {len(top_outlier_edges)} translation-direction outlier edges:")
+        for r in top_outlier_edges:
+            print(
+                f'  target={r["target_idx"]:3d}, ref={r["ref_idx"]:3d}, '
+                f'rot={r["rotation_error_deg"]:.4f} deg, '
+                f'trans={r["translation_dir_error_deg"]:.4f} deg, '
+                f'matches={r["num_matches"]}, '
+                f'inliers={r["pose_inliers"]}, '
+                f'sampson_med={r["sampson_error_median"]:.4f}'
+            )
+
+    # Export direct pairwise edges.
+    direct_edges_json = []
+    for e in edges:
+        rvec, _ = cv2.Rodrigues(e.R_ref_target)
+
+        direct_edges_json.append(
+            {
+                "target_idx": int(e.target_idx),
+                "ref_idx": int(e.ref_idx),
+
+                "num_matches": int(e.num_matches),
+                "essential_inliers": int(e.essential_inliers),
+                "pose_inliers": int(e.pose_inliers),
+
+                "sampson_error_mean": float(e.sampson_error_mean),
+                "sampson_error_median": float(e.sampson_error_median),
+                "sampson_error_p90": float(e.sampson_error_p90),
+
+                "sampson_error_sqrt_median_px": (
+                    float(np.sqrt(e.sampson_error_median))
+                    if np.isfinite(e.sampson_error_median) and e.sampson_error_median >= 0.0
+                    else float("nan")
+                ),
+                "sampson_error_sqrt_p90_px": (
+                    float(np.sqrt(e.sampson_error_p90))
+                    if np.isfinite(e.sampson_error_p90) and e.sampson_error_p90 >= 0.0
+                    else float("nan")
+                ),
+
+                "R_ref_target": e.R_ref_target.tolist(),
+                "t_ref_target_unit": normalize_vec(e.t_ref_target).tolist(),
+                "rvec_ref_target_rad": rvec.reshape(3).tolist(),
+            }
+        )
+
+    # Export global poses.
+    # If anchor_idx = 0, this is T_0_i:
+    #   X_0 = R_0_i * X_i + t_0_i
+    global_poses_json = {}
+    for f in frames:
+        if f not in poses:
+            continue
+
+        R_anchor_frame, t_anchor_frame = poses[f]
+        rvec, _ = cv2.Rodrigues(R_anchor_frame)
+
+        global_poses_json[str(f)] = {
+            "R_anchor_frame": R_anchor_frame.tolist(),
+            "t_anchor_frame_arbitrary_scale": np.asarray(t_anchor_frame).reshape(3).tolist(),
+            "rvec_anchor_frame_rad": rvec.reshape(3).tolist(),
+        }
+
+    # Export consistent pair transforms.
+    pair_transforms_json = []
+
+    if args.export_pairs != "none":
+        if args.export_pairs == "edges":
+            export_pair_list = [(e.target_idx, e.ref_idx) for e in edges]
+        else:
+            export_pair_list = []
+            for target_idx in frames:
+                for ref_idx in frames:
+                    if target_idx == ref_idx:
+                        continue
+                    if target_idx in poses and ref_idx in poses:
+                        export_pair_list.append((target_idx, ref_idx))
+
+        for target_idx, ref_idx in export_pair_list:
+            if target_idx not in poses or ref_idx not in poses:
+                continue
+
+            R_ref_target, t_ref_target = relative_from_global_poses(
+                poses=poses,
+                target_idx=target_idx,
+                ref_idx=ref_idx,
+                normalize_translation=True,
+            )
+
+            rvec, _ = cv2.Rodrigues(R_ref_target)
+
+            pair_transforms_json.append(
+                {
+                    "target_idx": int(target_idx),
+                    "ref_idx": int(ref_idx),
+
+                    "R_ref_target": R_ref_target.tolist(),
+                    "t_ref_target_unit": t_ref_target.reshape(3).tolist(),
+                    "rvec_ref_target_rad": rvec.reshape(3).tolist(),
+
+                    "source": "gop_consistent_pose_graph",
+                    "formula": "T_ref_target = inverse(T_anchor_ref) * T_anchor_target",
+                }
+            )
+
+    result = {
+        "input": args.input,
+        "width": int(args.width),
+        "height": int(args.height),
+        "bitdepth": int(args.bitdepth),
+
+        "frames": frames,
+        "anchor_idx": int(anchor_idx),
+
+        "padded_width": int(padded_width),
+        "padded_height": int(padded_height),
+        "pad_multiple": int(args.pad_multiple),
+        "block_size_ready": 8,
+
+        "K": K.tolist(),
+
+        "edge_mode": args.edge_mode,
+        "max_edge_dist": int(args.max_edge_dist),
+        "min_pose_inliers": int(args.min_pose_inliers),
+        "pose_iters": int(args.pose_iters),
+        "temporal_smooth": float(args.temporal_smooth),
+
+        "direct_pairwise_edges": direct_edges_json,
+        "failed_edges": failed_edges,
+
+        "pose_graph_residual_summary": pose_graph_residual_summary,
+        "pose_graph_residuals": pose_graph_residuals,
+        "top_translation_outlier_edges": top_outlier_edges,
+
+        "global_poses_anchor_from_frame": global_poses_json,
+        "consistent_pair_transforms": pair_transforms_json,
+
+        "notes": [
+            "Global pose convention: X_anchor = R_anchor_frame * X_frame + t_anchor_frame.",
+            "If anchor_idx is GOP first frame, global_poses_anchor_from_frame stores T_anchor_i for each frame i.",
+            "Pair transform convention: X_ref = R_ref_target * X_target + t_ref_target.",
+            "Pair transform is derived as T_ref_target = inverse(T_anchor_ref) * T_anchor_target.",
+            "All pairwise and exported translations are normalized or arbitrary scale because monocular Essential matrix does not recover metric translation scale.",
+            "Use R_ref_target and t_ref_target_unit for later backward projection with block-wise inverse-depth scalar c_b.",
+            "rotation_error_deg and translation_dir_error_deg are in degrees.",
+            "sampson_error_* is roughly pixel^2; sqrt values are roughly pixels.",
+        ],
+    }
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    print(f"[DONE] wrote {args.output}")
+
+
+if __name__ == "__main__":
+    main()
