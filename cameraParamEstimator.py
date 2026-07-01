@@ -6,14 +6,17 @@
 # Coordinate convention:
 #   target pixel x_t -> ref pixel x_r
 #
-# For each level:
-#   block_size = start_block_size / 2^level
+# Main update:
+#   Edge-anchored fitting.
+#   For right/bottom partial blocks, the output region remains non-overlapping,
+#   but the fitting region is shifted inward so that the local homography is
+#   estimated from a full block_size x block_size window whenever possible.
 #
-# For each block:
-#   1. collect feature matches whose target-side point lies in block + margin
-#   2. fit local homography with RANSAC
-#   3. compare candidate H against parent/fallback H by photometric MAE
-#   4. accept candidate if reliable; otherwise inherit parent H
+# Example:
+#   output right edge block:
+#       out_x = 1792..1919, out_w = 128
+#   fitting window:
+#       fit_x = 1664..1919, fit_w = 256
 #
 # Outputs:
 #   target_pair.yuv
@@ -21,25 +24,6 @@
 #   pred_levelXX_blockYYY.yuv
 #   pred_hier_block_homography.yuv
 #   result.json
-#
-# Example:
-#   python hierarchical_block_homography.py \
-#     --input input.yuv \
-#     --width 1920 \
-#     --height 1080 \
-#     --bitdepth 10 \
-#     --target-idx 1 \
-#     --ref-idx 0 \
-#     --start-block-size 256 \
-#     --levels 3 \
-#     --block-margin 32 \
-#     --max-features 60000 \
-#     --match-ratio 0.70 \
-#     --ransac-thresh 2.0 \
-#     --min-matches 12 \
-#     --min-inliers 8 \
-#     --root-fallback global_translation \
-#     --output-dir hier_homo_t1_r0
 
 import argparse
 import json
@@ -85,6 +69,26 @@ class BlockHResult:
     chosen_cost: float
     valid_ratio: float
     reason: str
+
+
+@dataclass
+class Tile:
+    # Non-overlap output region.
+    out_x0: int
+    out_y0: int
+    out_x1: int
+    out_y1: int
+
+    # Fitting region. For edge blocks this may be shifted inward.
+    fit_x0: int
+    fit_y0: int
+    fit_x1: int
+    fit_y1: int
+
+    out_w: int
+    out_h: int
+    fit_w: int
+    fit_h: int
 
 
 # ============================================================
@@ -176,6 +180,77 @@ def normalize_homography(H: np.ndarray) -> np.ndarray:
         H = H / H[2, 2]
 
     return H
+
+
+def make_tiles(
+    width: int,
+    height: int,
+    block_size: int,
+    edge_anchored_fit: bool,
+) -> List[List[Tile]]:
+    """
+    Create non-overlap output tiles and fitting tiles.
+
+    If edge_anchored_fit is True:
+        For partial right/bottom edge blocks, the fitting region is shifted
+        inward so that fit_w/fit_h becomes block_size whenever possible.
+
+    Example:
+        width=1856, block_size=256
+        last output tile: out_x0=1792, out_x1=1856, out_w=64
+        last fitting tile: fit_x0=1600, fit_x1=1856, fit_w=256
+    """
+    tiles: List[List[Tile]] = []
+
+    for out_y0 in range(0, height, block_size):
+        out_y1 = min(out_y0 + block_size, height)
+        row: List[Tile] = []
+
+        if edge_anchored_fit:
+            fit_y1 = out_y1
+            fit_y0 = fit_y1 - block_size
+
+            if fit_y0 < 0:
+                fit_y0 = 0
+                fit_y1 = min(block_size, height)
+        else:
+            fit_y0 = out_y0
+            fit_y1 = out_y1
+
+        for out_x0 in range(0, width, block_size):
+            out_x1 = min(out_x0 + block_size, width)
+
+            if edge_anchored_fit:
+                fit_x1 = out_x1
+                fit_x0 = fit_x1 - block_size
+
+                if fit_x0 < 0:
+                    fit_x0 = 0
+                    fit_x1 = min(block_size, width)
+            else:
+                fit_x0 = out_x0
+                fit_x1 = out_x1
+
+            tile = Tile(
+                out_x0=int(out_x0),
+                out_y0=int(out_y0),
+                out_x1=int(out_x1),
+                out_y1=int(out_y1),
+                fit_x0=int(fit_x0),
+                fit_y0=int(fit_y0),
+                fit_x1=int(fit_x1),
+                fit_y1=int(fit_y1),
+                out_w=int(out_x1 - out_x0),
+                out_h=int(out_y1 - out_y0),
+                fit_w=int(fit_x1 - fit_x0),
+                fit_h=int(fit_y1 - fit_y0),
+            )
+
+            row.append(tile)
+
+        tiles.append(row)
+
+    return tiles
 
 
 # ============================================================
@@ -493,14 +568,14 @@ def collect_matches_for_block(
 def parent_H_for_block(
     parent_H_grid: Optional[np.ndarray],
     parent_block_size: Optional[int],
-    bx: int,
-    by: int,
+    out_x0: int,
+    out_y0: int,
 ) -> Optional[np.ndarray]:
     if parent_H_grid is None or parent_block_size is None:
         return None
 
-    py = by // parent_block_size
-    px = bx // parent_block_size
+    py = out_y0 // parent_block_size
+    px = out_x0 // parent_block_size
 
     py = min(parent_H_grid.shape[0] - 1, max(0, py))
     px = min(parent_H_grid.shape[1] - 1, max(0, px))
@@ -513,35 +588,37 @@ def render_prediction_from_H_grid(
     ref_y: np.ndarray,
     H_grid: np.ndarray,
     block_size: int,
+    edge_anchored_fit: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
     height, width = target_y.shape
     pred = np.zeros((height, width), dtype=np.float32)
     valid_all = np.zeros((height, width), dtype=bool)
 
-    for by_idx, by in enumerate(range(0, height, block_size)):
-        y1 = min(by + block_size, height)
-        bh = y1 - by
+    tiles = make_tiles(
+        width=width,
+        height=height,
+        block_size=block_size,
+        edge_anchored_fit=edge_anchored_fit,
+    )
 
-        for bx_idx, bx in enumerate(range(0, width, block_size)):
-            x1 = min(bx + block_size, width)
-            bw = x1 - bx
-
+    for by_idx, row in enumerate(tiles):
+        for bx_idx, tile in enumerate(row):
             H = H_grid[by_idx, bx_idx].reshape(3, 3)
 
             map_x, map_y, valid = homography_maps_for_roi(
                 H=H,
-                bx=bx,
-                by=by,
-                bw=bw,
-                bh=bh,
+                bx=tile.out_x0,
+                by=tile.out_y0,
+                bw=tile.out_w,
+                bh=tile.out_h,
                 width=width,
                 height=height,
             )
 
             pred_roi = remap_ref(ref_y, map_x, map_y)
 
-            pred[by:y1, bx:x1] = pred_roi
-            valid_all[by:y1, bx:x1] = valid
+            pred[tile.out_y0:tile.out_y1, tile.out_x0:tile.out_x1] = pred_roi
+            valid_all[tile.out_y0:tile.out_y1, tile.out_x0:tile.out_x1] = valid
 
     return pred, valid_all
 
@@ -560,6 +637,15 @@ def run_one_level(
 ) -> Tuple[np.ndarray, List[List[Dict]], Dict[str, np.ndarray]]:
     height, width = target_y.shape
     ny, nx = block_grid_shape(width, height, block_size)
+
+    edge_anchored_fit = not args.disable_edge_anchored_fit
+
+    tiles = make_tiles(
+        width=width,
+        height=height,
+        block_size=block_size,
+        edge_anchored_fit=edge_anchored_fit,
+    )
 
     H_grid = np.zeros((ny, nx, 3, 3), dtype=np.float64)
 
@@ -590,16 +676,16 @@ def run_one_level(
     inherited = 0
     rejected = 0
 
-    for by_idx, by in enumerate(range(0, height, block_size)):
-        y1 = min(by + block_size, height)
-        bh = y1 - by
+    for by_idx, row in enumerate(tiles):
         row_records = []
 
-        for bx_idx, bx in enumerate(range(0, width, block_size)):
-            x1 = min(bx + block_size, width)
-            bw = x1 - bx
-
-            parent_H = parent_H_for_block(parent_H_grid, parent_block_size, bx, by)
+        for bx_idx, tile in enumerate(row):
+            parent_H = parent_H_for_block(
+                parent_H_grid=parent_H_grid,
+                parent_block_size=parent_block_size,
+                out_x0=tile.out_x0,
+                out_y0=tile.out_y0,
+            )
 
             if parent_H is None:
                 fallback_H = root_fallback_H.copy()
@@ -608,24 +694,28 @@ def run_one_level(
                 fallback_H = parent_H.copy()
                 fallback_source = "parent_inherit"
 
+            # Cost is evaluated only on the actual non-overlap output tile.
             fallback_cost, fallback_valid_ratio = eval_block_photometric_cost(
                 target_y=target_y,
                 ref_y=ref_y,
                 H=fallback_H,
-                bx=bx,
-                by=by,
-                bw=bw,
-                bh=bh,
+                bx=tile.out_x0,
+                by=tile.out_y0,
+                bw=tile.out_w,
+                bh=tile.out_h,
                 min_valid_ratio=args.min_block_valid_ratio,
             )
 
+            # Matches are collected from the fitting tile.
+            # For edge blocks, this fitting tile is shifted inward and may be
+            # much larger than the actual output tile.
             pts_t, pts_r = collect_matches_for_block(
                 pts_t_all=pts_t_all,
                 pts_r_all=pts_r_all,
-                bx=bx,
-                by=by,
-                bw=bw,
-                bh=bh,
+                bx=tile.fit_x0,
+                by=tile.fit_y0,
+                bw=tile.fit_w,
+                bh=tile.fit_h,
                 width=width,
                 height=height,
                 margin=margin,
@@ -646,25 +736,24 @@ def run_one_level(
             candidate_cost = float("inf")
             chosen_cost = fallback_cost
             chosen_valid_ratio = fallback_valid_ratio
-            ok = False
             reason = fit_reason
 
             if H_candidate is not None:
+                # Candidate is also judged only on the output tile.
                 candidate_cost, candidate_valid_ratio = eval_block_photometric_cost(
                     target_y=target_y,
                     ref_y=ref_y,
                     H=H_candidate,
-                    bx=bx,
-                    by=by,
-                    bw=bw,
-                    bh=bh,
+                    bx=tile.out_x0,
+                    by=tile.out_y0,
+                    bw=tile.out_w,
+                    bh=tile.out_h,
                     min_valid_ratio=args.min_block_valid_ratio,
                 )
 
                 accept_by_cost = True
 
                 if not args.disable_cost_gate:
-                    # Accept local H if it is better, or not much worse when fallback is invalid.
                     if np.isfinite(fallback_cost):
                         accept_by_cost = candidate_cost <= fallback_cost - args.min_gain
                     else:
@@ -675,7 +764,6 @@ def run_one_level(
                     chosen_source = "local_fit"
                     chosen_cost = candidate_cost
                     chosen_valid_ratio = candidate_valid_ratio
-                    ok = True
                     reason = "local_fit_accepted"
                     accepted += 1
                 else:
@@ -683,7 +771,6 @@ def run_one_level(
                     chosen_source = "local_fit_rejected_cost"
                     chosen_cost = fallback_cost
                     chosen_valid_ratio = fallback_valid_ratio
-                    ok = False
                     reason = "local_fit_rejected_by_cost"
                     rejected += 1
             else:
@@ -701,10 +788,25 @@ def run_one_level(
 
             row_records.append(
                 {
-                    "block_x": int(bx),
-                    "block_y": int(by),
-                    "block_w": int(bw),
-                    "block_h": int(bh),
+                    "tile_index_x": int(bx_idx),
+                    "tile_index_y": int(by_idx),
+
+                    "out_x": int(tile.out_x0),
+                    "out_y": int(tile.out_y0),
+                    "out_w": int(tile.out_w),
+                    "out_h": int(tile.out_h),
+
+                    "fit_x": int(tile.fit_x0),
+                    "fit_y": int(tile.fit_y0),
+                    "fit_w": int(tile.fit_w),
+                    "fit_h": int(tile.fit_h),
+
+                    # Keep old names for compatibility with previous JSON readers.
+                    "block_x": int(tile.out_x0),
+                    "block_y": int(tile.out_y0),
+                    "block_w": int(tile.out_w),
+                    "block_h": int(tile.out_h),
+
                     "source": chosen_source,
                     "reason": reason,
                     "match_count": int(len(pts_t)),
@@ -842,6 +944,15 @@ def main():
     parser.add_argument("--min-block-size", type=int, default=32)
     parser.add_argument("--block-margin", type=int, default=32)
 
+    parser.add_argument(
+        "--disable-edge-anchored-fit",
+        action="store_true",
+        help=(
+            "Disable edge-anchored fitting. If disabled, right/bottom partial blocks "
+            "use only their partial output area for fitting, matching the old behavior."
+        ),
+    )
+
     parser.add_argument("--max-features", type=int, default=60000)
     parser.add_argument("--match-ratio", type=float, default=0.70)
     parser.add_argument("--no-clahe", action="store_true")
@@ -869,10 +980,12 @@ def main():
 
     width = args.width
     height = args.height
+    edge_anchored_fit = not args.disable_edge_anchored_fit
 
     print(f"[INFO] target={args.target_idx}, ref={args.ref_idx}")
     print(f"[INFO] size={width}x{height}, bitdepth={args.bitdepth}")
     print(f"[INFO] start_block={args.start_block_size}, levels={args.levels}, min_block={args.min_block_size}")
+    print(f"[INFO] edge_anchored_fit={edge_anchored_fit}")
 
     target = read_y_frame(args.input, width, height, args.bitdepth, args.target_idx)
     ref = read_y_frame(args.input, width, height, args.bitdepth, args.ref_idx)
@@ -971,6 +1084,7 @@ def main():
             ref_y=ref.y,
             H_grid=H_grid,
             block_size=block_size,
+            edge_anchored_fit=edge_anchored_fit,
         )
 
         cost = calc_cost(target.y, pred, valid, args.bitdepth)
@@ -1108,9 +1222,13 @@ def main():
             "levels": int(args.levels),
             "min_block_size": int(args.min_block_size),
             "block_margin": int(args.block_margin),
+            "edge_anchored_fit": bool(edge_anchored_fit),
             "root_fallback": args.root_fallback,
             "parent_inheritance": True,
             "cost_gate": bool(not args.disable_cost_gate),
+            "fit_output_region_separation": (
+                "H is fitted from fit tile; photometric accept/reject and final rendering use output tile only."
+            ),
         },
 
         "feature_matching": {
@@ -1156,8 +1274,10 @@ def main():
             "source_map value 2 means local homography accepted.",
             "source_map value 1 means parent homography inherited.",
             "source_map value 3 means local homography was fitted but rejected by photometric cost.",
-            "If many blocks are inherited, local feature fitting is not stable at that block size.",
-            "If smaller levels improve MAE but look blocky, add smoothness/gain threshold or use larger block size.",
+            "For edge blocks, fit_x/fit_y/fit_w/fit_h in JSON may differ from block_x/block_y/block_w/block_h.",
+            "Edge-anchored fitting uses inward full-size fitting windows for partial right/bottom blocks.",
+            "The final prediction still writes only the non-overlap output tile, so adjacent blocks are not overwritten.",
+            "If an edge block improves after this change, the previous issue was likely caused by too few matches in a partial tile.",
             "This code is diagnostic only; it does not yet compress block homographies into global parameters + scalar c.",
         ],
     }
