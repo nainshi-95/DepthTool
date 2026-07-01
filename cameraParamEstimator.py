@@ -1,57 +1,60 @@
 #!/usr/bin/env python3
-# homography_block_residual_basis.py
+# local_block_feature_fit.py
 #
-# Image-space factorized warp:
+# Local block feature fitting experiment.
 #
-#   1. Estimate global homography H_g from target -> ref.
-#   2. Around H_g, estimate block-wise residual MV by block matching.
-#   3. Fit a smooth global residual vector field B(x) from reliable block residual MVs.
-#   4. For each block, find scalar c_b.
-#   5. Final predictor:
+# Core idea:
+#   1. Extract global feature matches between target and ref.
+#   2. Assign matches to target-side blocks.
+#   3. Fit local motion model per block:
+#        - translation
+#        - partial affine
+#        - affine
+#        - optional homography
+#   4. Use local block models as motion observations.
+#   5. Aggregate observations into:
+#        - global affine model
+#        - radial FOE + block scalar c model
 #
-#        p_ref(x, b) = H_g(x) + c_b * B(x)
+# Coordinate convention:
+#   target pixel x_t -> ref pixel x_r
 #
-# This is not physical R|t + depth.
-# But it has a similar coding/tool structure:
+# Local predictor:
+#   x_r = M_b(x_t)
 #
-#   global info + block-wise constant scalar.
+# Radial compressed model:
+#   x_r = x_t + c_b * [x_t - foe_x, y_t - foe_y]
 #
 # Outputs:
-#   - pred_homography.yuv
-#   - pred_block_residual_mv.yuv       : upper-bound block residual MV predictor
-#   - pred_basis_scalar.yuv            : H + global basis * block scalar
-#   - c_map.png
-#   - residual_mv_map.png
-#   - basis_field.png
+#   - pred_local_block_model.yuv
+#   - pred_global_affine_from_blocks.yuv
+#   - pred_radial_scalar_from_blocks.yuv
+#   - block MV / reliability / model type maps
 #   - result.json
 #
 # Example:
-#   python homography_block_residual_basis.py \
+#   python local_block_feature_fit.py \
 #     --input input.yuv \
 #     --width 1920 \
 #     --height 1080 \
 #     --bitdepth 10 \
 #     --target-idx 1 \
 #     --ref-idx 0 \
-#     --block-size 32 \
-#     --res-search-range 12 \
-#     --res-search-step 1 \
-#     --basis-degree 2 \
-#     --c-samples 9 \
-#     --c-refine-range 2.0 \
-#     --max-features 30000 \
-#     --match-ratio 0.65 \
-#     --ransac-thresh 0.75 \
-#     --h-refine-iters 100 \
-#     --h-refine-scale 0.5 \
-#     --output-dir h_basis_t1_r0
+#     --block-size 128 \
+#     --block-margin 32 \
+#     --fit-model affine \
+#     --max-features 50000 \
+#     --match-ratio 0.70 \
+#     --ransac-thresh 2.0 \
+#     --min-matches-affine 8 \
+#     --output-dir local_fit_t1_r0
 
 import argparse
 import json
 import math
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -78,45 +81,21 @@ class MatchResult:
 
 
 @dataclass
-class BlockResidualResult:
-    dx_grid: np.ndarray
-    dy_grid: np.ndarray
-    cost_grid: np.ndarray
-    second_cost_grid: np.ndarray
-    gap_grid: np.ndarray
-    valid_ratio_grid: np.ndarray
-    texture_grid: np.ndarray
-    reliable_grid: np.ndarray
-    pred_block_mv: np.ndarray
-    valid_block_mv: np.ndarray
-
-
-@dataclass
-class BasisFitResult:
-    coef_x: np.ndarray
-    coef_y: np.ndarray
-    norm_scale: float
-    basis_x: np.ndarray
-    basis_y: np.ndarray
-    basis_x_block: np.ndarray
-    basis_y_block: np.ndarray
-    fit_mask: np.ndarray
-    fit_weights: np.ndarray
-    fit_error_grid: np.ndarray
-    num_fit_blocks: int
-
-
-@dataclass
-class ScalarPredictResult:
-    c_grid: np.ndarray
-    cost_grid: np.ndarray
-    valid_ratio_grid: np.ndarray
-    pred: np.ndarray
-    valid: np.ndarray
+class LocalModel:
+    ok: bool
+    model_type: str
+    param: Optional[np.ndarray]
+    inlier_count: int
+    match_count: int
+    reproj_mae: float
+    center_mv: Tuple[float, float]
+    valid_ratio: float
+    fallback: bool
+    reason: str
 
 
 # ============================================================
-# Basic utilities
+# Basic I/O
 # ============================================================
 
 def ensure_dir(path: str):
@@ -134,7 +113,7 @@ def yuv420_frame_size_bytes(width: int, height: int, bitdepth: int) -> int:
     if bitdepth == 10:
         return samples * 2
 
-    raise ValueError("Only 8-bit and 10-bit are supported.")
+    raise ValueError("Only 8-bit and 10-bit YUV420 are supported.")
 
 
 def read_y_frame(path: str, width: int, height: int, bitdepth: int, frame_idx: int) -> FrameY:
@@ -180,38 +159,13 @@ def write_single_yuv420(path: str, y: np.ndarray, width: int, height: int, bitde
 def to_8bit(y: np.ndarray, bitdepth: int) -> np.ndarray:
     if bitdepth == 8:
         return np.clip(y, 0, 255).astype(np.uint8)
-
     return np.clip(y.astype(np.float32) / 4.0, 0, 255).astype(np.uint8)
 
 
 def to_8bit_feature(y: np.ndarray, bitdepth: int) -> np.ndarray:
     if bitdepth == 8:
         return y.astype(np.uint8)
-
     return (np.clip(y, 0, 1023).astype(np.uint16) >> 2).astype(np.uint8)
-
-
-def to_float_ecc(y: np.ndarray, bitdepth: int) -> np.ndarray:
-    maxv = 255.0 if bitdepth == 8 else 1023.0
-    return np.clip(y.astype(np.float32) / maxv, 0.0, 1.0).astype(np.float32)
-
-
-def resize_frame(y: np.ndarray, scale: float) -> np.ndarray:
-    if abs(scale - 1.0) < 1e-12:
-        return y.copy()
-
-    h, w = y.shape
-    new_w = max(8, int(round(w * scale)))
-    new_h = max(8, int(round(h * scale)))
-
-    return cv2.resize(y, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-
-def normalize_homography(H: np.ndarray) -> np.ndarray:
-    H = np.asarray(H, dtype=np.float64)
-    if abs(H[2, 2]) > 1e-12:
-        H = H / H[2, 2]
-    return H
 
 
 def block_grid_shape(width: int, height: int, block_size: int) -> Tuple[int, int]:
@@ -220,58 +174,8 @@ def block_grid_shape(width: int, height: int, block_size: int) -> Tuple[int, int
     return ny, nx
 
 
-def block_sum_grid(arr: np.ndarray, block_size: int) -> np.ndarray:
-    h, w = arr.shape
-    ny, nx = block_grid_shape(w, h, block_size)
-
-    integ = cv2.integral(arr.astype(np.float64))
-    out = np.zeros((ny, nx), dtype=np.float64)
-
-    for by_idx, by in enumerate(range(0, h, block_size)):
-        y1 = min(by + block_size, h)
-
-        for bx_idx, bx in enumerate(range(0, w, block_size)):
-            x1 = min(bx + block_size, w)
-            s = (
-                integ[y1, x1]
-                - integ[by, x1]
-                - integ[y1, bx]
-                + integ[by, bx]
-            )
-            out[by_idx, bx_idx] = s
-
-    return out
-
-
-def block_mean_grid(arr: np.ndarray, block_size: int) -> np.ndarray:
-    h, w = arr.shape
-    sums = block_sum_grid(arr, block_size)
-    ny, nx = sums.shape
-
-    out = np.zeros_like(sums, dtype=np.float64)
-
-    for by_idx, by in enumerate(range(0, h, block_size)):
-        y1 = min(by + block_size, h)
-
-        for bx_idx, bx in enumerate(range(0, w, block_size)):
-            x1 = min(bx + block_size, w)
-            area = max(1, (y1 - by) * (x1 - bx))
-            out[by_idx, bx_idx] = sums[by_idx, bx_idx] / area
-
-    return out
-
-
-def calc_block_texture(target_y: np.ndarray, block_size: int) -> np.ndarray:
-    target_f = target_y.astype(np.float32)
-    mean = block_mean_grid(target_f, block_size)
-    mean2 = block_mean_grid(target_f * target_f, block_size)
-
-    var = np.maximum(0.0, mean2 - mean * mean)
-    return np.sqrt(var)
-
-
 # ============================================================
-# Feature matching / Homography / ECC
+# Feature matching
 # ============================================================
 
 def detect_and_match_orb(
@@ -332,52 +236,23 @@ def detect_and_match_orb(
     )
 
 
-def estimate_initial_homography(
-    pts_target: np.ndarray,
-    pts_ref: np.ndarray,
-    ransac_thresh: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    H, mask = cv2.findHomography(
-        pts_target,
-        pts_ref,
-        method=cv2.RANSAC,
-        ransacReprojThreshold=ransac_thresh,
-        maxIters=5000,
-        confidence=0.995,
-    )
-
-    if H is None:
-        raise RuntimeError("cv2.findHomography failed.")
-
-    return normalize_homography(H), mask
-
-
 def save_match_vis(
     out_path: str,
     target_y: np.ndarray,
     ref_y: np.ndarray,
     bitdepth: int,
     match_result: MatchResult,
-    inlier_mask: Optional[np.ndarray],
-    max_draw: int = 200,
+    max_draw: int = 300,
 ):
     target_8 = to_8bit(target_y, bitdepth)
     ref_8 = to_8bit(ref_y, bitdepth)
-
-    matches = match_result.good_matches
-
-    if inlier_mask is not None:
-        mask = np.asarray(inlier_mask).reshape(-1) != 0
-        matches = [m for m, ok in zip(matches, mask) if ok]
-
-    matches = matches[:max_draw]
 
     vis = cv2.drawMatches(
         target_8,
         match_result.keypoints_target,
         ref_8,
         match_result.keypoints_ref,
-        matches,
+        match_result.good_matches[:max_draw],
         None,
         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
     )
@@ -385,144 +260,324 @@ def save_match_vis(
     cv2.imwrite(out_path, vis)
 
 
-def scale_homography_for_resized_image(H_full: np.ndarray, scale: float) -> np.ndarray:
-    S = np.array(
-        [
-            [scale, 0.0, 0.0],
-            [0.0, scale, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
+# ============================================================
+# Model fitting
+# ============================================================
+
+def apply_model_points(model_type: str, param: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+
+    if model_type == "translation":
+        dx, dy = float(param[0]), float(param[1])
+        return pts + np.array([dx, dy], dtype=np.float32)
+
+    if model_type in ("partial_affine", "affine"):
+        M = param.reshape(2, 3).astype(np.float64)
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        ph = np.concatenate([pts.astype(np.float64), ones], axis=1)
+        out = ph @ M.T
+        return out.astype(np.float32)
+
+    if model_type == "homography":
+        H = param.reshape(3, 3).astype(np.float64)
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        ph = np.concatenate([pts.astype(np.float64), ones], axis=1)
+        q = ph @ H.T
+        z = q[:, 2:3] + 1e-12
+        out = q[:, :2] / z
+        return out.astype(np.float32)
+
+    raise ValueError(f"Unknown model_type: {model_type}")
+
+
+def model_reproj_stats(
+    model_type: str,
+    param: np.ndarray,
+    pts_t: np.ndarray,
+    pts_r: np.ndarray,
+    thresh: float,
+) -> Tuple[int, float, np.ndarray]:
+    if len(pts_t) == 0:
+        return 0, float("inf"), np.zeros((0,), dtype=bool)
+
+    pred = apply_model_points(model_type, param, pts_t)
+    err = np.sqrt(np.sum((pred - pts_r) ** 2, axis=1))
+    inliers = err <= thresh
+
+    if np.any(inliers):
+        mae = float(np.mean(err[inliers]))
+    else:
+        mae = float(np.mean(err))
+
+    return int(np.count_nonzero(inliers)), mae, inliers
+
+
+def fit_translation(
+    pts_t: np.ndarray,
+    pts_r: np.ndarray,
+    thresh: float,
+    min_matches: int,
+) -> Optional[LocalModel]:
+    n = len(pts_t)
+    if n < min_matches:
+        return None
+
+    d = pts_r - pts_t
+    dx, dy = np.median(d, axis=0)
+
+    param = np.array([dx, dy], dtype=np.float64)
+
+    inlier_count, mae, _ = model_reproj_stats("translation", param, pts_t, pts_r, thresh)
+
+    return LocalModel(
+        ok=inlier_count >= min_matches,
+        model_type="translation",
+        param=param,
+        inlier_count=inlier_count,
+        match_count=n,
+        reproj_mae=mae,
+        center_mv=(0.0, 0.0),
+        valid_ratio=0.0,
+        fallback=False,
+        reason="ok" if inlier_count >= min_matches else "not_enough_translation_inliers",
     )
-    return normalize_homography(S @ H_full @ np.linalg.inv(S))
 
 
-def unscale_homography_to_full_image(H_scaled: np.ndarray, scale: float) -> np.ndarray:
-    S = np.array(
-        [
-            [scale, 0.0, 0.0],
-            [0.0, scale, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    return normalize_homography(np.linalg.inv(S) @ H_scaled @ S)
-
-
-def preprocess_ecc(img: np.ndarray, blur_ksize: int) -> np.ndarray:
-    out = img.astype(np.float32)
-
-    if blur_ksize > 0:
-        if blur_ksize % 2 == 0:
-            blur_ksize += 1
-        out = cv2.GaussianBlur(out, (blur_ksize, blur_ksize), 0)
-
-    return out.astype(np.float32)
-
-
-def refine_homography_ecc(
-    H_init_full: np.ndarray,
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    bitdepth: int,
-    iters: int,
-    eps: float,
-    scale: float,
-    blur_ksize: int,
-) -> Tuple[np.ndarray, dict]:
-    meta = {
-        "enabled": bool(iters > 0),
-        "success": False,
-        "cc": None,
-        "iters": int(iters),
-        "eps": float(eps),
-        "scale": float(scale),
-        "blur_ksize": int(blur_ksize),
-        "error": None,
-    }
-
-    H_init_full = normalize_homography(H_init_full)
-
-    if iters <= 0:
-        return H_init_full, meta
-
-    if scale <= 0.0 or scale > 1.0:
-        raise ValueError("--h-refine-scale must be in (0, 1].")
-
-    target_f = resize_frame(to_float_ecc(target_y, bitdepth), scale)
-    ref_f = resize_frame(to_float_ecc(ref_y, bitdepth), scale)
-
-    target_f = preprocess_ecc(target_f, blur_ksize)
-    ref_f = preprocess_ecc(ref_f, blur_ksize)
-
-    H_scaled = scale_homography_for_resized_image(H_init_full, scale).astype(np.float32)
-
-    criteria = (
-        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-        int(iters),
-        float(eps),
-    )
+def fit_partial_affine(
+    pts_t: np.ndarray,
+    pts_r: np.ndarray,
+    thresh: float,
+    min_matches: int,
+) -> Optional[LocalModel]:
+    n = len(pts_t)
+    if n < min_matches:
+        return None
 
     try:
-        try:
-            cc, warp_refined = cv2.findTransformECC(
-                target_f,
-                ref_f,
-                H_scaled,
-                cv2.MOTION_HOMOGRAPHY,
-                criteria,
-                None,
-                5,
-            )
-        except TypeError:
-            cc, warp_refined = cv2.findTransformECC(
-                target_f,
-                ref_f,
-                H_scaled,
-                cv2.MOTION_HOMOGRAPHY,
-                criteria,
-            )
+        M, inlier_mask = cv2.estimateAffinePartial2D(
+            pts_t,
+            pts_r,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=thresh,
+            maxIters=2000,
+            confidence=0.99,
+            refineIters=10,
+        )
+    except cv2.error:
+        return None
 
-        H_refined = unscale_homography_to_full_image(warp_refined.astype(np.float64), scale)
-        meta["success"] = True
-        meta["cc"] = float(cc)
+    if M is None:
+        return None
 
-        return H_refined, meta
+    param = M.astype(np.float64).reshape(-1)
+    inlier_count, mae, _ = model_reproj_stats("partial_affine", param, pts_t, pts_r, thresh)
 
-    except cv2.error as e:
-        meta["error"] = str(e)
-        return H_init_full, meta
-
-
-# ============================================================
-# Homography mapping
-# ============================================================
-
-def homography_maps(H: np.ndarray, width: int, height: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    H = normalize_homography(H)
-
-    xs, ys = np.meshgrid(
-        np.arange(width, dtype=np.float32),
-        np.arange(height, dtype=np.float32),
+    return LocalModel(
+        ok=inlier_count >= min_matches,
+        model_type="partial_affine",
+        param=param,
+        inlier_count=inlier_count,
+        match_count=n,
+        reproj_mae=mae,
+        center_mv=(0.0, 0.0),
+        valid_ratio=0.0,
+        fallback=False,
+        reason="ok" if inlier_count >= min_matches else "not_enough_partial_affine_inliers",
     )
 
-    denom = H[2, 0] * xs + H[2, 1] * ys + H[2, 2]
-    valid_denom = np.abs(denom) > 1e-9
 
-    denom_safe = denom + 1e-12
+def fit_affine(
+    pts_t: np.ndarray,
+    pts_r: np.ndarray,
+    thresh: float,
+    min_matches: int,
+) -> Optional[LocalModel]:
+    n = len(pts_t)
+    if n < min_matches:
+        return None
 
-    map_x = (H[0, 0] * xs + H[0, 1] * ys + H[0, 2]) / denom_safe
-    map_y = (H[1, 0] * xs + H[1, 1] * ys + H[1, 2]) / denom_safe
+    try:
+        M, inlier_mask = cv2.estimateAffine2D(
+            pts_t,
+            pts_r,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=thresh,
+            maxIters=2000,
+            confidence=0.99,
+            refineIters=10,
+        )
+    except cv2.error:
+        return None
+
+    if M is None:
+        return None
+
+    param = M.astype(np.float64).reshape(-1)
+    inlier_count, mae, _ = model_reproj_stats("affine", param, pts_t, pts_r, thresh)
+
+    return LocalModel(
+        ok=inlier_count >= min_matches,
+        model_type="affine",
+        param=param,
+        inlier_count=inlier_count,
+        match_count=n,
+        reproj_mae=mae,
+        center_mv=(0.0, 0.0),
+        valid_ratio=0.0,
+        fallback=False,
+        reason="ok" if inlier_count >= min_matches else "not_enough_affine_inliers",
+    )
+
+
+def fit_homography(
+    pts_t: np.ndarray,
+    pts_r: np.ndarray,
+    thresh: float,
+    min_matches: int,
+) -> Optional[LocalModel]:
+    n = len(pts_t)
+    if n < min_matches:
+        return None
+
+    try:
+        H, mask = cv2.findHomography(
+            pts_t,
+            pts_r,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=thresh,
+            maxIters=2000,
+            confidence=0.99,
+        )
+    except cv2.error:
+        return None
+
+    if H is None:
+        return None
+
+    if abs(H[2, 2]) > 1e-12:
+        H = H / H[2, 2]
+
+    param = H.astype(np.float64).reshape(-1)
+    inlier_count, mae, _ = model_reproj_stats("homography", param, pts_t, pts_r, thresh)
+
+    return LocalModel(
+        ok=inlier_count >= min_matches,
+        model_type="homography",
+        param=param,
+        inlier_count=inlier_count,
+        match_count=n,
+        reproj_mae=mae,
+        center_mv=(0.0, 0.0),
+        valid_ratio=0.0,
+        fallback=False,
+        reason="ok" if inlier_count >= min_matches else "not_enough_homography_inliers",
+    )
+
+
+def choose_local_model(
+    pts_t: np.ndarray,
+    pts_r: np.ndarray,
+    fit_model: str,
+    allow_homography_in_auto: bool,
+    ransac_thresh: float,
+    min_matches_translation: int,
+    min_matches_affine: int,
+    min_matches_homography: int,
+) -> Optional[LocalModel]:
+    candidates: List[LocalModel] = []
+
+    tr = fit_translation(pts_t, pts_r, ransac_thresh, min_matches_translation)
+    if tr is not None and tr.ok:
+        candidates.append(tr)
+
+    if fit_model in ("partial_affine", "auto"):
+        pa = fit_partial_affine(pts_t, pts_r, ransac_thresh, min_matches_affine)
+        if pa is not None and pa.ok:
+            candidates.append(pa)
+
+    if fit_model in ("affine", "auto"):
+        af = fit_affine(pts_t, pts_r, ransac_thresh, min_matches_affine)
+        if af is not None and af.ok:
+            candidates.append(af)
+
+    if fit_model == "homography" or (fit_model == "auto" and allow_homography_in_auto):
+        hg = fit_homography(pts_t, pts_r, ransac_thresh, min_matches_homography)
+        if hg is not None and hg.ok:
+            candidates.append(hg)
+
+    if fit_model == "translation":
+        return tr if tr is not None and tr.ok else None
+
+    if fit_model == "partial_affine":
+        pa = fit_partial_affine(pts_t, pts_r, ransac_thresh, min_matches_affine)
+        return pa if pa is not None and pa.ok else tr
+
+    if fit_model == "affine":
+        af = fit_affine(pts_t, pts_r, ransac_thresh, min_matches_affine)
+        return af if af is not None and af.ok else tr
+
+    if fit_model == "homography":
+        hg = fit_homography(pts_t, pts_r, ransac_thresh, min_matches_homography)
+        if hg is not None and hg.ok:
+            return hg
+        af = fit_affine(pts_t, pts_r, ransac_thresh, min_matches_affine)
+        if af is not None and af.ok:
+            return af
+        return tr
+
+    if not candidates:
+        return None
+
+    # Conservative model selection.
+    # Penalize high-DOF models so they are selected only when they really improve reprojection error.
+    penalty = {
+        "translation": 0.75,
+        "partial_affine": 1.00,
+        "affine": 1.25,
+        "homography": 2.50,
+    }
+
+    def score(m: LocalModel):
+        inlier_ratio = m.inlier_count / max(m.match_count, 1)
+        return m.reproj_mae + penalty.get(m.model_type, 1.0) - 0.5 * inlier_ratio
+
+    candidates.sort(key=score)
+    return candidates[0]
+
+
+# ============================================================
+# Map generation and prediction
+# ============================================================
+
+def model_maps_for_roi(
+    model_type: str,
+    param: np.ndarray,
+    bx: int,
+    by: int,
+    bw: int,
+    bh: int,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    xs, ys = np.meshgrid(
+        np.arange(bx, bx + bw, dtype=np.float32),
+        np.arange(by, by + bh, dtype=np.float32),
+    )
+
+    pts = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=1)
+    out = apply_model_points(model_type, param, pts)
+
+    mx = out[:, 0].reshape(bh, bw).astype(np.float32)
+    my = out[:, 1].reshape(bh, bw).astype(np.float32)
 
     valid = (
-        valid_denom
-        & (map_x >= 0.0)
-        & (map_x <= width - 1.0)
-        & (map_y >= 0.0)
-        & (map_y <= height - 1.0)
+        (mx >= 0.0)
+        & (mx <= width - 1.0)
+        & (my >= 0.0)
+        & (my <= height - 1.0)
     )
 
-    return map_x.astype(np.float32), map_y.astype(np.float32), valid
+    return mx, my, valid
 
 
 def remap_ref(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
@@ -535,496 +590,6 @@ def remap_ref(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.nda
         borderValue=0,
     )
 
-
-# ============================================================
-# Block residual MV search around homography
-# ============================================================
-
-def candidate_shifts(search_range: float, search_step: float) -> List[Tuple[float, float]]:
-    vals = np.arange(-search_range, search_range + 1e-9, search_step, dtype=np.float32)
-    shifts = []
-
-    for dy in vals:
-        for dx in vals:
-            shifts.append((float(dx), float(dy)))
-
-    return shifts
-
-
-def estimate_block_residual_mv(
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    map_x_H: np.ndarray,
-    map_y_H: np.ndarray,
-    valid_H: np.ndarray,
-    block_size: int,
-    search_range: float,
-    search_step: float,
-    min_block_valid_ratio: float,
-    min_texture: float,
-    min_gap: float,
-) -> BlockResidualResult:
-    h, w = target_y.shape
-    ny, nx = block_grid_shape(w, h, block_size)
-
-    target_f = target_y.astype(np.float32)
-
-    texture_grid = calc_block_texture(target_y, block_size)
-
-    best_cost = np.full((ny, nx), np.inf, dtype=np.float64)
-    second_cost = np.full((ny, nx), np.inf, dtype=np.float64)
-    best_dx = np.zeros((ny, nx), dtype=np.float64)
-    best_dy = np.zeros((ny, nx), dtype=np.float64)
-    best_valid_ratio = np.zeros((ny, nx), dtype=np.float64)
-
-    shifts = candidate_shifts(search_range, search_step)
-    print(f"[INFO] residual MV candidate shifts = {len(shifts)}")
-
-    for idx, (dx, dy) in enumerate(shifts):
-        if idx % max(1, len(shifts) // 10) == 0:
-            print(f"[BM] shift {idx + 1}/{len(shifts)} dx={dx} dy={dy}")
-
-        map_x = map_x_H + dx
-        map_y = map_y_H + dy
-
-        valid = (
-            valid_H
-            & (map_x >= 0.0)
-            & (map_x <= w - 1.0)
-            & (map_y >= 0.0)
-            & (map_y <= h - 1.0)
-        )
-
-        pred = remap_ref(ref_y, map_x, map_y)
-        diff = np.abs(target_f - pred)
-
-        diff_sum = block_sum_grid(diff * valid.astype(np.float32), block_size)
-        valid_sum = block_sum_grid(valid.astype(np.float32), block_size)
-
-        for by_idx, by in enumerate(range(0, h, block_size)):
-            y1 = min(by + block_size, h)
-
-            for bx_idx, bx in enumerate(range(0, w, block_size)):
-                x1 = min(bx + block_size, w)
-                area = max(1, (y1 - by) * (x1 - bx))
-
-                valid_ratio = valid_sum[by_idx, bx_idx] / area
-
-                if valid_ratio < min_block_valid_ratio:
-                    continue
-
-                cost = diff_sum[by_idx, bx_idx] / max(valid_sum[by_idx, bx_idx], 1.0)
-
-                if cost < best_cost[by_idx, bx_idx]:
-                    second_cost[by_idx, bx_idx] = best_cost[by_idx, bx_idx]
-                    best_cost[by_idx, bx_idx] = cost
-                    best_dx[by_idx, bx_idx] = dx
-                    best_dy[by_idx, bx_idx] = dy
-                    best_valid_ratio[by_idx, bx_idx] = valid_ratio
-                elif cost < second_cost[by_idx, bx_idx]:
-                    second_cost[by_idx, bx_idx] = cost
-
-    gap = second_cost - best_cost
-
-    reliable = (
-        np.isfinite(best_cost)
-        & (best_valid_ratio >= min_block_valid_ratio)
-        & (texture_grid >= min_texture)
-        & (gap >= min_gap)
-    )
-
-    pred_block = np.zeros_like(target_f, dtype=np.float32)
-    valid_block = np.zeros_like(target_y, dtype=bool)
-
-    for by_idx, by in enumerate(range(0, h, block_size)):
-        y1 = min(by + block_size, h)
-
-        for bx_idx, bx in enumerate(range(0, w, block_size)):
-            x1 = min(bx + block_size, w)
-
-            dx = best_dx[by_idx, bx_idx]
-            dy = best_dy[by_idx, bx_idx]
-
-            mx = map_x_H[by:y1, bx:x1] + dx
-            my = map_y_H[by:y1, bx:x1] + dy
-
-            v = (
-                valid_H[by:y1, bx:x1]
-                & (mx >= 0.0)
-                & (mx <= w - 1.0)
-                & (my >= 0.0)
-                & (my <= h - 1.0)
-            )
-
-            pred_roi = remap_ref(ref_y, mx.astype(np.float32), my.astype(np.float32))
-
-            pred_block[by:y1, bx:x1] = pred_roi
-            valid_block[by:y1, bx:x1] = v
-
-    return BlockResidualResult(
-        dx_grid=best_dx,
-        dy_grid=best_dy,
-        cost_grid=best_cost,
-        second_cost_grid=second_cost,
-        gap_grid=gap,
-        valid_ratio_grid=best_valid_ratio,
-        texture_grid=texture_grid,
-        reliable_grid=reliable,
-        pred_block_mv=pred_block,
-        valid_block_mv=valid_block,
-    )
-
-
-# ============================================================
-# Polynomial basis fitting
-# ============================================================
-
-def normalized_xy_pixel_grid(width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
-    xs, ys = np.meshgrid(
-        np.arange(width, dtype=np.float32),
-        np.arange(height, dtype=np.float32),
-    )
-
-    if width > 1:
-        xn = (xs / (width - 1.0)) * 2.0 - 1.0
-    else:
-        xn = np.zeros_like(xs)
-
-    if height > 1:
-        yn = (ys / (height - 1.0)) * 2.0 - 1.0
-    else:
-        yn = np.zeros_like(ys)
-
-    return xn.astype(np.float32), yn.astype(np.float32)
-
-
-def block_center_normalized_grid(width: int, height: int, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
-    ny, nx = block_grid_shape(width, height, block_size)
-
-    cx = np.zeros((ny, nx), dtype=np.float64)
-    cy = np.zeros((ny, nx), dtype=np.float64)
-
-    for by_idx, by in enumerate(range(0, height, block_size)):
-        y1 = min(by + block_size, height)
-        yy = 0.5 * (by + y1 - 1.0)
-
-        for bx_idx, bx in enumerate(range(0, width, block_size)):
-            x1 = min(bx + block_size, width)
-            xx = 0.5 * (bx + x1 - 1.0)
-
-            cx[by_idx, bx_idx] = (xx / max(width - 1.0, 1.0)) * 2.0 - 1.0
-            cy[by_idx, bx_idx] = (yy / max(height - 1.0, 1.0)) * 2.0 - 1.0
-
-    return cx, cy
-
-
-def poly_features(x: np.ndarray, y: np.ndarray, degree: int) -> np.ndarray:
-    x = np.asarray(x)
-    y = np.asarray(y)
-
-    if degree == 0:
-        return np.stack([np.ones_like(x)], axis=-1)
-
-    if degree == 1:
-        return np.stack(
-            [
-                np.ones_like(x),
-                x,
-                y,
-            ],
-            axis=-1,
-        )
-
-    if degree == 2:
-        return np.stack(
-            [
-                np.ones_like(x),
-                x,
-                y,
-                x * x,
-                x * y,
-                y * y,
-            ],
-            axis=-1,
-        )
-
-    raise ValueError("--basis-degree must be 0, 1, or 2.")
-
-
-def weighted_lstsq(A: np.ndarray, b: np.ndarray, w: np.ndarray) -> np.ndarray:
-    w = np.maximum(w.astype(np.float64), 1e-12)
-    sw = np.sqrt(w)
-
-    Aw = A * sw[:, None]
-    bw = b * sw
-
-    coef, _, _, _ = np.linalg.lstsq(Aw, bw, rcond=None)
-    return coef.astype(np.float64)
-
-
-def fit_polynomial_residual_basis(
-    dx_grid: np.ndarray,
-    dy_grid: np.ndarray,
-    reliable_grid: np.ndarray,
-    cost_grid: np.ndarray,
-    gap_grid: np.ndarray,
-    texture_grid: np.ndarray,
-    width: int,
-    height: int,
-    block_size: int,
-    degree: int,
-    robust_iters: int,
-    min_fit_blocks: int,
-) -> BasisFitResult:
-    ny, nx = dx_grid.shape
-
-    cx, cy = block_center_normalized_grid(width, height, block_size)
-    A_all = poly_features(cx.reshape(-1), cy.reshape(-1), degree).astype(np.float64)
-
-    dx_all = dx_grid.reshape(-1).astype(np.float64)
-    dy_all = dy_grid.reshape(-1).astype(np.float64)
-    reliable = reliable_grid.reshape(-1).astype(bool)
-
-    finite = np.isfinite(dx_all) & np.isfinite(dy_all) & np.isfinite(cost_grid.reshape(-1))
-    mask = reliable & finite
-
-    if np.count_nonzero(mask) < min_fit_blocks:
-        print("[WARN] Not enough reliable blocks for polynomial fit. Falling back to all finite blocks.")
-        mask = finite
-
-    if np.count_nonzero(mask) < max(3, min_fit_blocks):
-        print("[WARN] Still not enough blocks. Using mean residual fallback.")
-
-        mean_dx = float(np.mean(dx_all[finite])) if np.any(finite) else 0.0
-        mean_dy = float(np.mean(dy_all[finite])) if np.any(finite) else 0.0
-
-        ncoef = poly_features(np.array([0.0]), np.array([0.0]), degree).shape[-1]
-        coef_x = np.zeros(ncoef, dtype=np.float64)
-        coef_y = np.zeros(ncoef, dtype=np.float64)
-        coef_x[0] = mean_dx
-        coef_y[0] = mean_dy
-
-        fit_mask = finite.reshape(ny, nx)
-        weights = fit_mask.astype(np.float64)
-
-    else:
-        A = A_all[mask]
-        bx = dx_all[mask]
-        by = dy_all[mask]
-
-        # Base reliability weights.
-        gap = gap_grid.reshape(-1)[mask].astype(np.float64)
-        tex = texture_grid.reshape(-1)[mask].astype(np.float64)
-        cost = cost_grid.reshape(-1)[mask].astype(np.float64)
-
-        w = np.ones_like(bx, dtype=np.float64)
-        w *= np.clip(gap / (np.median(gap) + 1e-6), 0.25, 4.0)
-        w *= np.clip(tex / (np.median(tex) + 1e-6), 0.25, 4.0)
-        w *= np.clip((np.median(cost) + 1e-6) / (cost + 1e-6), 0.25, 4.0)
-
-        coef_x = None
-        coef_y = None
-
-        for it in range(max(1, robust_iters)):
-            coef_x = weighted_lstsq(A, bx, w)
-            coef_y = weighted_lstsq(A, by, w)
-
-            pred_x = A @ coef_x
-            pred_y = A @ coef_y
-            err = np.sqrt((bx - pred_x) ** 2 + (by - pred_y) ** 2)
-
-            med = np.median(err)
-            sigma = 1.4826 * np.median(np.abs(err - med)) + 1e-6
-            huber = np.minimum(1.0, (2.5 * sigma) / (err + 1e-6))
-            w = w * huber
-
-        fit_mask = mask.reshape(ny, nx)
-        weights = np.zeros(ny * nx, dtype=np.float64)
-        weights[mask] = w
-        weights = weights.reshape(ny, nx)
-
-    # Evaluate basis on pixels.
-    xn, yn = normalized_xy_pixel_grid(width, height)
-    A_pix = poly_features(xn, yn, degree)
-    basis_x = np.tensordot(A_pix, coef_x, axes=([-1], [0])).astype(np.float32)
-    basis_y = np.tensordot(A_pix, coef_y, axes=([-1], [0])).astype(np.float32)
-
-    # Evaluate basis at block centers.
-    A_blk = poly_features(cx, cy, degree)
-    basis_x_blk = np.tensordot(A_blk, coef_x, axes=([-1], [0])).astype(np.float64)
-    basis_y_blk = np.tensordot(A_blk, coef_y, axes=([-1], [0])).astype(np.float64)
-
-    # Normalize basis RMS to 1 pixel, so c_b roughly means residual strength in pixels.
-    mag2 = basis_x_blk * basis_x_blk + basis_y_blk * basis_y_blk
-    if np.any(fit_mask):
-        rms = math.sqrt(float(np.mean(mag2[fit_mask])))
-    else:
-        rms = math.sqrt(float(np.mean(mag2)))
-
-    norm_scale = max(rms, 1e-6)
-
-    basis_x /= norm_scale
-    basis_y /= norm_scale
-    basis_x_blk /= norm_scale
-    basis_y_blk /= norm_scale
-    coef_x = coef_x / norm_scale
-    coef_y = coef_y / norm_scale
-
-    # Fit error grid after normalization, with scalar projection allowed.
-    fit_error = np.full((ny, nx), np.inf, dtype=np.float64)
-
-    denom = basis_x_blk * basis_x_blk + basis_y_blk * basis_y_blk + 1e-12
-    c_ls = (dx_grid * basis_x_blk + dy_grid * basis_y_blk) / denom
-
-    pred_dx = c_ls * basis_x_blk
-    pred_dy = c_ls * basis_y_blk
-
-    err_grid = np.sqrt((dx_grid - pred_dx) ** 2 + (dy_grid - pred_dy) ** 2)
-    fit_error[np.isfinite(err_grid)] = err_grid[np.isfinite(err_grid)]
-
-    return BasisFitResult(
-        coef_x=coef_x,
-        coef_y=coef_y,
-        norm_scale=float(norm_scale),
-        basis_x=basis_x.astype(np.float32),
-        basis_y=basis_y.astype(np.float32),
-        basis_x_block=basis_x_blk.astype(np.float64),
-        basis_y_block=basis_y_blk.astype(np.float64),
-        fit_mask=fit_mask,
-        fit_weights=weights.astype(np.float64),
-        fit_error_grid=fit_error,
-        num_fit_blocks=int(np.count_nonzero(fit_mask)),
-    )
-
-
-# ============================================================
-# Scalar c search
-# ============================================================
-
-def estimate_initial_c_grid_from_observed_residual(
-    dx_grid: np.ndarray,
-    dy_grid: np.ndarray,
-    basis_x_blk: np.ndarray,
-    basis_y_blk: np.ndarray,
-    c_min: float,
-    c_max: float,
-) -> np.ndarray:
-    denom = basis_x_blk * basis_x_blk + basis_y_blk * basis_y_blk + 1e-12
-    c = (dx_grid * basis_x_blk + dy_grid * basis_y_blk) / denom
-    return np.clip(c, c_min, c_max).astype(np.float64)
-
-
-def c_candidates(center: float, refine_range: float, samples: int, c_min: float, c_max: float) -> np.ndarray:
-    if samples <= 1 or refine_range <= 1e-12:
-        return np.array([np.clip(center, c_min, c_max)], dtype=np.float64)
-
-    lo = max(c_min, center - refine_range)
-    hi = min(c_max, center + refine_range)
-
-    if abs(hi - lo) < 1e-12:
-        return np.array([0.5 * (lo + hi)], dtype=np.float64)
-
-    return np.linspace(lo, hi, samples, dtype=np.float64)
-
-
-def predict_with_basis_scalar(
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    map_x_H: np.ndarray,
-    map_y_H: np.ndarray,
-    valid_H: np.ndarray,
-    basis_x: np.ndarray,
-    basis_y: np.ndarray,
-    c_center_grid: np.ndarray,
-    block_size: int,
-    c_refine_range: float,
-    c_samples: int,
-    c_min: float,
-    c_max: float,
-    min_block_valid_ratio: float,
-) -> ScalarPredictResult:
-    h, w = target_y.shape
-    ny, nx = block_grid_shape(w, h, block_size)
-
-    target_f = target_y.astype(np.float32)
-
-    c_grid = np.zeros((ny, nx), dtype=np.float64)
-    cost_grid = np.full((ny, nx), np.inf, dtype=np.float64)
-    valid_ratio_grid = np.zeros((ny, nx), dtype=np.float64)
-
-    pred_out = np.zeros((h, w), dtype=np.float32)
-    valid_out = np.zeros((h, w), dtype=bool)
-
-    for by_idx, by in enumerate(range(0, h, block_size)):
-        y1 = min(by + block_size, h)
-
-        for bx_idx, bx in enumerate(range(0, w, block_size)):
-            x1 = min(bx + block_size, w)
-
-            center = float(c_center_grid[by_idx, bx_idx])
-            cand_list = c_candidates(center, c_refine_range, c_samples, c_min, c_max)
-
-            best_cost = float("inf")
-            best_c = center
-            best_pred = None
-            best_valid = None
-            best_valid_ratio = 0.0
-
-            target_roi = target_f[by:y1, bx:x1]
-
-            Hx = map_x_H[by:y1, bx:x1]
-            Hy = map_y_H[by:y1, bx:x1]
-            Vh = valid_H[by:y1, bx:x1]
-            Bx = basis_x[by:y1, bx:x1]
-            By = basis_y[by:y1, bx:x1]
-
-            for c in cand_list:
-                mx = Hx + float(c) * Bx
-                my = Hy + float(c) * By
-
-                valid = (
-                    Vh
-                    & (mx >= 0.0)
-                    & (mx <= w - 1.0)
-                    & (my >= 0.0)
-                    & (my <= h - 1.0)
-                )
-
-                valid_ratio = float(np.mean(valid))
-
-                if valid_ratio < min_block_valid_ratio or not np.any(valid):
-                    continue
-
-                pred_roi = remap_ref(ref_y, mx.astype(np.float32), my.astype(np.float32))
-                cost = float(np.mean(np.abs(target_roi[valid] - pred_roi[valid])))
-
-                if cost < best_cost:
-                    best_cost = cost
-                    best_c = float(c)
-                    best_pred = pred_roi
-                    best_valid = valid
-                    best_valid_ratio = valid_ratio
-
-            c_grid[by_idx, bx_idx] = best_c
-            cost_grid[by_idx, bx_idx] = best_cost
-            valid_ratio_grid[by_idx, bx_idx] = best_valid_ratio
-
-            if best_pred is not None and best_valid is not None:
-                pred_out[by:y1, bx:x1] = best_pred
-                valid_out[by:y1, bx:x1] = best_valid
-
-    return ScalarPredictResult(
-        c_grid=c_grid,
-        cost_grid=cost_grid,
-        valid_ratio_grid=valid_ratio_grid,
-        pred=pred_out,
-        valid=valid_out,
-    )
-
-
-# ============================================================
-# Cost / Visualization
-# ============================================================
 
 def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, bitdepth: int) -> dict:
     valid_ratio = float(np.mean(valid))
@@ -1053,8 +618,258 @@ def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, bitde
     }
 
 
+# ============================================================
+# Aggregation models
+# ============================================================
+
+def fit_global_translation_from_matches(pts_t: np.ndarray, pts_r: np.ndarray) -> np.ndarray:
+    d = pts_r - pts_t
+    dx, dy = np.median(d, axis=0)
+    return np.array([dx, dy], dtype=np.float64)
+
+
+def fit_global_affine_from_block_mvs(
+    centers: np.ndarray,
+    mvs: np.ndarray,
+    weights: np.ndarray,
+    ransac_thresh: float,
+) -> Optional[np.ndarray]:
+    if len(centers) < 6:
+        return None
+
+    pts_t = centers.astype(np.float32)
+    pts_r = (centers + mvs).astype(np.float32)
+
+    try:
+        M, mask = cv2.estimateAffine2D(
+            pts_t,
+            pts_r,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_thresh,
+            maxIters=3000,
+            confidence=0.99,
+            refineIters=10,
+        )
+    except cv2.error:
+        return None
+
+    if M is None:
+        return None
+
+    return M.astype(np.float64).reshape(-1)
+
+
+def fit_foe_from_block_mvs(
+    centers: np.ndarray,
+    mvs: np.ndarray,
+    weights: np.ndarray,
+    width: int,
+    height: int,
+    min_mv_mag: float,
+) -> Tuple[np.ndarray, dict]:
+    rows = []
+    rhs = []
+    ws = []
+
+    for p, v, w in zip(centers, mvs, weights):
+        dx, dy = float(v[0]), float(v[1])
+        mag = math.sqrt(dx * dx + dy * dy)
+
+        if mag < min_mv_mag:
+            continue
+
+        # FOE lies on the line passing through p with direction v.
+        # normal n = [-dy, dx]
+        # n dot foe = n dot p
+        n = np.array([-dy, dx], dtype=np.float64)
+        n_norm = np.linalg.norm(n)
+
+        if n_norm < 1e-9:
+            continue
+
+        n = n / n_norm
+
+        rows.append(n)
+        rhs.append(float(n @ p))
+        ws.append(max(float(w), 1e-6))
+
+    meta = {
+        "num_equations": len(rows),
+        "success": False,
+        "fallback": False,
+    }
+
+    if len(rows) < 4:
+        meta["fallback"] = True
+        foe = np.array([(width - 1.0) * 0.5, (height - 1.0) * 0.5], dtype=np.float64)
+        return foe, meta
+
+    A = np.stack(rows, axis=0)
+    b = np.array(rhs, dtype=np.float64)
+    w = np.array(ws, dtype=np.float64)
+    sw = np.sqrt(w)
+
+    Aw = A * sw[:, None]
+    bw = b * sw
+
+    try:
+        foe, _, _, _ = np.linalg.lstsq(Aw, bw, rcond=None)
+    except np.linalg.LinAlgError:
+        meta["fallback"] = True
+        foe = np.array([(width - 1.0) * 0.5, (height - 1.0) * 0.5], dtype=np.float64)
+        return foe, meta
+
+    meta["success"] = True
+    meta["foe_x"] = float(foe[0])
+    meta["foe_y"] = float(foe[1])
+
+    return foe.astype(np.float64), meta
+
+
+def make_full_affine_prediction(
+    target_y: np.ndarray,
+    ref_y: np.ndarray,
+    width: int,
+    height: int,
+    affine_param: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    xs, ys = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+
+    pts = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=1)
+    out = apply_model_points("affine", affine_param, pts)
+
+    mx = out[:, 0].reshape(height, width).astype(np.float32)
+    my = out[:, 1].reshape(height, width).astype(np.float32)
+
+    valid = (
+        (mx >= 0.0)
+        & (mx <= width - 1.0)
+        & (my >= 0.0)
+        & (my <= height - 1.0)
+    )
+
+    pred = remap_ref(ref_y, mx, my)
+    return pred, valid
+
+
+def make_radial_scalar_prediction(
+    target_y: np.ndarray,
+    ref_y: np.ndarray,
+    width: int,
+    height: int,
+    block_size: int,
+    foe: np.ndarray,
+    center_mv_grid_x: np.ndarray,
+    center_mv_grid_y: np.ndarray,
+    reliable_grid: np.ndarray,
+    c_clip: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ny, nx = block_grid_shape(width, height, block_size)
+
+    c_grid = np.zeros((ny, nx), dtype=np.float64)
+
+    # Estimate c_b from observed block center MV:
+    #   mv ≈ c * (center - foe)
+    for by_idx, by in enumerate(range(0, height, block_size)):
+        y1 = min(by + block_size, height)
+        cy = 0.5 * (by + y1 - 1.0)
+
+        for bx_idx, bx in enumerate(range(0, width, block_size)):
+            x1 = min(bx + block_size, width)
+            cx = 0.5 * (bx + x1 - 1.0)
+
+            r = np.array([cx - foe[0], cy - foe[1]], dtype=np.float64)
+            mv = np.array([center_mv_grid_x[by_idx, bx_idx], center_mv_grid_y[by_idx, bx_idx]], dtype=np.float64)
+
+            denom = float(r @ r) + 1e-12
+            c = float((mv @ r) / denom)
+
+            c_grid[by_idx, bx_idx] = np.clip(c, -c_clip, c_clip)
+
+    # Fill unreliable blocks with median reliable c.
+    if np.any(reliable_grid):
+        med_c = float(np.median(c_grid[reliable_grid]))
+    else:
+        med_c = 0.0
+
+    c_grid[~reliable_grid] = med_c
+
+    pred = np.zeros((height, width), dtype=np.float32)
+    valid = np.zeros((height, width), dtype=bool)
+
+    for by_idx, by in enumerate(range(0, height, block_size)):
+        y1 = min(by + block_size, height)
+
+        for bx_idx, bx in enumerate(range(0, width, block_size)):
+            x1 = min(bx + block_size, width)
+
+            c = float(c_grid[by_idx, bx_idx])
+
+            xs, ys = np.meshgrid(
+                np.arange(bx, x1, dtype=np.float32),
+                np.arange(by, y1, dtype=np.float32),
+            )
+
+            mx = xs + c * (xs - float(foe[0]))
+            my = ys + c * (ys - float(foe[1]))
+
+            v = (
+                (mx >= 0.0)
+                & (mx <= width - 1.0)
+                & (my >= 0.0)
+                & (my <= height - 1.0)
+            )
+
+            pred_roi = remap_ref(ref_y, mx.astype(np.float32), my.astype(np.float32))
+
+            pred[by:y1, bx:x1] = pred_roi
+            valid[by:y1, bx:x1] = v
+
+    return pred, valid, c_grid
+
+
+# ============================================================
+# Visualization
+# ============================================================
+
 def save_gray_png(path: str, y: np.ndarray, bitdepth: int):
     cv2.imwrite(path, to_8bit(y, bitdepth))
+
+
+def expand_grid_to_image(grid: np.ndarray, width: int, height: int, block_size: int) -> np.ndarray:
+    out = np.zeros((height, width), dtype=np.float32)
+
+    for by_idx, by in enumerate(range(0, height, block_size)):
+        y1 = min(by + block_size, height)
+
+        for bx_idx, bx in enumerate(range(0, width, block_size)):
+            x1 = min(bx + block_size, width)
+            out[by:y1, bx:x1] = float(grid[by_idx, bx_idx])
+
+    return out
+
+
+def save_scalar_map_png(path: str, grid: np.ndarray, width: int, height: int, block_size: int):
+    img = expand_grid_to_image(grid, width, height, block_size)
+
+    finite = np.isfinite(img)
+    if not np.any(finite):
+        out = np.zeros_like(img, dtype=np.uint8)
+    else:
+        vals = img[finite]
+        lo = float(np.percentile(vals, 1))
+        hi = float(np.percentile(vals, 99))
+
+        if abs(hi - lo) < 1e-12:
+            out = np.full_like(img, 128, dtype=np.uint8)
+        else:
+            out = np.clip((img - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+    color = cv2.applyColorMap(out, cv2.COLORMAP_TURBO)
+    cv2.imwrite(path, color)
 
 
 def save_diff_png(path: str, target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray):
@@ -1074,39 +889,11 @@ def save_diff_png(path: str, target_y: np.ndarray, pred_y: np.ndarray, valid: np
     cv2.imwrite(path, color)
 
 
-def expand_grid_to_image(grid: np.ndarray, width: int, height: int, block_size: int) -> np.ndarray:
-    ny, nx = grid.shape
-    out = np.zeros((height, width), dtype=np.float32)
-
-    for by_idx, by in enumerate(range(0, height, block_size)):
-        y1 = min(by + block_size, height)
-
-        for bx_idx, bx in enumerate(range(0, width, block_size)):
-            x1 = min(bx + block_size, width)
-            out[by:y1, bx:x1] = float(grid[by_idx, bx_idx])
-
-    return out
-
-
-def save_scalar_map_png(path: str, grid: np.ndarray, width: int, height: int, block_size: int):
-    img = expand_grid_to_image(grid, width, height, block_size)
-
-    vmin = float(np.percentile(img, 1))
-    vmax = float(np.percentile(img, 99))
-
-    if abs(vmax - vmin) < 1e-12:
-        out = np.full_like(img, 128, dtype=np.uint8)
-    else:
-        out = np.clip((img - vmin) / (vmax - vmin) * 255.0, 0, 255).astype(np.uint8)
-
-    color = cv2.applyColorMap(out, cv2.COLORMAP_TURBO)
-    cv2.imwrite(path, color)
-
-
-def save_vector_field_png(
+def save_mv_field_png(
     path: str,
-    vx_grid: np.ndarray,
-    vy_grid: np.ndarray,
+    mvx: np.ndarray,
+    mvy: np.ndarray,
+    reliable: np.ndarray,
     width: int,
     height: int,
     block_size: int,
@@ -1114,7 +901,7 @@ def save_vector_field_png(
 ):
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
 
-    mag = np.sqrt(vx_grid * vx_grid + vy_grid * vy_grid)
+    mag = np.sqrt(mvx * mvx + mvy * mvy)
     save_scalar_map_png(path + ".mag.png", mag, width, height, block_size)
 
     for by_idx, by in enumerate(range(0, height, block_size)):
@@ -1125,34 +912,15 @@ def save_vector_field_png(
             x1 = min(bx + block_size, width)
             cx = int(round(0.5 * (bx + x1 - 1)))
 
-            dx = float(vx_grid[by_idx, bx_idx])
-            dy = float(vy_grid[by_idx, bx_idx])
+            dx = float(mvx[by_idx, bx_idx])
+            dy = float(mvy[by_idx, bx_idx])
+
+            color = (0, 255, 0) if reliable[by_idx, bx_idx] else (0, 0, 255)
 
             p0 = (cx, cy)
             p1 = (int(round(cx + scale * dx)), int(round(cy + scale * dy)))
 
-            cv2.arrowedLine(canvas, p0, p1, (0, 255, 0), 1, tipLength=0.3)
-
-    cv2.imwrite(path, canvas)
-
-
-def save_basis_field_png(path: str, basis_x: np.ndarray, basis_y: np.ndarray, stride: int = 64, scale: float = 12.0):
-    h, w = basis_x.shape
-    canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
-    mag = np.sqrt(basis_x * basis_x + basis_y * basis_y)
-    mag_norm = np.clip(mag / (np.percentile(mag, 99) + 1e-6) * 255.0, 0, 255).astype(np.uint8)
-    canvas = cv2.applyColorMap(mag_norm, cv2.COLORMAP_TURBO)
-
-    for y in range(stride // 2, h, stride):
-        for x in range(stride // 2, w, stride):
-            dx = float(basis_x[y, x])
-            dy = float(basis_y[y, x])
-
-            p0 = (x, y)
-            p1 = (int(round(x + scale * dx)), int(round(y + scale * dy)))
-
-            cv2.arrowedLine(canvas, p0, p1, (255, 255, 255), 1, tipLength=0.3)
+            cv2.arrowedLine(canvas, p0, p1, color, 1, tipLength=0.3)
 
     cv2.imwrite(path, canvas)
 
@@ -1171,38 +939,33 @@ def main():
     parser.add_argument("--target-idx", type=int, required=True)
     parser.add_argument("--ref-idx", type=int, required=True)
 
-    # Homography estimation.
-    parser.add_argument("--max-features", type=int, default=30000)
-    parser.add_argument("--match-ratio", type=float, default=0.65)
-    parser.add_argument("--ransac-thresh", type=float, default=0.75)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--block-margin", type=int, default=32)
+
+    parser.add_argument(
+        "--fit-model",
+        choices=["translation", "partial_affine", "affine", "homography", "auto"],
+        default="affine",
+    )
+    parser.add_argument("--auto-allow-homography", action="store_true")
+
+    parser.add_argument("--max-features", type=int, default=50000)
+    parser.add_argument("--match-ratio", type=float, default=0.70)
     parser.add_argument("--no-clahe", action="store_true")
 
-    # ECC refinement.
-    parser.add_argument("--h-refine-iters", type=int, default=100)
-    parser.add_argument("--h-refine-eps", type=float, default=1e-7)
-    parser.add_argument("--h-refine-scale", type=float, default=0.5)
-    parser.add_argument("--h-refine-blur", type=int, default=5)
+    parser.add_argument("--ransac-thresh", type=float, default=2.0)
+    parser.add_argument("--min-matches-translation", type=int, default=3)
+    parser.add_argument("--min-matches-affine", type=int, default=8)
+    parser.add_argument("--min-matches-homography", type=int, default=16)
 
-    # Block residual MV search.
-    parser.add_argument("--block-size", type=int, default=32)
-    parser.add_argument("--res-search-range", type=float, default=12.0)
-    parser.add_argument("--res-search-step", type=float, default=1.0)
+    parser.add_argument(
+        "--fallback",
+        choices=["none", "global_translation"],
+        default="global_translation",
+    )
 
-    # Reliability filtering.
-    parser.add_argument("--min-block-valid-ratio", type=float, default=0.50)
-    parser.add_argument("--min-texture", type=float, default=1.0)
-    parser.add_argument("--min-gap", type=float, default=0.0)
-
-    # Basis.
-    parser.add_argument("--basis-degree", type=int, choices=[0, 1, 2], default=2)
-    parser.add_argument("--robust-fit-iters", type=int, default=3)
-    parser.add_argument("--min-fit-blocks", type=int, default=20)
-
-    # Block scalar c.
-    parser.add_argument("--c-min", type=float, default=-32.0)
-    parser.add_argument("--c-max", type=float, default=32.0)
-    parser.add_argument("--c-samples", type=int, default=9)
-    parser.add_argument("--c-refine-range", type=float, default=2.0)
+    parser.add_argument("--radial-c-clip", type=float, default=0.20)
+    parser.add_argument("--foe-min-mv-mag", type=float, default=0.25)
 
     parser.add_argument("--output-dir", required=True)
 
@@ -1210,19 +973,18 @@ def main():
 
     ensure_dir(args.output_dir)
 
-    print(f"[INFO] target_idx={args.target_idx}, ref_idx={args.ref_idx}")
-    print(f"[INFO] resolution={args.width}x{args.height}, bitdepth={args.bitdepth}")
-    print(f"[INFO] block_size={args.block_size}")
-    print(f"[INFO] residual search range=±{args.res_search_range}, step={args.res_search_step}")
+    width = args.width
+    height = args.height
+    block_size = args.block_size
 
-    target = read_y_frame(args.input, args.width, args.height, args.bitdepth, args.target_idx)
-    ref = read_y_frame(args.input, args.width, args.height, args.bitdepth, args.ref_idx)
+    print(f"[INFO] target={args.target_idx}, ref={args.ref_idx}")
+    print(f"[INFO] size={width}x{height}, bitdepth={args.bitdepth}")
+    print(f"[INFO] block={block_size}, margin={args.block_margin}, fit_model={args.fit_model}")
 
-    # ------------------------------------------------------------
-    # Global homography.
-    # ------------------------------------------------------------
+    target = read_y_frame(args.input, width, height, args.bitdepth, args.target_idx)
+    ref = read_y_frame(args.input, width, height, args.bitdepth, args.ref_idx)
 
-    match_result = detect_and_match_orb(
+    match = detect_and_match_orb(
         target_y=target.y,
         ref_y=ref.y,
         bitdepth=args.bitdepth,
@@ -1231,302 +993,425 @@ def main():
         use_clahe=not args.no_clahe,
     )
 
-    print(f"[INFO] good matches = {len(match_result.good_matches)}")
-
-    H_init, H_mask = estimate_initial_homography(
-        pts_target=match_result.pts_target,
-        pts_ref=match_result.pts_ref,
-        ransac_thresh=args.ransac_thresh,
-    )
-
-    H_inliers = int(np.count_nonzero(H_mask)) if H_mask is not None else 0
-
-    print(f"[INFO] H inliers = {H_inliers}")
-    print("[INFO] Initial H:")
-    print(H_init)
+    print(f"[INFO] good matches = {len(match.good_matches)}")
 
     save_match_vis(
-        os.path.join(args.output_dir, "match_vis_homography_inliers.png"),
+        os.path.join(args.output_dir, "match_vis.png"),
         target.y,
         ref.y,
         args.bitdepth,
-        match_result,
-        H_mask,
+        match,
     )
 
-    H_refined, ecc_meta = refine_homography_ecc(
-        H_init_full=H_init,
+    global_tr = fit_global_translation_from_matches(match.pts_target, match.pts_ref)
+    print(f"[INFO] global median translation fallback = dx={global_tr[0]:.3f}, dy={global_tr[1]:.3f}")
+
+    ny, nx = block_grid_shape(width, height, block_size)
+
+    pred_local = np.zeros((height, width), dtype=np.float32)
+    valid_local = np.zeros((height, width), dtype=bool)
+
+    model_type_grid = np.zeros((ny, nx), dtype=np.float64)
+    match_count_grid = np.zeros((ny, nx), dtype=np.float64)
+    inlier_count_grid = np.zeros((ny, nx), dtype=np.float64)
+    reproj_mae_grid = np.full((ny, nx), np.inf, dtype=np.float64)
+    valid_ratio_grid = np.zeros((ny, nx), dtype=np.float64)
+    mvx_grid = np.zeros((ny, nx), dtype=np.float64)
+    mvy_grid = np.zeros((ny, nx), dtype=np.float64)
+    reliable_grid = np.zeros((ny, nx), dtype=bool)
+
+    type_to_id = {
+        "invalid": 0,
+        "fallback_translation": 1,
+        "translation": 2,
+        "partial_affine": 3,
+        "affine": 4,
+        "homography": 5,
+    }
+
+    block_models: List[List[Dict]] = []
+
+    pts_t_all = match.pts_target
+    pts_r_all = match.pts_ref
+
+    for by_idx, by in enumerate(range(0, height, block_size)):
+        row_records = []
+        y1 = min(by + block_size, height)
+
+        for bx_idx, bx in enumerate(range(0, width, block_size)):
+            x1 = min(bx + block_size, width)
+
+            mx0 = max(0, bx - args.block_margin)
+            mx1 = min(width, x1 + args.block_margin)
+            my0 = max(0, by - args.block_margin)
+            my1 = min(height, y1 + args.block_margin)
+
+            # Assign matches by target-side position.
+            mask = (
+                (pts_t_all[:, 0] >= mx0)
+                & (pts_t_all[:, 0] < mx1)
+                & (pts_t_all[:, 1] >= my0)
+                & (pts_t_all[:, 1] < my1)
+            )
+
+            pts_t = pts_t_all[mask]
+            pts_r = pts_r_all[mask]
+
+            model = choose_local_model(
+                pts_t=pts_t,
+                pts_r=pts_r,
+                fit_model=args.fit_model,
+                allow_homography_in_auto=args.auto_allow_homography,
+                ransac_thresh=args.ransac_thresh,
+                min_matches_translation=args.min_matches_translation,
+                min_matches_affine=args.min_matches_affine,
+                min_matches_homography=args.min_matches_homography,
+            )
+
+            if model is None or not model.ok:
+                if args.fallback == "global_translation":
+                    model = LocalModel(
+                        ok=True,
+                        model_type="translation",
+                        param=global_tr.copy(),
+                        inlier_count=0,
+                        match_count=len(pts_t),
+                        reproj_mae=float("inf"),
+                        center_mv=(float(global_tr[0]), float(global_tr[1])),
+                        valid_ratio=0.0,
+                        fallback=True,
+                        reason="fallback_global_translation",
+                    )
+                else:
+                    model = LocalModel(
+                        ok=False,
+                        model_type="invalid",
+                        param=None,
+                        inlier_count=0,
+                        match_count=len(pts_t),
+                        reproj_mae=float("inf"),
+                        center_mv=(0.0, 0.0),
+                        valid_ratio=0.0,
+                        fallback=False,
+                        reason="no_valid_model",
+                    )
+
+            if model.ok and model.param is not None and model.model_type != "invalid":
+                bw = x1 - bx
+                bh = y1 - by
+
+                map_x, map_y, valid = model_maps_for_roi(
+                    model.model_type,
+                    model.param,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    width,
+                    height,
+                )
+
+                pred_roi = remap_ref(ref.y, map_x, map_y)
+
+                pred_local[by:y1, bx:x1] = pred_roi
+                valid_local[by:y1, bx:x1] = valid
+
+                valid_ratio = float(np.mean(valid))
+
+                cx = 0.5 * (bx + x1 - 1.0)
+                cy = 0.5 * (by + y1 - 1.0)
+                center_out = apply_model_points(
+                    model.model_type,
+                    model.param,
+                    np.array([[cx, cy]], dtype=np.float32),
+                )[0]
+
+                dx = float(center_out[0] - cx)
+                dy = float(center_out[1] - cy)
+
+                model.center_mv = (dx, dy)
+                model.valid_ratio = valid_ratio
+
+                is_reliable = (
+                    (not model.fallback)
+                    and model.inlier_count >= max(args.min_matches_translation, 3)
+                    and np.isfinite(model.reproj_mae)
+                    and valid_ratio > 0.5
+                )
+            else:
+                valid_ratio = 0.0
+                dx = 0.0
+                dy = 0.0
+                is_reliable = False
+
+            model_id = type_to_id["fallback_translation"] if model.fallback else type_to_id.get(model.model_type, 0)
+
+            model_type_grid[by_idx, bx_idx] = model_id
+            match_count_grid[by_idx, bx_idx] = model.match_count
+            inlier_count_grid[by_idx, bx_idx] = model.inlier_count
+            reproj_mae_grid[by_idx, bx_idx] = model.reproj_mae
+            valid_ratio_grid[by_idx, bx_idx] = model.valid_ratio
+            mvx_grid[by_idx, bx_idx] = model.center_mv[0]
+            mvy_grid[by_idx, bx_idx] = model.center_mv[1]
+            reliable_grid[by_idx, bx_idx] = is_reliable
+
+            row_records.append(
+                {
+                    "block_x": int(bx),
+                    "block_y": int(by),
+                    "model_type": model.model_type,
+                    "fallback": bool(model.fallback),
+                    "reason": model.reason,
+                    "match_count": int(model.match_count),
+                    "inlier_count": int(model.inlier_count),
+                    "reproj_mae": float(model.reproj_mae) if np.isfinite(model.reproj_mae) else None,
+                    "valid_ratio": float(model.valid_ratio),
+                    "center_mv": [float(model.center_mv[0]), float(model.center_mv[1])],
+                    "param": model.param.tolist() if model.param is not None else None,
+                    "reliable": bool(is_reliable),
+                }
+            )
+
+        block_models.append(row_records)
+
+    cost_local = calc_cost(target.y, pred_local, valid_local, args.bitdepth)
+
+    reliable_count = int(np.count_nonzero(reliable_grid))
+    total_blocks = int(reliable_grid.size)
+
+    print(f"[INFO] reliable blocks = {reliable_count}/{total_blocks}")
+    print("[INFO] local block model cost:")
+    print(json.dumps(cost_local, indent=2))
+
+    # ------------------------------------------------------------
+    # Aggregate local observations.
+    # ------------------------------------------------------------
+
+    centers = []
+    mvs = []
+    weights = []
+
+    for by_idx, by in enumerate(range(0, height, block_size)):
+        y1 = min(by + block_size, height)
+        cy = 0.5 * (by + y1 - 1.0)
+
+        for bx_idx, bx in enumerate(range(0, width, block_size)):
+            x1 = min(bx + block_size, width)
+            cx = 0.5 * (bx + x1 - 1.0)
+
+            if not reliable_grid[by_idx, bx_idx]:
+                continue
+
+            centers.append([cx, cy])
+            mvs.append([mvx_grid[by_idx, bx_idx], mvy_grid[by_idx, bx_idx]])
+
+            err = reproj_mae_grid[by_idx, bx_idx]
+            inl = inlier_count_grid[by_idx, bx_idx]
+            wgt = max(1.0, float(inl)) / max(1.0, float(err))
+            weights.append(wgt)
+
+    centers = np.asarray(centers, dtype=np.float64)
+    mvs = np.asarray(mvs, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+
+    # Global affine from block observations.
+    affine_from_blocks = fit_global_affine_from_block_mvs(
+        centers,
+        mvs,
+        weights,
+        ransac_thresh=max(2.0, args.ransac_thresh * 2.0),
+    )
+
+    if affine_from_blocks is not None:
+        pred_affine, valid_affine = make_full_affine_prediction(
+            target.y,
+            ref.y,
+            width,
+            height,
+            affine_from_blocks,
+        )
+        cost_affine = calc_cost(target.y, pred_affine, valid_affine, args.bitdepth)
+    else:
+        pred_affine = np.zeros_like(target.y, dtype=np.float32)
+        valid_affine = np.zeros_like(target.y, dtype=bool)
+        cost_affine = {
+            "valid_ratio": 0.0,
+            "mae": float("inf"),
+            "mse": float("inf"),
+            "psnr": None,
+        }
+
+    print("[INFO] global affine from blocks cost:")
+    print(json.dumps(cost_affine, indent=2))
+
+    # FOE/radial scalar from block observations.
+    foe, foe_meta = fit_foe_from_block_mvs(
+        centers,
+        mvs,
+        weights,
+        width=width,
+        height=height,
+        min_mv_mag=args.foe_min_mv_mag,
+    )
+
+    pred_radial, valid_radial, c_radial_grid = make_radial_scalar_prediction(
         target_y=target.y,
         ref_y=ref.y,
-        bitdepth=args.bitdepth,
-        iters=args.h_refine_iters,
-        eps=args.h_refine_eps,
-        scale=args.h_refine_scale,
-        blur_ksize=args.h_refine_blur,
+        width=width,
+        height=height,
+        block_size=block_size,
+        foe=foe,
+        center_mv_grid_x=mvx_grid,
+        center_mv_grid_y=mvy_grid,
+        reliable_grid=reliable_grid,
+        c_clip=args.radial_c_clip,
     )
 
-    print("[INFO] ECC meta:")
-    print(json.dumps(ecc_meta, indent=2))
-    print("[INFO] Refined H:")
-    print(H_refined)
+    cost_radial = calc_cost(target.y, pred_radial, valid_radial, args.bitdepth)
 
-    map_x_H, map_y_H, valid_H = homography_maps(H_refined, args.width, args.height)
-
-    pred_H = remap_ref(ref.y, map_x_H, map_y_H)
-    cost_H = calc_cost(target.y, pred_H, valid_H, args.bitdepth)
-
-    print("[INFO] Homography cost:")
-    print(json.dumps(cost_H, indent=2))
+    print("[INFO] FOE/radial meta:")
+    print(json.dumps(foe_meta, indent=2))
+    print("[INFO] radial scalar from blocks cost:")
+    print(json.dumps(cost_radial, indent=2))
 
     # ------------------------------------------------------------
-    # Block residual MV search around H.
-    # ------------------------------------------------------------
-
-    block_res = estimate_block_residual_mv(
-        target_y=target.y,
-        ref_y=ref.y,
-        map_x_H=map_x_H,
-        map_y_H=map_y_H,
-        valid_H=valid_H,
-        block_size=args.block_size,
-        search_range=args.res_search_range,
-        search_step=args.res_search_step,
-        min_block_valid_ratio=args.min_block_valid_ratio,
-        min_texture=args.min_texture,
-        min_gap=args.min_gap,
-    )
-
-    cost_block_mv = calc_cost(target.y, block_res.pred_block_mv, block_res.valid_block_mv, args.bitdepth)
-
-    reliable_count = int(np.count_nonzero(block_res.reliable_grid))
-    total_blocks = int(block_res.reliable_grid.size)
-
-    print(f"[INFO] reliable block residuals = {reliable_count}/{total_blocks}")
-    print("[INFO] Block residual MV upper-bound cost:")
-    print(json.dumps(cost_block_mv, indent=2))
-
-    # ------------------------------------------------------------
-    # Fit global residual basis B(x).
-    # ------------------------------------------------------------
-
-    basis = fit_polynomial_residual_basis(
-        dx_grid=block_res.dx_grid,
-        dy_grid=block_res.dy_grid,
-        reliable_grid=block_res.reliable_grid,
-        cost_grid=block_res.cost_grid,
-        gap_grid=block_res.gap_grid,
-        texture_grid=block_res.texture_grid,
-        width=args.width,
-        height=args.height,
-        block_size=args.block_size,
-        degree=args.basis_degree,
-        robust_iters=args.robust_fit_iters,
-        min_fit_blocks=args.min_fit_blocks,
-    )
-
-    print(f"[INFO] basis fit blocks = {basis.num_fit_blocks}")
-    print(f"[INFO] basis norm_scale = {basis.norm_scale}")
-
-    # Initial c from projection of observed block residual onto basis.
-    c_init = estimate_initial_c_grid_from_observed_residual(
-        dx_grid=block_res.dx_grid,
-        dy_grid=block_res.dy_grid,
-        basis_x_blk=basis.basis_x_block,
-        basis_y_blk=basis.basis_y_block,
-        c_min=args.c_min,
-        c_max=args.c_max,
-    )
-
-    # Refine c by actual block remap cost.
-    scalar_pred = predict_with_basis_scalar(
-        target_y=target.y,
-        ref_y=ref.y,
-        map_x_H=map_x_H,
-        map_y_H=map_y_H,
-        valid_H=valid_H,
-        basis_x=basis.basis_x,
-        basis_y=basis.basis_y,
-        c_center_grid=c_init,
-        block_size=args.block_size,
-        c_refine_range=args.c_refine_range,
-        c_samples=args.c_samples,
-        c_min=args.c_min,
-        c_max=args.c_max,
-        min_block_valid_ratio=args.min_block_valid_ratio,
-    )
-
-    cost_scalar = calc_cost(target.y, scalar_pred.pred, scalar_pred.valid, args.bitdepth)
-
-    print("[INFO] Basis scalar predictor cost:")
-    print(json.dumps(cost_scalar, indent=2))
-
-    # ------------------------------------------------------------
-    # Save outputs.
+    # Save output.
     # ------------------------------------------------------------
 
     paths = {
         "target_yuv": os.path.join(args.output_dir, "target_pair.yuv"),
         "ref_yuv": os.path.join(args.output_dir, "ref_pair.yuv"),
-        "pred_homography_yuv": os.path.join(args.output_dir, "pred_homography.yuv"),
-        "pred_block_residual_mv_yuv": os.path.join(args.output_dir, "pred_block_residual_mv.yuv"),
-        "pred_basis_scalar_yuv": os.path.join(args.output_dir, "pred_basis_scalar.yuv"),
+        "pred_local_block_model_yuv": os.path.join(args.output_dir, "pred_local_block_model.yuv"),
+        "pred_global_affine_from_blocks_yuv": os.path.join(args.output_dir, "pred_global_affine_from_blocks.yuv"),
+        "pred_radial_scalar_from_blocks_yuv": os.path.join(args.output_dir, "pred_radial_scalar_from_blocks.yuv"),
     }
 
-    write_single_yuv420(paths["target_yuv"], target.y, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["ref_yuv"], ref.y, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_homography_yuv"], pred_H, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_block_residual_mv_yuv"], block_res.pred_block_mv, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_basis_scalar_yuv"], scalar_pred.pred, args.width, args.height, args.bitdepth)
+    write_single_yuv420(paths["target_yuv"], target.y, width, height, args.bitdepth)
+    write_single_yuv420(paths["ref_yuv"], ref.y, width, height, args.bitdepth)
+    write_single_yuv420(paths["pred_local_block_model_yuv"], pred_local, width, height, args.bitdepth)
+    write_single_yuv420(paths["pred_global_affine_from_blocks_yuv"], pred_affine, width, height, args.bitdepth)
+    write_single_yuv420(paths["pred_radial_scalar_from_blocks_yuv"], pred_radial, width, height, args.bitdepth)
 
     save_gray_png(os.path.join(args.output_dir, "target.png"), target.y, args.bitdepth)
     save_gray_png(os.path.join(args.output_dir, "ref.png"), ref.y, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_homography.png"), pred_H, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_block_residual_mv.png"), block_res.pred_block_mv, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_basis_scalar.png"), scalar_pred.pred, args.bitdepth)
+    save_gray_png(os.path.join(args.output_dir, "pred_local_block_model.png"), pred_local, args.bitdepth)
+    save_gray_png(os.path.join(args.output_dir, "pred_global_affine_from_blocks.png"), pred_affine, args.bitdepth)
+    save_gray_png(os.path.join(args.output_dir, "pred_radial_scalar_from_blocks.png"), pred_radial, args.bitdepth)
 
-    save_diff_png(os.path.join(args.output_dir, "diff_homography.png"), target.y, pred_H, valid_H)
-    save_diff_png(os.path.join(args.output_dir, "diff_block_residual_mv.png"), target.y, block_res.pred_block_mv, block_res.valid_block_mv)
-    save_diff_png(os.path.join(args.output_dir, "diff_basis_scalar.png"), target.y, scalar_pred.pred, scalar_pred.valid)
+    save_diff_png(os.path.join(args.output_dir, "diff_local_block_model.png"), target.y, pred_local, valid_local)
+    save_diff_png(os.path.join(args.output_dir, "diff_global_affine_from_blocks.png"), target.y, pred_affine, valid_affine)
+    save_diff_png(os.path.join(args.output_dir, "diff_radial_scalar_from_blocks.png"), target.y, pred_radial, valid_radial)
 
-    save_scalar_map_png(
-        os.path.join(args.output_dir, "c_map.png"),
-        scalar_pred.c_grid,
-        args.width,
-        args.height,
-        args.block_size,
-    )
+    save_scalar_map_png(os.path.join(args.output_dir, "model_type_map.png"), model_type_grid, width, height, block_size)
+    save_scalar_map_png(os.path.join(args.output_dir, "match_count_map.png"), match_count_grid, width, height, block_size)
+    save_scalar_map_png(os.path.join(args.output_dir, "inlier_count_map.png"), inlier_count_grid, width, height, block_size)
+    save_scalar_map_png(os.path.join(args.output_dir, "reproj_mae_map.png"), reproj_mae_grid, width, height, block_size)
+    save_scalar_map_png(os.path.join(args.output_dir, "valid_ratio_map.png"), valid_ratio_grid, width, height, block_size)
+    save_scalar_map_png(os.path.join(args.output_dir, "reliable_map.png"), reliable_grid.astype(np.float64), width, height, block_size)
+    save_scalar_map_png(os.path.join(args.output_dir, "radial_c_map.png"), c_radial_grid, width, height, block_size)
 
-    save_scalar_map_png(
-        os.path.join(args.output_dir, "block_residual_cost.png"),
-        block_res.cost_grid,
-        args.width,
-        args.height,
-        args.block_size,
-    )
-
-    save_scalar_map_png(
-        os.path.join(args.output_dir, "block_residual_gap.png"),
-        block_res.gap_grid,
-        args.width,
-        args.height,
-        args.block_size,
-    )
-
-    save_vector_field_png(
-        os.path.join(args.output_dir, "residual_mv_field.png"),
-        block_res.dx_grid,
-        block_res.dy_grid,
-        args.width,
-        args.height,
-        args.block_size,
+    save_mv_field_png(
+        os.path.join(args.output_dir, "local_center_mv_field.png"),
+        mvx_grid,
+        mvy_grid,
+        reliable_grid,
+        width,
+        height,
+        block_size,
         scale=4.0,
     )
 
-    save_basis_field_png(
-        os.path.join(args.output_dir, "basis_field.png"),
-        basis.basis_x,
-        basis.basis_y,
-        stride=max(16, args.block_size * 2),
-        scale=16.0,
-    )
-
-    # ------------------------------------------------------------
-    # JSON.
-    # ------------------------------------------------------------
-
     result = {
         "input": args.input,
-        "width": int(args.width),
-        "height": int(args.height),
+        "width": int(width),
+        "height": int(height),
         "bitdepth": int(args.bitdepth),
         "target_idx": int(args.target_idx),
         "ref_idx": int(args.ref_idx),
 
-        "model": {
-            "description": "image-space factorized warp",
-            "formula": "p_ref(x,b) = H_g(x) + c_b * B(x)",
-            "global": "H_g and polynomial residual basis B(x)",
-            "block": "scalar c_b",
-            "note": "This is not physical R|t/depth, but syntax/structure is similar: global info + block constant.",
+        "method": {
+            "description": "local block feature fitting, then aggregation",
+            "local_model": args.fit_model,
+            "block_size": int(block_size),
+            "block_margin": int(args.block_margin),
+            "coordinate": "target pixel -> ref pixel",
         },
 
-        "homography": {
-            "H_initial_target_to_ref": H_init.tolist(),
-            "H_refined_target_to_ref": H_refined.tolist(),
-            "num_good_matches": int(len(match_result.good_matches)),
-            "num_H_inliers": int(H_inliers),
-            "ecc": ecc_meta,
+        "feature_matching": {
+            "max_features": int(args.max_features),
+            "match_ratio": float(args.match_ratio),
+            "clahe": bool(not args.no_clahe),
+            "num_good_matches": int(len(match.good_matches)),
         },
 
-        "block_residual_search": {
-            "block_size": int(args.block_size),
-            "res_search_range": float(args.res_search_range),
-            "res_search_step": float(args.res_search_step),
-            "min_block_valid_ratio": float(args.min_block_valid_ratio),
-            "min_texture": float(args.min_texture),
-            "min_gap": float(args.min_gap),
-            "reliable_blocks": reliable_count,
+        "fitting_args": {
+            "ransac_thresh": float(args.ransac_thresh),
+            "min_matches_translation": int(args.min_matches_translation),
+            "min_matches_affine": int(args.min_matches_affine),
+            "min_matches_homography": int(args.min_matches_homography),
+            "fallback": args.fallback,
+            "auto_allow_homography": bool(args.auto_allow_homography),
+        },
+
+        "summary": {
             "total_blocks": total_blocks,
-            "dx_grid": block_res.dx_grid.tolist(),
-            "dy_grid": block_res.dy_grid.tolist(),
-            "cost_grid": block_res.cost_grid.tolist(),
-            "gap_grid": block_res.gap_grid.tolist(),
-            "valid_ratio_grid": block_res.valid_ratio_grid.tolist(),
-            "texture_grid": block_res.texture_grid.tolist(),
-            "reliable_grid": block_res.reliable_grid.astype(int).tolist(),
-        },
-
-        "basis": {
-            "degree": int(args.basis_degree),
-            "robust_fit_iters": int(args.robust_fit_iters),
-            "num_fit_blocks": int(basis.num_fit_blocks),
-            "norm_scale": float(basis.norm_scale),
-            "coef_x": basis.coef_x.tolist(),
-            "coef_y": basis.coef_y.tolist(),
-            "fit_error_grid": basis.fit_error_grid.tolist(),
-        },
-
-        "scalar_c": {
-            "c_min": float(args.c_min),
-            "c_max": float(args.c_max),
-            "c_samples": int(args.c_samples),
-            "c_refine_range": float(args.c_refine_range),
-            "c_grid": scalar_pred.c_grid.tolist(),
-            "cost_grid": scalar_pred.cost_grid.tolist(),
-            "valid_ratio_grid": scalar_pred.valid_ratio_grid.tolist(),
+            "reliable_blocks": reliable_count,
+            "reliable_ratio": float(reliable_count / max(total_blocks, 1)),
+            "global_translation_fallback": global_tr.tolist(),
+            "foe": foe.tolist(),
+            "foe_meta": foe_meta,
+            "global_affine_from_blocks": affine_from_blocks.tolist() if affine_from_blocks is not None else None,
         },
 
         "costs": {
-            "homography": cost_H,
-            "block_residual_mv_upper_bound": cost_block_mv,
-            "basis_scalar": cost_scalar,
+            "local_block_model": cost_local,
+            "global_affine_from_blocks": cost_affine,
+            "radial_scalar_from_blocks": cost_radial,
         },
+
+        "grids": {
+            "model_type_id": model_type_grid.tolist(),
+            "model_type_id_legend": {
+                "0": "invalid",
+                "1": "fallback_translation",
+                "2": "translation",
+                "3": "partial_affine",
+                "4": "affine",
+                "5": "homography",
+            },
+            "match_count": match_count_grid.tolist(),
+            "inlier_count": inlier_count_grid.tolist(),
+            "reproj_mae": np.where(np.isfinite(reproj_mae_grid), reproj_mae_grid, -1).tolist(),
+            "valid_ratio": valid_ratio_grid.tolist(),
+            "mvx": mvx_grid.tolist(),
+            "mvy": mvy_grid.tolist(),
+            "reliable": reliable_grid.astype(int).tolist(),
+            "radial_c": c_radial_grid.tolist(),
+        },
+
+        "block_models": block_models,
 
         "outputs": paths,
 
         "png_outputs": {
-            "match_vis": os.path.join(args.output_dir, "match_vis_homography_inliers.png"),
-            "target": os.path.join(args.output_dir, "target.png"),
-            "ref": os.path.join(args.output_dir, "ref.png"),
-            "pred_homography": os.path.join(args.output_dir, "pred_homography.png"),
-            "pred_block_residual_mv": os.path.join(args.output_dir, "pred_block_residual_mv.png"),
-            "pred_basis_scalar": os.path.join(args.output_dir, "pred_basis_scalar.png"),
-            "diff_homography": os.path.join(args.output_dir, "diff_homography.png"),
-            "diff_block_residual_mv": os.path.join(args.output_dir, "diff_block_residual_mv.png"),
-            "diff_basis_scalar": os.path.join(args.output_dir, "diff_basis_scalar.png"),
-            "c_map": os.path.join(args.output_dir, "c_map.png"),
-            "residual_mv_field": os.path.join(args.output_dir, "residual_mv_field.png"),
-            "residual_mv_magnitude": os.path.join(args.output_dir, "residual_mv_field.png.mag.png"),
-            "basis_field": os.path.join(args.output_dir, "basis_field.png"),
+            "match_vis": os.path.join(args.output_dir, "match_vis.png"),
+            "local_center_mv_field": os.path.join(args.output_dir, "local_center_mv_field.png"),
+            "local_center_mv_magnitude": os.path.join(args.output_dir, "local_center_mv_field.png.mag.png"),
+            "model_type_map": os.path.join(args.output_dir, "model_type_map.png"),
+            "match_count_map": os.path.join(args.output_dir, "match_count_map.png"),
+            "inlier_count_map": os.path.join(args.output_dir, "inlier_count_map.png"),
+            "reproj_mae_map": os.path.join(args.output_dir, "reproj_mae_map.png"),
+            "reliable_map": os.path.join(args.output_dir, "reliable_map.png"),
+            "radial_c_map": os.path.join(args.output_dir, "radial_c_map.png"),
         },
 
         "interpretation": [
-            "pred_homography.yuv: baseline global homography predictor.",
-            "pred_block_residual_mv.yuv: upper bound using independent block residual MV around H.",
-            "pred_basis_scalar.yuv: actual proposed factorized predictor, H + c_b * B(x).",
-            "If block_residual_mv is much better but basis_scalar is not, one basis is insufficient; try degree=2 or later multi-basis.",
-            "If basis_scalar is close to block_residual_mv, global basis + block scalar is promising.",
-            "If homography is already best, residual MV may be fitting noise or moving objects.",
+            "pred_local_block_model is an upper-bound-like local fitting predictor. It may be blocky.",
+            "local_center_mv_field shows observed local motion from block feature fitting.",
+            "pred_global_affine_from_blocks tests whether local observations agree with one global affine model.",
+            "pred_radial_scalar_from_blocks tests whether local observations can be compressed into FOE/radial global info + block scalar c.",
+            "If local block model is good but radial/global aggregation is poor, the scene needs richer basis or multiple modes.",
+            "If radial scalar is good for forward/backward camera motion, the global+block-c syntax is promising.",
         ],
     }
 
@@ -1535,11 +1420,9 @@ def main():
         json.dump(result, f, indent=2)
 
     print(f"[DONE] result JSON: {json_path}")
-    print(f"[DONE] target YUV: {paths['target_yuv']}")
-    print(f"[DONE] ref YUV: {paths['ref_yuv']}")
-    print(f"[DONE] homography YUV: {paths['pred_homography_yuv']}")
-    print(f"[DONE] block residual MV YUV: {paths['pred_block_residual_mv_yuv']}")
-    print(f"[DONE] basis scalar YUV: {paths['pred_basis_scalar_yuv']}")
+    print(f"[DONE] local block model YUV: {paths['pred_local_block_model_yuv']}")
+    print(f"[DONE] global affine YUV: {paths['pred_global_affine_from_blocks_yuv']}")
+    print(f"[DONE] radial scalar YUV: {paths['pred_radial_scalar_from_blocks_yuv']}")
 
 
 if __name__ == "__main__":
