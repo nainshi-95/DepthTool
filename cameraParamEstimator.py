@@ -1052,3 +1052,456 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@dataclass
+class PoseEdge:
+    target_idx: int
+    ref_idx: int
+
+    # Maps target camera coordinates to ref camera coordinates:
+    #   X_ref = R_ref_target * X_target + t_ref_target
+    R_ref_target: np.ndarray
+    t_ref_target: np.ndarray
+
+    num_matches: int
+    essential_inliers: int
+    pose_inliers: int
+
+    # Pairwise epipolar geometry quality.
+    # Smaller is better.
+    sampson_error_mean: float
+    sampson_error_median: float
+    sampson_error_p90: float
+
+
+
+
+
+
+
+
+
+def skew(t: np.ndarray) -> np.ndarray:
+    """
+    Return skew-symmetric matrix [t]_x such that:
+      [t]_x @ x = t cross x
+    """
+    tx, ty, tz = np.asarray(t, dtype=np.float64).reshape(3)
+    return np.array(
+        [
+            [0.0, -tz,  ty],
+            [tz,   0.0, -tx],
+            [-ty,  tx,   0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def compute_sampson_error_pixels(
+    pts_target: np.ndarray,
+    pts_ref: np.ndarray,
+    K: np.ndarray,
+    R_ref_target: np.ndarray,
+    t_ref_target: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute Sampson error for matched points.
+
+    pts_target: Nx2 points in target image
+    pts_ref:    Nx2 points in reference image
+
+    Smaller is better.
+    Unit is roughly pixel^2.
+    """
+
+    t_ref_target = normalize_vec(t_ref_target)
+
+    # Essential matrix from estimated pose.
+    E = skew(t_ref_target) @ R_ref_target
+
+    Kinv = np.linalg.inv(K)
+
+    # Fundamental matrix in pixel coordinates.
+    F = Kinv.T @ E @ Kinv
+
+    ones = np.ones((pts_target.shape[0], 1), dtype=np.float64)
+
+    x1 = np.concatenate([pts_target.astype(np.float64), ones], axis=1)  # target
+    x2 = np.concatenate([pts_ref.astype(np.float64), ones], axis=1)     # ref
+
+    Fx1 = (F @ x1.T).T
+    Ftx2 = (F.T @ x2.T).T
+
+    numerator = np.sum(x2 * Fx1, axis=1) ** 2
+    denominator = (
+        Fx1[:, 0] ** 2
+        + Fx1[:, 1] ** 2
+        + Ftx2[:, 0] ** 2
+        + Ftx2[:, 1] ** 2
+        + 1e-12
+    )
+
+    return numerator / denominator
+
+
+def summarize_sampson_error(
+    sampson_error: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> Tuple[float, float, float]:
+    """
+    Return mean, median, p90 Sampson error.
+    If mask is given, compute only on masked inliers.
+    """
+
+    e = np.asarray(sampson_error, dtype=np.float64).reshape(-1)
+
+    if mask is not None:
+        m = np.asarray(mask).reshape(-1).astype(bool)
+        if m.shape[0] == e.shape[0] and np.count_nonzero(m) > 0:
+            e = e[m]
+
+    if e.size == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    return (
+        float(np.mean(e)),
+        float(np.median(e)),
+        float(np.percentile(e, 90)),
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+R, t, pose_mask, pose_inliers = choose_best_pose_from_E(
+    E,
+    pts_target,
+    pts_ref,
+    K,
+)
+
+essential_inliers = int(np.count_nonzero(inlier_mask_E)) if inlier_mask_E is not None else 0
+
+# Evaluate pairwise epipolar geometry quality.
+sampson_error = compute_sampson_error_pixels(
+    pts_target=pts_target,
+    pts_ref=pts_ref,
+    K=K,
+    R_ref_target=R,
+    t_ref_target=t,
+)
+
+sampson_mean, sampson_median, sampson_p90 = summarize_sampson_error(
+    sampson_error,
+    mask=inlier_mask_E,
+)
+
+return PoseEdge(
+    target_idx=target_idx,
+    ref_idx=ref_idx,
+    R_ref_target=R,
+    t_ref_target=t,
+    num_matches=int(num_matches),
+    essential_inliers=essential_inliers,
+    pose_inliers=int(pose_inliers),
+    sampson_error_mean=sampson_mean,
+    sampson_error_median=sampson_median,
+    sampson_error_p90=sampson_p90,
+)
+
+
+
+
+
+
+
+
+
+
+
+
+def rotation_angle_error_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    """
+    Rotation difference between two rotations in degrees.
+    """
+
+    R_delta = R_a @ R_b.T
+    R_delta = project_rotation_to_so3(R_delta)
+
+    cos_theta = (np.trace(R_delta) - 1.0) * 0.5
+    cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
+def translation_direction_error_deg(t_a: np.ndarray, t_b: np.ndarray) -> float:
+    """
+    Direction difference between two translation vectors in degrees.
+    Translation scale is ignored.
+    """
+
+    ta = normalize_vec(t_a)
+    tb = normalize_vec(t_b)
+
+    if np.linalg.norm(ta) < 1e-12 or np.linalg.norm(tb) < 1e-12:
+        return float("nan")
+
+    dot = float(np.dot(ta, tb))
+    dot = float(np.clip(dot, -1.0, 1.0))
+
+    return float(np.degrees(np.arccos(dot)))
+
+
+def evaluate_pose_graph_edges(
+    edges: List[PoseEdge],
+    poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+) -> List[dict]:
+    """
+    Compare direct pairwise edge pose against GOP-consistent pose graph result.
+
+    For each edge:
+      direct:
+        e.R_ref_target, e.t_ref_target
+
+      graph:
+        relative_from_global_poses(target=e.target_idx, ref=e.ref_idx)
+
+    Smaller errors mean the global pose graph is consistent with direct pairwise estimates.
+    """
+
+    stats = []
+
+    for e in edges:
+        if e.target_idx not in poses or e.ref_idx not in poses:
+            continue
+
+        R_graph, t_graph = relative_from_global_poses(
+            poses=poses,
+            target_idx=e.target_idx,
+            ref_idx=e.ref_idx,
+            normalize_translation=True,
+        )
+
+        rot_err = rotation_angle_error_deg(R_graph, e.R_ref_target)
+        trans_err = translation_direction_error_deg(t_graph, e.t_ref_target)
+
+        stats.append(
+            {
+                "target_idx": int(e.target_idx),
+                "ref_idx": int(e.ref_idx),
+                "num_matches": int(e.num_matches),
+                "essential_inliers": int(e.essential_inliers),
+                "pose_inliers": int(e.pose_inliers),
+
+                "sampson_error_mean": float(e.sampson_error_mean),
+                "sampson_error_median": float(e.sampson_error_median),
+                "sampson_error_p90": float(e.sampson_error_p90),
+
+                "rotation_error_deg": float(rot_err),
+                "translation_dir_error_deg": float(trans_err),
+            }
+        )
+
+    return stats
+
+
+def summarize_pose_graph_residuals(residuals: List[dict]) -> dict:
+    """
+    Summarize pose graph residuals.
+    """
+
+    if len(residuals) == 0:
+        return {
+            "num_edges": 0,
+            "rotation_error_deg_mean": None,
+            "rotation_error_deg_median": None,
+            "rotation_error_deg_p90": None,
+            "translation_dir_error_deg_mean": None,
+            "translation_dir_error_deg_median": None,
+            "translation_dir_error_deg_p90": None,
+        }
+
+    rot = np.array(
+        [r["rotation_error_deg"] for r in residuals],
+        dtype=np.float64,
+    )
+
+    trans = np.array(
+        [r["translation_dir_error_deg"] for r in residuals],
+        dtype=np.float64,
+    )
+
+    rot = rot[np.isfinite(rot)]
+    trans = trans[np.isfinite(trans)]
+
+    def safe_summary(x: np.ndarray):
+        if x.size == 0:
+            return None, None, None
+        return (
+            float(np.mean(x)),
+            float(np.median(x)),
+            float(np.percentile(x, 90)),
+        )
+
+    rot_mean, rot_median, rot_p90 = safe_summary(rot)
+    trans_mean, trans_median, trans_p90 = safe_summary(trans)
+
+    return {
+        "num_edges": int(len(residuals)),
+
+        "rotation_error_deg_mean": rot_mean,
+        "rotation_error_deg_median": rot_median,
+        "rotation_error_deg_p90": rot_p90,
+
+        "translation_dir_error_deg_mean": trans_mean,
+        "translation_dir_error_deg_median": trans_median,
+        "translation_dir_error_deg_p90": trans_p90,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+pose_graph_residuals = evaluate_pose_graph_edges(
+    edges=edges,
+    poses=poses,
+)
+
+pose_graph_residual_summary = summarize_pose_graph_residuals(
+    pose_graph_residuals
+)
+
+print("[INFO] pose graph residual summary:")
+print(json.dumps(pose_graph_residual_summary, indent=2))
+
+
+
+
+
+
+
+
+
+
+
+
+direct_edges_json.append({
+    "target_idx": e.target_idx,
+    "ref_idx": e.ref_idx,
+    "num_matches": e.num_matches,
+    "essential_inliers": e.essential_inliers,
+    "pose_inliers": e.pose_inliers,
+
+    "sampson_error_mean": e.sampson_error_mean,
+    "sampson_error_median": e.sampson_error_median,
+    "sampson_error_p90": e.sampson_error_p90,
+
+    "R_ref_target": e.R_ref_target.tolist(),
+    "t_ref_target_unit": normalize_vec(e.t_ref_target).tolist(),
+    "rvec_ref_target": rvec.reshape(3).tolist(),
+})
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"direct_pairwise_edges": direct_edges_json,
+"failed_edges": failed_edges,
+
+"pose_graph_residual_summary": pose_graph_residual_summary,
+"pose_graph_residuals": pose_graph_residuals,
+
+"global_poses_anchor_from_frame": global_poses_json,
+"consistent_pair_transforms": pair_transforms_json,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
