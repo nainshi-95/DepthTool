@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# pair_homography_c_strength_refine.py
+# pair_homography_c_strength_refine_ecc.py
 #
-# Pairwise homography-flow + block-wise C strength matching.
+# Pairwise homography-flow + block-wise C strength matching
+# with optional ECC-based homography refinement.
 #
 # Model:
 #   p_hom(x)  = H * x
@@ -12,17 +13,18 @@
 #   c = 0 : identity / no warp
 #   c = 1 : homography
 #   c > 1 : stronger than homography along the same flow direction
-#   c < 1 : weaker or opposite direction
+#   c < 1 : weaker / opposite direction
 #
-# Coarse-to-fine C search:
-#   Start from [c_min, c_max].
-#   Sample c_samples candidates.
-#   Pick best c for each block.
-#   Narrow range around the best c.
-#   Repeat c_search_iters times.
+# Homography:
+#   1. Initial H by ORB matching + RANSAC findHomography
+#   2. Optional H refinement by cv2.findTransformECC()
+#
+# Important convention:
+#   H maps target pixel coordinates to ref pixel coordinates:
+#      p_ref ~ H * p_target
 #
 # Example:
-#   python pair_homography_c_strength_refine.py \
+#   python pair_homography_c_strength_refine_ecc.py \
 #     --input input.yuv \
 #     --width 1920 \
 #     --height 1080 \
@@ -30,17 +32,25 @@
 #     --target-idx 1 \
 #     --ref-idx 0 \
 #     --block-size 64 \
-#     --c-min 0.0 \
-#     --c-max 2.0 \
-#     --c-samples 9 \
-#     --c-search-iters 4 \
-#     --output-dir pair_homo_c_t1_r0
+#     --max-features 20000 \
+#     --match-ratio 0.70 \
+#     --ransac-thresh 1.0 \
+#     --h-refine-iters 100 \
+#     --h-refine-scale 0.5 \
+#     --h-refine-eps 1e-7 \
+#     --h-refine-blur 5 \
+#     --c-min 0.97 \
+#     --c-max 1.03 \
+#     --c-samples 25 \
+#     --c-search-iters 5 \
+#     --min-range-width 1e-7 \
+#     --output-dir pair_homo_ecc_t1_r0
 
 import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -142,8 +152,18 @@ def to_8bit_feature(y: np.ndarray, bitdepth: int) -> np.ndarray:
     return (np.clip(y, 0, 1023).astype(np.uint16) >> 2).astype(np.uint8)
 
 
+def to_float_for_ecc(y: np.ndarray, bitdepth: int) -> np.ndarray:
+    if bitdepth == 8:
+        maxv = 255.0
+    else:
+        maxv = 1023.0
+
+    img = np.clip(y.astype(np.float32) / maxv, 0.0, 1.0)
+    return img.astype(np.float32)
+
+
 # ============================================================
-# Feature matching + homography
+# Feature matching + initial homography
 # ============================================================
 
 def detect_and_match_orb(
@@ -208,7 +228,16 @@ def detect_and_match_orb(
     )
 
 
-def estimate_homography(
+def normalize_homography(H: np.ndarray) -> np.ndarray:
+    H = np.asarray(H, dtype=np.float64)
+
+    if abs(H[2, 2]) > 1e-12:
+        H = H / H[2, 2]
+
+    return H
+
+
+def estimate_initial_homography(
     pts_target: np.ndarray,
     pts_ref: np.ndarray,
     ransac_thresh: float,
@@ -225,10 +254,7 @@ def estimate_homography(
     if H is None:
         raise RuntimeError("cv2.findHomography failed.")
 
-    H = H.astype(np.float64)
-
-    if abs(H[2, 2]) > 1e-12:
-        H = H / H[2, 2]
+    H = normalize_homography(H)
 
     return H, mask
 
@@ -267,6 +293,169 @@ def save_match_vis(
 
 
 # ============================================================
+# ECC homography refinement
+# ============================================================
+
+def scale_homography_for_resized_image(H_full: np.ndarray, scale: float) -> np.ndarray:
+    """
+    Convert full-resolution H to resized-image H.
+
+    If p_ref_full ~ H_full * p_target_full,
+    and p_scaled = S * p_full,
+    then:
+      H_scaled = S * H_full * S^-1
+    """
+    S = np.array(
+        [
+            [scale, 0.0, 0.0],
+            [0.0, scale, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    H_scaled = S @ H_full @ np.linalg.inv(S)
+    return normalize_homography(H_scaled)
+
+
+def unscale_homography_to_full_image(H_scaled: np.ndarray, scale: float) -> np.ndarray:
+    """
+    Convert resized-image H back to full-resolution H.
+
+      H_full = S^-1 * H_scaled * S
+    """
+    S = np.array(
+        [
+            [scale, 0.0, 0.0],
+            [0.0, scale, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    H_full = np.linalg.inv(S) @ H_scaled @ S
+    return normalize_homography(H_full)
+
+
+def resize_for_ecc(img: np.ndarray, scale: float) -> np.ndarray:
+    if abs(scale - 1.0) < 1e-12:
+        return img.astype(np.float32)
+
+    h, w = img.shape
+    new_w = max(8, int(round(w * scale)))
+    new_h = max(8, int(round(h * scale)))
+
+    out = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return out.astype(np.float32)
+
+
+def preprocess_ecc_image(img: np.ndarray, blur_ksize: int) -> np.ndarray:
+    out = img.astype(np.float32)
+
+    if blur_ksize > 0:
+        if blur_ksize % 2 == 0:
+            blur_ksize += 1
+
+        out = cv2.GaussianBlur(out, (blur_ksize, blur_ksize), 0)
+
+    return out.astype(np.float32)
+
+
+def refine_homography_ecc(
+    H_init_full: np.ndarray,
+    target_y: np.ndarray,
+    ref_y: np.ndarray,
+    bitdepth: int,
+    iters: int,
+    eps: float,
+    scale: float,
+    blur_ksize: int,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Refine H using ECC.
+
+    Convention:
+      templateImage = target
+      inputImage    = ref
+
+    OpenCV ECC homography convention is compatible with:
+      output_target(x) = ref(H * x)
+    when the returned warp matrix is used as target->ref mapping.
+
+    So the refined H can be directly used for our remap:
+      p_ref ~ H_refined * p_target
+    """
+    H_init_full = normalize_homography(H_init_full)
+
+    meta = {
+        "enabled": bool(iters > 0),
+        "success": False,
+        "cc": None,
+        "iters": int(iters),
+        "eps": float(eps),
+        "scale": float(scale),
+        "blur_ksize": int(blur_ksize),
+        "error": None,
+    }
+
+    if iters <= 0:
+        return H_init_full, meta
+
+    if scale <= 0.0 or scale > 1.0:
+        raise ValueError("--h-refine-scale must be in (0, 1].")
+
+    target_f = to_float_for_ecc(target_y, bitdepth)
+    ref_f = to_float_for_ecc(ref_y, bitdepth)
+
+    target_s = resize_for_ecc(target_f, scale)
+    ref_s = resize_for_ecc(ref_f, scale)
+
+    target_s = preprocess_ecc_image(target_s, blur_ksize)
+    ref_s = preprocess_ecc_image(ref_s, blur_ksize)
+
+    H_scaled = scale_homography_for_resized_image(H_init_full, scale)
+    warp = H_scaled.astype(np.float32)
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        int(iters),
+        float(eps),
+    )
+
+    try:
+        try:
+            cc, warp_refined = cv2.findTransformECC(
+                target_s,
+                ref_s,
+                warp,
+                cv2.MOTION_HOMOGRAPHY,
+                criteria,
+                None,
+                5,
+            )
+        except TypeError:
+            cc, warp_refined = cv2.findTransformECC(
+                target_s,
+                ref_s,
+                warp,
+                cv2.MOTION_HOMOGRAPHY,
+                criteria,
+            )
+
+        H_refined_scaled = normalize_homography(warp_refined.astype(np.float64))
+        H_refined_full = unscale_homography_to_full_image(H_refined_scaled, scale)
+
+        meta["success"] = True
+        meta["cc"] = float(cc)
+
+        return H_refined_full, meta
+
+    except cv2.error as e:
+        meta["error"] = str(e)
+        return H_init_full, meta
+
+
+# ============================================================
 # Homography flow
 # ============================================================
 
@@ -279,6 +468,8 @@ def make_identity_grid(width: int, height: int) -> Tuple[np.ndarray, np.ndarray]
 
 
 def homography_map(H: np.ndarray, width: int, height: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    H = normalize_homography(H)
+
     xs, ys = make_identity_grid(width, height)
 
     x = xs.astype(np.float64)
@@ -322,11 +513,7 @@ def remap_full(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.nd
     )
 
 
-def remap_roi(
-    ref_y: np.ndarray,
-    map_x_roi: np.ndarray,
-    map_y_roi: np.ndarray,
-) -> np.ndarray:
+def remap_roi(ref_y: np.ndarray, map_x_roi: np.ndarray, map_y_roi: np.ndarray) -> np.ndarray:
     return cv2.remap(
         ref_y.astype(np.float32),
         map_x_roi.astype(np.float32),
@@ -340,6 +527,15 @@ def remap_roi(
 # ============================================================
 # Cost
 # ============================================================
+
+def valid_from_map(map_x: np.ndarray, map_y: np.ndarray, width: int, height: int) -> np.ndarray:
+    return (
+        (map_x >= 0.0)
+        & (map_x <= width - 1.0)
+        & (map_y >= 0.0)
+        & (map_y <= height - 1.0)
+    )
+
 
 def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, min_valid_ratio: float):
     valid_ratio = float(np.mean(valid))
@@ -369,15 +565,6 @@ def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, min_v
         "mse": mse,
         "psnr": psnr,
     }
-
-
-def valid_from_map(map_x: np.ndarray, map_y: np.ndarray, width: int, height: int) -> np.ndarray:
-    return (
-        (map_x >= 0.0)
-        & (map_x <= width - 1.0)
-        & (map_y >= 0.0)
-        & (map_y <= height - 1.0)
-    )
 
 
 # ============================================================
@@ -537,7 +724,7 @@ def search_best_c_for_block(
             min_width=min_range_width,
         )
 
-    best_c = final_best["c"]
+    best_c = float(final_best["c"])
 
     map_x = xs_roi + best_c * flow_x_roi
     map_y = ys_roi + best_c * flow_y_roi
@@ -545,7 +732,7 @@ def search_best_c_for_block(
     pred = remap_roi(ref_y, map_x, map_y)
 
     return {
-        "best_c": float(best_c),
+        "best_c": best_c,
         "best_cost_mae": float(final_best["cost"]),
         "second_best_cost_mae": float(final_best["second_cost"]),
         "confidence_second_minus_best": float(final_best["confidence"]),
@@ -675,7 +862,6 @@ def framewise_c_refine(
 ):
     height, width = target_y.shape
 
-    # Treat the whole picture as one block.
     res = search_best_c_for_block(
         target_y=target_y,
         ref_y=ref_y,
@@ -785,6 +971,31 @@ def main():
     parser.add_argument("--ransac-thresh", type=float, default=2.0)
     parser.add_argument("--no-clahe", action="store_true")
 
+    parser.add_argument(
+        "--h-refine-iters",
+        type=int,
+        default=100,
+        help="ECC iterations for refining homography H. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--h-refine-eps",
+        type=float,
+        default=1e-7,
+        help="ECC convergence epsilon.",
+    )
+    parser.add_argument(
+        "--h-refine-scale",
+        type=float,
+        default=0.5,
+        help="Image scale for ECC homography refinement. Must be in (0, 1].",
+    )
+    parser.add_argument(
+        "--h-refine-blur",
+        type=int,
+        default=5,
+        help="Gaussian blur kernel for ECC images. 0 disables blur. Even values are rounded up.",
+    )
+
     parser.add_argument("--block-size", type=int, default=64)
 
     parser.add_argument("--c-min", type=float, default=0.0)
@@ -814,12 +1025,16 @@ def main():
     print(f"[INFO] resolution={args.width}x{args.height}, bitdepth={args.bitdepth}")
     print(f"[INFO] block_size={args.block_size}")
     print(f"[INFO] c range=[{args.c_min}, {args.c_max}], samples={args.c_samples}, iters={args.c_search_iters}")
+    print(
+        f"[INFO] H ECC refine: iters={args.h_refine_iters}, "
+        f"scale={args.h_refine_scale}, eps={args.h_refine_eps}, blur={args.h_refine_blur}"
+    )
 
     target = read_y_frame(args.input, args.width, args.height, args.bitdepth, args.target_idx)
     ref = read_y_frame(args.input, args.width, args.height, args.bitdepth, args.ref_idx)
 
     # ------------------------------------------------------------
-    # Match + estimate homography.
+    # Match + initial homography.
     # ------------------------------------------------------------
 
     match_result = detect_and_match_orb(
@@ -833,7 +1048,7 @@ def main():
 
     print(f"[INFO] good matches = {len(match_result.good_matches)}")
 
-    H, h_mask = estimate_homography(
+    H_init, h_mask = estimate_initial_homography(
         pts_target=match_result.pts_target,
         pts_ref=match_result.pts_ref,
         ransac_thresh=args.ransac_thresh,
@@ -842,8 +1057,8 @@ def main():
     h_inliers = int(np.count_nonzero(h_mask)) if h_mask is not None else 0
 
     print(f"[INFO] homography inliers = {h_inliers}")
-    print("[INFO] H target->ref:")
-    print(H)
+    print("[INFO] Initial H target->ref:")
+    print(H_init)
 
     save_match_vis(
         os.path.join(args.output_dir, "match_vis_homography_inliers.png"),
@@ -855,21 +1070,51 @@ def main():
     )
 
     # ------------------------------------------------------------
-    # Build homography flow.
+    # Evaluate initial H.
+    # ------------------------------------------------------------
+
+    init_hom_x, init_hom_y, init_hom_valid = homography_map(H_init, args.width, args.height)
+    pred_hom_init = remap_full(ref.y, init_hom_x, init_hom_y)
+    init_hom_cost = calc_cost(target.y, pred_hom_init, init_hom_valid, args.min_valid_ratio)
+
+    print(f"[INFO] initial homography c=1 cost: {init_hom_cost}")
+
+    # ------------------------------------------------------------
+    # Refine homography H by ECC.
+    # ------------------------------------------------------------
+
+    H_refined, ecc_meta = refine_homography_ecc(
+        H_init_full=H_init,
+        target_y=target.y,
+        ref_y=ref.y,
+        bitdepth=args.bitdepth,
+        iters=args.h_refine_iters,
+        eps=args.h_refine_eps,
+        scale=args.h_refine_scale,
+        blur_ksize=args.h_refine_blur,
+    )
+
+    print("[INFO] ECC meta:")
+    print(json.dumps(ecc_meta, indent=2))
+    print("[INFO] Refined H target->ref:")
+    print(H_refined)
+
+    # ------------------------------------------------------------
+    # Build refined homography flow.
     # ------------------------------------------------------------
 
     xs, ys, flow_x, flow_y, hom_x, hom_y, hom_valid = build_homography_flow(
-        H=H,
+        H=H_refined,
         width=args.width,
         height=args.height,
     )
 
-    pred_hom = remap_full(ref.y, hom_x, hom_y)
-    hom_cost = calc_cost(target.y, pred_hom, hom_valid, args.min_valid_ratio)
+    pred_hom_refined = remap_full(ref.y, hom_x, hom_y)
+    refined_hom_cost = calc_cost(target.y, pred_hom_refined, hom_valid, args.min_valid_ratio)
 
-    print(f"[INFO] homography c=1 cost: {hom_cost}")
+    print(f"[INFO] refined homography c=1 cost: {refined_hom_cost}")
 
-    # Identity/no warp baseline.
+    # Identity baseline.
     pred_identity = remap_full(ref.y, xs, ys)
     identity_valid = valid_from_map(xs, ys, args.width, args.height)
     identity_cost = calc_cost(target.y, pred_identity, identity_valid, args.min_valid_ratio)
@@ -877,7 +1122,7 @@ def main():
     print(f"[INFO] identity c=0 cost: {identity_cost}")
 
     # ------------------------------------------------------------
-    # Frame-level C coarse-to-fine.
+    # Frame-level C coarse-to-fine using refined H flow.
     # ------------------------------------------------------------
 
     pred_frame_c, valid_frame_c, frame_c_meta = framewise_c_refine(
@@ -899,7 +1144,7 @@ def main():
     print(json.dumps(frame_c_meta, indent=2))
 
     # ------------------------------------------------------------
-    # Block-level C coarse-to-fine.
+    # Block-level C coarse-to-fine using refined H flow.
     # ------------------------------------------------------------
 
     pred_block_c, valid_block_c, c_map, conf_map, block_meta = blockwise_c_refine(
@@ -929,7 +1174,8 @@ def main():
         "target_yuv": os.path.join(args.output_dir, "target_pair.yuv"),
         "ref_yuv": os.path.join(args.output_dir, "ref_pair.yuv"),
         "pred_identity_yuv": os.path.join(args.output_dir, "pred_identity_c0.yuv"),
-        "pred_homography_yuv": os.path.join(args.output_dir, "pred_homography_c1.yuv"),
+        "pred_homography_initial_yuv": os.path.join(args.output_dir, "pred_homography_initial_c1.yuv"),
+        "pred_homography_refined_yuv": os.path.join(args.output_dir, "pred_homography_refined_c1.yuv"),
         "pred_frame_c_yuv": os.path.join(args.output_dir, "pred_frameC_refined.yuv"),
         "pred_block_c_yuv": os.path.join(args.output_dir, f"pred_block{args.block_size}C_refined.yuv"),
     }
@@ -937,7 +1183,8 @@ def main():
     write_single_yuv420(paths["target_yuv"], target.y, args.width, args.height, args.bitdepth)
     write_single_yuv420(paths["ref_yuv"], ref.y, args.width, args.height, args.bitdepth)
     write_single_yuv420(paths["pred_identity_yuv"], pred_identity, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_homography_yuv"], pred_hom, args.width, args.height, args.bitdepth)
+    write_single_yuv420(paths["pred_homography_initial_yuv"], pred_hom_init, args.width, args.height, args.bitdepth)
+    write_single_yuv420(paths["pred_homography_refined_yuv"], pred_hom_refined, args.width, args.height, args.bitdepth)
     write_single_yuv420(paths["pred_frame_c_yuv"], pred_frame_c, args.width, args.height, args.bitdepth)
     write_single_yuv420(paths["pred_block_c_yuv"], pred_block_c, args.width, args.height, args.bitdepth)
 
@@ -948,12 +1195,14 @@ def main():
     save_gray_png(os.path.join(args.output_dir, "target.png"), target.y, args.bitdepth)
     save_gray_png(os.path.join(args.output_dir, "ref.png"), ref.y, args.bitdepth)
     save_gray_png(os.path.join(args.output_dir, "pred_identity_c0.png"), pred_identity, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_homography_c1.png"), pred_hom, args.bitdepth)
+    save_gray_png(os.path.join(args.output_dir, "pred_homography_initial_c1.png"), pred_hom_init, args.bitdepth)
+    save_gray_png(os.path.join(args.output_dir, "pred_homography_refined_c1.png"), pred_hom_refined, args.bitdepth)
     save_gray_png(os.path.join(args.output_dir, "pred_frameC_refined.png"), pred_frame_c, args.bitdepth)
     save_gray_png(os.path.join(args.output_dir, f"pred_block{args.block_size}C_refined.png"), pred_block_c, args.bitdepth)
 
     save_diff_png(os.path.join(args.output_dir, "diff_identity_c0.png"), target.y, pred_identity, identity_valid)
-    save_diff_png(os.path.join(args.output_dir, "diff_homography_c1.png"), target.y, pred_hom, hom_valid)
+    save_diff_png(os.path.join(args.output_dir, "diff_homography_initial_c1.png"), target.y, pred_hom_init, init_hom_valid)
+    save_diff_png(os.path.join(args.output_dir, "diff_homography_refined_c1.png"), target.y, pred_hom_refined, hom_valid)
     save_diff_png(os.path.join(args.output_dir, "diff_frameC_refined.png"), target.y, pred_frame_c, valid_frame_c)
     save_diff_png(os.path.join(args.output_dir, f"diff_block{args.block_size}C_refined.png"), target.y, pred_block_c, valid_block_c)
 
@@ -974,12 +1223,12 @@ def main():
         "target_idx": int(args.target_idx),
         "ref_idx": int(args.ref_idx),
 
-        "model": "p_pred = p_identity + c_block * (p_homography - p_identity)",
+        "model": "p_pred = p_identity + c_block * (p_homography_refined - p_identity)",
         "c_meaning": {
             "c=0": "identity / no warp",
-            "c=1": "homography",
-            "c<1": "weaker than homography",
-            "c>1": "stronger than homography along the same flow direction",
+            "c=1": "refined homography",
+            "c<1": "weaker than refined homography",
+            "c>1": "stronger than refined homography along the same flow direction",
         },
 
         "matching": {
@@ -991,7 +1240,11 @@ def main():
             "clahe": bool(not args.no_clahe),
         },
 
-        "homography_H_target_to_ref": H.tolist(),
+        "homography": {
+            "H_initial_target_to_ref": H_init.tolist(),
+            "H_refined_target_to_ref": H_refined.tolist(),
+            "ecc": ecc_meta,
+        },
 
         "search": {
             "block_size": int(args.block_size),
@@ -1006,7 +1259,8 @@ def main():
 
         "costs": {
             "identity_c0": identity_cost,
-            "homography_c1": hom_cost,
+            "homography_initial_c1": init_hom_cost,
+            "homography_refined_c1": refined_hom_cost,
             "frame_c_refined": frame_c_meta,
             "block_c_refined_summary": block_meta["summary"],
         },
@@ -1018,11 +1272,13 @@ def main():
             "target_png": os.path.join(args.output_dir, "target.png"),
             "ref_png": os.path.join(args.output_dir, "ref.png"),
             "pred_identity_png": os.path.join(args.output_dir, "pred_identity_c0.png"),
-            "pred_homography_png": os.path.join(args.output_dir, "pred_homography_c1.png"),
+            "pred_homography_initial_png": os.path.join(args.output_dir, "pred_homography_initial_c1.png"),
+            "pred_homography_refined_png": os.path.join(args.output_dir, "pred_homography_refined_c1.png"),
             "pred_frame_c_png": os.path.join(args.output_dir, "pred_frameC_refined.png"),
             "pred_block_c_png": os.path.join(args.output_dir, f"pred_block{args.block_size}C_refined.png"),
             "diff_identity_png": os.path.join(args.output_dir, "diff_identity_c0.png"),
-            "diff_homography_png": os.path.join(args.output_dir, "diff_homography_c1.png"),
+            "diff_homography_initial_png": os.path.join(args.output_dir, "diff_homography_initial_c1.png"),
+            "diff_homography_refined_png": os.path.join(args.output_dir, "diff_homography_refined_c1.png"),
             "diff_frame_c_png": os.path.join(args.output_dir, "diff_frameC_refined.png"),
             "diff_block_c_png": os.path.join(args.output_dir, f"diff_block{args.block_size}C_refined.png"),
             "c_map_png": os.path.join(args.output_dir, f"c_map_block{args.block_size}.png"),
@@ -1032,12 +1288,13 @@ def main():
         "block_records": block_meta["blocks"],
 
         "notes": [
-            "Affine is not used in this version.",
-            "The base direction field is the dense flow from identity to homography.",
-            "Block-wise C is found by coarse-to-fine search.",
-            "c_search_iters controls how many times the best C neighborhood is refined.",
-            "If most blocks select c near 1, the homography itself is already a good global predictor.",
-            "If blocks select different C values, the homography flow direction is useful but local strength differs spatially.",
+            "Initial homography is estimated by ORB matching and RANSAC.",
+            "Refined homography is obtained by ECC photometric alignment.",
+            "Use --h-refine-iters 0 to disable ECC refinement.",
+            "C search is separate from H refinement.",
+            "c=1 means the refined homography itself.",
+            "If the scene is pure camera rotation, pred_homography_refined_c1 should usually be the most physically meaningful baseline.",
+            "If block-wise C improves over c=1, the homography flow direction is useful but local strength differs spatially.",
         ],
     }
 
@@ -1047,9 +1304,10 @@ def main():
 
     print(f"[DONE] result JSON: {json_path}")
     print(f"[DONE] target YUV: {paths['target_yuv']}")
-    print(f"[DONE] homography YUV: {paths['pred_homography_yuv']}")
-    print(f"[DONE] frame refined C YUV: {paths['pred_frame_c_yuv']}")
-    print(f"[DONE] block refined C YUV: {paths['pred_block_c_yuv']}")
+    print(f"[DONE] initial homography YUV: {paths['pred_homography_initial_yuv']}")
+    print(f"[DONE] refined homography YUV: {paths['pred_homography_refined_yuv']}")
+    print(f"[DONE] frame C YUV: {paths['pred_frame_c_yuv']}")
+    print(f"[DONE] block C YUV: {paths['pred_block_c_yuv']}")
 
 
 if __name__ == "__main__":
