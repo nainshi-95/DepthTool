@@ -6,19 +6,17 @@
 # Coordinate convention:
 #   target pixel x_t -> ref pixel x_r
 #
-# Main features:
-#   1. Edge-anchored fitting:
-#      For right/bottom partial blocks, the output region remains non-overlapping,
-#      but the fitting region is shifted inward so that local homography is
-#      estimated from a full block_size x block_size window whenever possible.
+# Main update:
+#   Edge-anchored fitting.
+#   For right/bottom partial blocks, the output region remains non-overlapping,
+#   but the fitting region is shifted inward so that the local homography is
+#   estimated from a full block_size x block_size window whenever possible.
 #
-#   2. Root-level CP sweep refinement:
-#      At the largest block level, refine the RANSAC homography by moving
-#      4 destination control points with coordinate-descent photometric search.
-#
-#   3. Strong parent propagation:
-#      Lower levels try local homography, but accept it only if it improves
-#      over inherited parent H by enough absolute/relative MAE gain.
+# Additional update:
+#   Level-0 only small ref-coordinate translation sweep.
+#   After the first largest-block level chooses each block homography,
+#   the code sweeps small dx/dy offsets and keeps T(dx,dy) @ H if it reduces MAE.
+#   The refined H is then passed to the next hierarchical level as parent H.
 #
 # Outputs:
 #   target_pair.yuv
@@ -55,6 +53,21 @@ class MatchResult:
     keypoints_target: list
     keypoints_ref: list
     good_matches: list
+
+
+@dataclass
+class BlockHResult:
+    H: np.ndarray
+    source: str
+    ok: bool
+    match_count: int
+    inlier_count: int
+    reproj_mae: float
+    candidate_cost: float
+    fallback_cost: float
+    chosen_cost: float
+    valid_ratio: float
+    reason: str
 
 
 @dataclass
@@ -506,249 +519,117 @@ def eval_block_photometric_cost(
     return cost, valid_ratio
 
 
-def eval_H_on_tile_region(
+def shift_homography_ref_translation(H: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """
+    Coordinate convention:
+        target pixel -> ref pixel
+
+    This applies a small translation in the ref sampling coordinate:
+        x_ref' = x_ref + dx
+        y_ref' = y_ref + dy
+
+    Homogeneous form:
+        H' = T(dx, dy) @ H
+    """
+    H = normalize_homography(H)
+
+    T = np.array(
+        [
+            [1.0, 0.0, float(dx)],
+            [0.0, 1.0, float(dy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    return normalize_homography(T @ H)
+
+
+def sweep_homography_ref_translation_mae(
     target_y: np.ndarray,
     ref_y: np.ndarray,
     H: np.ndarray,
-    tile: Tile,
-    region: str,
+    bx: int,
+    by: int,
+    bw: int,
+    bh: int,
     min_valid_ratio: float,
-) -> Tuple[float, float]:
-    if region == "out":
-        return eval_block_photometric_cost(
-            target_y, ref_y, H,
-            tile.out_x0, tile.out_y0, tile.out_w, tile.out_h,
-            min_valid_ratio,
-        )
-
-    if region == "fit":
-        return eval_block_photometric_cost(
-            target_y, ref_y, H,
-            tile.fit_x0, tile.fit_y0, tile.fit_w, tile.fit_h,
-            min_valid_ratio,
-        )
-
-    if region == "both":
-        cost_fit, vr_fit = eval_block_photometric_cost(
-            target_y, ref_y, H,
-            tile.fit_x0, tile.fit_y0, tile.fit_w, tile.fit_h,
-            min_valid_ratio,
-        )
-        cost_out, vr_out = eval_block_photometric_cost(
-            target_y, ref_y, H,
-            tile.out_x0, tile.out_y0, tile.out_w, tile.out_h,
-            min_valid_ratio,
-        )
-
-        vals = []
-        if np.isfinite(cost_fit):
-            vals.append(cost_fit)
-        if np.isfinite(cost_out):
-            vals.append(cost_out)
-
-        if not vals:
-            return float("inf"), min(vr_fit, vr_out)
-
-        return float(np.mean(vals)), min(vr_fit, vr_out)
-
-    raise ValueError(f"Unknown CP sweep cost region: {region}")
-
-
-# ============================================================
-# CP sweep refinement
-# ============================================================
-
-def region_corners(x0: int, y0: int, w: int, h: int) -> np.ndarray:
-    x1 = x0 + w - 1
-    y1 = y0 + h - 1
-
-    return np.array(
-        [
-            [x0, y0],
-            [x1, y0],
-            [x1, y1],
-            [x0, y1],
-        ],
-        dtype=np.float32,
-    )
-
-
-def H_from_control_points(src_cps: np.ndarray, dst_cps: np.ndarray) -> Optional[np.ndarray]:
-    try:
-        H = cv2.getPerspectiveTransform(
-            src_cps.astype(np.float32),
-            dst_cps.astype(np.float32),
-        )
-    except cv2.error:
-        return None
-
-    if H is None:
-        return None
-
-    return normalize_homography(H)
-
-
-def refine_homography_cp_sweep(
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    H_init: np.ndarray,
-    tile: Tile,
-    args,
-) -> Tuple[np.ndarray, Dict]:
+    radius: float,
+    step: float,
+    min_gain: float,
+) -> Tuple[np.ndarray, float, float, float, float, bool]:
     """
-    Coordinate-descent CP sweep.
+    Sweep small ref-coordinate translation around H and choose the lowest MAE.
 
-    Source CPs:
-        4 corners of fitting tile.
-
-    Destination CPs:
-        H_init(source CPs), then each CP is locally perturbed.
-
-    Cost:
-        MAE over args.cp_sweep_cost_region.
-        Default: fit region.
+    Returns:
+        best_H
+        best_dx
+        best_dy
+        best_cost
+        best_valid_ratio
+        applied
     """
-    if args.disable_cp_sweep:
-        return H_init, {
-            "enabled": False,
-            "reason": "disabled",
-            "initial_cost": None,
-            "final_cost": None,
-            "improvement": 0.0,
-            "num_evals": 0,
-        }
+    H0 = normalize_homography(H)
 
-    if args.cp_sweep_steps <= 0:
-        return H_init, {
-            "enabled": False,
-            "reason": "steps_le_0",
-            "initial_cost": None,
-            "final_cost": None,
-            "improvement": 0.0,
-            "num_evals": 0,
-        }
-
-    src_cps = region_corners(tile.fit_x0, tile.fit_y0, tile.fit_w, tile.fit_h)
-    dst_cps = apply_homography_points(H_init, src_cps).astype(np.float32)
-
-    H_best = H_from_control_points(src_cps, dst_cps)
-    if H_best is None:
-        return H_init, {
-            "enabled": True,
-            "reason": "initial_cp_to_H_failed",
-            "initial_cost": None,
-            "final_cost": None,
-            "improvement": 0.0,
-            "num_evals": 0,
-        }
-
-    best_cost, best_vr = eval_H_on_tile_region(
+    base_cost, base_valid_ratio = eval_block_photometric_cost(
         target_y=target_y,
         ref_y=ref_y,
-        H=H_best,
-        tile=tile,
-        region=args.cp_sweep_cost_region,
-        min_valid_ratio=args.min_block_valid_ratio,
+        H=H0,
+        bx=bx,
+        by=by,
+        bw=bw,
+        bh=bh,
+        min_valid_ratio=min_valid_ratio,
     )
 
-    initial_cost = best_cost
-    num_evals = 1
+    if radius <= 0.0 or step <= 0.0:
+        return H0, 0.0, 0.0, base_cost, base_valid_ratio, False
 
-    if not np.isfinite(best_cost):
-        return H_init, {
-            "enabled": True,
-            "reason": "initial_cost_invalid",
-            "initial_cost": None,
-            "final_cost": None,
-            "improvement": 0.0,
-            "num_evals": num_evals,
-        }
+    offsets = np.arange(-radius, radius + step * 0.5, step, dtype=np.float64)
 
-    current_cps = dst_cps.copy()
+    best_H = H0
+    best_dx = 0.0
+    best_dy = 0.0
+    best_cost = base_cost
+    best_valid_ratio = base_valid_ratio
 
-    step = float(args.cp_sweep_initial_step)
+    for dy in offsets:
+        for dx in offsets:
+            if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+                continue
 
-    for step_idx in range(args.cp_sweep_steps):
-        for _pass in range(args.cp_sweep_passes):
-            any_improved = False
+            H_try = shift_homography_ref_translation(H0, dx, dy)
 
-            for cp_idx in range(4):
-                local_best_cost = best_cost
-                local_best_cps = current_cps.copy()
-                local_best_H = H_best
+            cost, valid_ratio = eval_block_photometric_cost(
+                target_y=target_y,
+                ref_y=ref_y,
+                H=H_try,
+                bx=bx,
+                by=by,
+                bw=bw,
+                bh=bh,
+                min_valid_ratio=min_valid_ratio,
+            )
 
-                # 8-neighborhood + stay.
-                for dy in (-step, 0.0, step):
-                    for dx in (-step, 0.0, step):
-                        if dx == 0.0 and dy == 0.0:
-                            continue
+            if cost < best_cost:
+                best_H = H_try
+                best_dx = float(dx)
+                best_dy = float(dy)
+                best_cost = cost
+                best_valid_ratio = valid_ratio
 
-                        trial_cps = current_cps.copy()
-                        trial_cps[cp_idx, 0] += dx
-                        trial_cps[cp_idx, 1] += dy
+    if np.isfinite(best_cost):
+        if np.isfinite(base_cost):
+            applied = best_cost <= base_cost - min_gain
+        else:
+            applied = True
+    else:
+        applied = False
 
-                        H_trial = H_from_control_points(src_cps, trial_cps)
-                        if H_trial is None:
-                            continue
+    if not applied:
+        return H0, 0.0, 0.0, base_cost, base_valid_ratio, False
 
-                        cost_trial, vr_trial = eval_H_on_tile_region(
-                            target_y=target_y,
-                            ref_y=ref_y,
-                            H=H_trial,
-                            tile=tile,
-                            region=args.cp_sweep_cost_region,
-                            min_valid_ratio=args.min_block_valid_ratio,
-                        )
-                        num_evals += 1
-
-                        if not np.isfinite(cost_trial):
-                            continue
-
-                        if cost_trial + 1e-9 < local_best_cost:
-                            local_best_cost = cost_trial
-                            local_best_cps = trial_cps
-                            local_best_H = H_trial
-
-                if local_best_cost + 1e-9 < best_cost:
-                    best_cost = local_best_cost
-                    current_cps = local_best_cps
-                    H_best = local_best_H
-                    any_improved = True
-
-            if not any_improved:
-                break
-
-        step *= float(args.cp_sweep_step_decay)
-
-    improvement = float(initial_cost - best_cost)
-
-    # Safety: keep initial H if CP sweep improved too little or got worse.
-    if improvement < float(args.cp_sweep_min_gain):
-        return H_init, {
-            "enabled": True,
-            "accepted": False,
-            "reason": "cp_sweep_gain_too_small",
-            "initial_cost": float(initial_cost),
-            "final_cost": float(best_cost),
-            "improvement": improvement,
-            "num_evals": int(num_evals),
-            "cost_region": args.cp_sweep_cost_region,
-            "initial_cps": dst_cps.tolist(),
-            "final_cps": current_cps.tolist(),
-        }
-
-    return H_best, {
-        "enabled": True,
-        "accepted": True,
-        "reason": "cp_sweep_accepted",
-        "initial_cost": float(initial_cost),
-        "final_cost": float(best_cost),
-        "improvement": improvement,
-        "num_evals": int(num_evals),
-        "cost_region": args.cp_sweep_cost_region,
-        "initial_cps": dst_cps.tolist(),
-        "final_cps": current_cps.tolist(),
-    }
+    return best_H, best_dx, best_dy, best_cost, best_valid_ratio, True
 
 
 # ============================================================
@@ -854,70 +735,6 @@ def render_prediction_from_H_grid(
     return pred, valid_all
 
 
-def candidate_accept_by_cost(
-    candidate_cost: float,
-    fallback_cost: float,
-    level: int,
-    args,
-) -> Tuple[bool, Dict]:
-    if args.disable_cost_gate:
-        return np.isfinite(candidate_cost), {
-            "mode": "disabled",
-            "abs_gain": None,
-            "rel_gain": None,
-            "abs_ok": True,
-            "rel_ok": True,
-        }
-
-    if not np.isfinite(candidate_cost):
-        return False, {
-            "mode": "invalid_candidate",
-            "abs_gain": None,
-            "rel_gain": None,
-            "abs_ok": False,
-            "rel_ok": False,
-        }
-
-    if not np.isfinite(fallback_cost):
-        return True, {
-            "mode": "fallback_invalid",
-            "abs_gain": None,
-            "rel_gain": None,
-            "abs_ok": True,
-            "rel_ok": True,
-        }
-
-    abs_gain = float(fallback_cost - candidate_cost)
-    rel_gain = float(abs_gain / max(abs(fallback_cost), 1e-9))
-
-    # Root is allowed to be more permissive.
-    min_rel_gain = args.root_min_rel_gain if level == 0 else args.child_min_rel_gain
-
-    abs_ok = abs_gain >= float(args.min_gain)
-    rel_ok = rel_gain >= float(min_rel_gain)
-
-    if args.gain_gate_mode == "absolute":
-        accepted = abs_ok
-    elif args.gain_gate_mode == "relative":
-        accepted = rel_ok
-    elif args.gain_gate_mode == "either":
-        accepted = abs_ok or rel_ok
-    elif args.gain_gate_mode == "both":
-        accepted = abs_ok and rel_ok
-    else:
-        raise ValueError(f"Unknown gain_gate_mode: {args.gain_gate_mode}")
-
-    return accepted, {
-        "mode": args.gain_gate_mode,
-        "abs_gain": abs_gain,
-        "rel_gain": rel_gain,
-        "min_abs_gain": float(args.min_gain),
-        "min_rel_gain": float(min_rel_gain),
-        "abs_ok": bool(abs_ok),
-        "rel_ok": bool(rel_ok),
-    }
-
-
 def run_one_level(
     target_y: np.ndarray,
     ref_y: np.ndarray,
@@ -928,13 +745,13 @@ def run_one_level(
     parent_H_grid: Optional[np.ndarray],
     parent_block_size: Optional[int],
     root_fallback_H: np.ndarray,
-    level: int,
     args,
 ) -> Tuple[np.ndarray, List[List[Dict]], Dict[str, np.ndarray]]:
     height, width = target_y.shape
     ny, nx = block_grid_shape(width, height, block_size)
 
     edge_anchored_fit = not args.disable_edge_anchored_fit
+    is_first_largest_level = parent_H_grid is None
 
     tiles = make_tiles(
         width=width,
@@ -953,33 +770,29 @@ def run_one_level(
     fallback_cost_grid = np.full((ny, nx), np.inf, dtype=np.float64)
     chosen_cost_grid = np.full((ny, nx), np.inf, dtype=np.float64)
     valid_ratio_grid = np.zeros((ny, nx), dtype=np.float64)
-    cp_sweep_gain_grid = np.zeros((ny, nx), dtype=np.float64)
+
+    level0_sweep_applied_grid = np.zeros((ny, nx), dtype=np.float64)
+    level0_sweep_dx_grid = np.zeros((ny, nx), dtype=np.float64)
+    level0_sweep_dy_grid = np.zeros((ny, nx), dtype=np.float64)
 
     # source id:
     # 0 root_fallback
     # 1 parent_inherit
     # 2 local_fit
     # 3 local_fit_rejected_cost
-    # 4 local_fit_cp_sweep
     source_id = {
         "root_fallback": 0,
         "parent_inherit": 1,
         "local_fit": 2,
         "local_fit_rejected_cost": 3,
-        "local_fit_cp_sweep": 4,
     }
 
     level_records: List[List[Dict]] = []
 
     accepted = 0
-    accepted_cp_sweep = 0
     inherited = 0
     rejected = 0
-
-    do_cp_sweep_this_level = (
-        (not args.disable_cp_sweep)
-        and level < args.cp_sweep_levels
-    )
+    level0_sweep_applied_count = 0
 
     for by_idx, row in enumerate(tiles):
         row_records = []
@@ -1012,6 +825,8 @@ def run_one_level(
             )
 
             # Matches are collected from the fitting tile.
+            # For edge blocks, this fitting tile is shifted inward and may be
+            # much larger than the actual output tile.
             pts_t, pts_r = collect_matches_for_block(
                 pts_t_all=pts_t_all,
                 pts_r_all=pts_r_all,
@@ -1034,34 +849,15 @@ def run_one_level(
                 min_inliers=args.min_inliers,
             )
 
-            cp_sweep_meta = {
-                "enabled": False,
-                "reason": "not_attempted",
-                "improvement": 0.0,
-                "num_evals": 0,
-            }
-
             chosen_H = fallback_H
             chosen_source = fallback_source
             candidate_cost = float("inf")
             chosen_cost = fallback_cost
             chosen_valid_ratio = fallback_valid_ratio
             reason = fit_reason
-            gate_meta = {}
 
             if H_candidate is not None:
-                if do_cp_sweep_this_level:
-                    H_refined, cp_sweep_meta = refine_homography_cp_sweep(
-                        target_y=target_y,
-                        ref_y=ref_y,
-                        H_init=H_candidate,
-                        tile=tile,
-                        args=args,
-                    )
-
-                    H_candidate = H_refined
-
-                # Candidate is judged only on the output tile.
+                # Candidate is also judged only on the output tile.
                 candidate_cost, candidate_valid_ratio = eval_block_photometric_cost(
                     target_y=target_y,
                     ref_y=ref_y,
@@ -1073,22 +869,17 @@ def run_one_level(
                     min_valid_ratio=args.min_block_valid_ratio,
                 )
 
-                accept_by_cost, gate_meta = candidate_accept_by_cost(
-                    candidate_cost=candidate_cost,
-                    fallback_cost=fallback_cost,
-                    level=level,
-                    args=args,
-                )
+                accept_by_cost = True
+
+                if not args.disable_cost_gate:
+                    if np.isfinite(fallback_cost):
+                        accept_by_cost = candidate_cost <= fallback_cost - args.min_gain
+                    else:
+                        accept_by_cost = np.isfinite(candidate_cost)
 
                 if np.isfinite(candidate_cost) and accept_by_cost:
                     chosen_H = H_candidate
-
-                    if cp_sweep_meta.get("accepted", False):
-                        chosen_source = "local_fit_cp_sweep"
-                        accepted_cp_sweep += 1
-                    else:
-                        chosen_source = "local_fit"
-
+                    chosen_source = "local_fit"
                     chosen_cost = candidate_cost
                     chosen_valid_ratio = candidate_valid_ratio
                     reason = "local_fit_accepted"
@@ -1103,6 +894,55 @@ def run_one_level(
             else:
                 inherited += 1
 
+            # ------------------------------------------------------------
+            # Level-0 only small translation sweep.
+            #
+            # This is applied only at the first largest-block level.
+            # The refined H becomes the parent H for the next level.
+            # ------------------------------------------------------------
+            level0_sweep_applied = False
+            level0_sweep_dx = 0.0
+            level0_sweep_dy = 0.0
+
+            if (
+                is_first_largest_level
+                and not args.disable_level0_sweep
+                and args.level0_sweep_radius > 0.0
+                and args.level0_sweep_step > 0.0
+            ):
+                swept_H, swept_dx, swept_dy, swept_cost, swept_valid_ratio, swept_applied = (
+                    sweep_homography_ref_translation_mae(
+                        target_y=target_y,
+                        ref_y=ref_y,
+                        H=chosen_H,
+                        bx=tile.out_x0,
+                        by=tile.out_y0,
+                        bw=tile.out_w,
+                        bh=tile.out_h,
+                        min_valid_ratio=args.min_block_valid_ratio,
+                        radius=args.level0_sweep_radius,
+                        step=args.level0_sweep_step,
+                        min_gain=args.level0_sweep_min_gain,
+                    )
+                )
+
+                if swept_applied:
+                    chosen_H = swept_H
+                    chosen_cost = swept_cost
+                    chosen_valid_ratio = swept_valid_ratio
+
+                    level0_sweep_applied = True
+                    level0_sweep_dx = swept_dx
+                    level0_sweep_dy = swept_dy
+                    level0_sweep_applied_count += 1
+
+                    reason = (
+                        f"{reason}+level0_sweep"
+                        f"(dx={swept_dx:.3f},dy={swept_dy:.3f})"
+                    )
+                else:
+                    reason = f"{reason}+level0_sweep_no_gain"
+
             H_grid[by_idx, bx_idx] = normalize_homography(chosen_H)
             source_grid[by_idx, bx_idx] = source_id.get(chosen_source, 0)
             match_count_grid[by_idx, bx_idx] = len(pts_t)
@@ -1112,7 +952,10 @@ def run_one_level(
             fallback_cost_grid[by_idx, bx_idx] = fallback_cost
             chosen_cost_grid[by_idx, bx_idx] = chosen_cost
             valid_ratio_grid[by_idx, bx_idx] = chosen_valid_ratio
-            cp_sweep_gain_grid[by_idx, bx_idx] = float(cp_sweep_meta.get("improvement", 0.0))
+
+            level0_sweep_applied_grid[by_idx, bx_idx] = 1.0 if level0_sweep_applied else 0.0
+            level0_sweep_dx_grid[by_idx, bx_idx] = level0_sweep_dx
+            level0_sweep_dy_grid[by_idx, bx_idx] = level0_sweep_dy
 
             row_records.append(
                 {
@@ -1129,7 +972,7 @@ def run_one_level(
                     "fit_w": int(tile.fit_w),
                     "fit_h": int(tile.fit_h),
 
-                    # Keep old names for compatibility.
+                    # Keep old names for compatibility with previous JSON readers.
                     "block_x": int(tile.out_x0),
                     "block_y": int(tile.out_y0),
                     "block_w": int(tile.out_w),
@@ -1144,8 +987,11 @@ def run_one_level(
                     "fallback_cost": float(fallback_cost) if np.isfinite(fallback_cost) else None,
                     "chosen_cost": float(chosen_cost) if np.isfinite(chosen_cost) else None,
                     "valid_ratio": float(chosen_valid_ratio),
-                    "gain_gate": gate_meta,
-                    "cp_sweep": cp_sweep_meta,
+
+                    "level0_sweep_applied": bool(level0_sweep_applied),
+                    "level0_sweep_dx": float(level0_sweep_dx),
+                    "level0_sweep_dy": float(level0_sweep_dy),
+
                     "H": H_grid[by_idx, bx_idx].tolist(),
                 }
             )
@@ -1161,11 +1007,15 @@ def run_one_level(
         "fallback_cost_grid": fallback_cost_grid,
         "chosen_cost_grid": chosen_cost_grid,
         "valid_ratio_grid": valid_ratio_grid,
-        "cp_sweep_gain_grid": cp_sweep_gain_grid,
+
+        "level0_sweep_applied_grid": level0_sweep_applied_grid,
+        "level0_sweep_dx_grid": level0_sweep_dx_grid,
+        "level0_sweep_dy_grid": level0_sweep_dy_grid,
+
         "accepted": np.array([accepted], dtype=np.float64),
-        "accepted_cp_sweep": np.array([accepted_cp_sweep], dtype=np.float64),
         "inherited": np.array([inherited], dtype=np.float64),
         "rejected": np.array([rejected], dtype=np.float64),
+        "level0_sweep_applied_count": np.array([level0_sweep_applied_count], dtype=np.float64),
     }
 
     return H_grid, level_records, aux
@@ -1301,42 +1151,35 @@ def main():
     )
 
     parser.add_argument("--min-block-valid-ratio", type=float, default=0.50)
-
-    # Cost gate.
     parser.add_argument("--min-gain", type=float, default=0.0)
-    parser.add_argument("--root-min-rel-gain", type=float, default=0.0)
-    parser.add_argument("--child-min-rel-gain", type=float, default=0.05)
-    parser.add_argument(
-        "--gain-gate-mode",
-        choices=["absolute", "relative", "either", "both"],
-        default="both",
-        help=(
-            "How to accept local H over parent/fallback. "
-            "For child levels, default requires both abs gain and relative gain. "
-            "If min-gain is 0, child-min-rel-gain dominates."
-        ),
-    )
     parser.add_argument("--disable-cost-gate", action="store_true")
 
-    # CP sweep.
-    parser.add_argument("--disable-cp-sweep", action="store_true")
     parser.add_argument(
-        "--cp-sweep-levels",
-        type=int,
-        default=1,
-        help="Number of top levels where CP sweep is enabled. Default 1 means root level only.",
+        "--disable-level0-sweep",
+        action="store_true",
+        help="Disable small dx/dy MAE sweep for the first largest-block level.",
     )
+
     parser.add_argument(
-        "--cp-sweep-cost-region",
-        choices=["fit", "out", "both"],
-        default="fit",
-        help="Photometric region used during CP sweep.",
+        "--level0-sweep-radius",
+        type=float,
+        default=2.0,
+        help="Sweep radius in ref pixels for the first level. Example: 2.0 means [-2, +2].",
     )
-    parser.add_argument("--cp-sweep-steps", type=int, default=3)
-    parser.add_argument("--cp-sweep-passes", type=int, default=1)
-    parser.add_argument("--cp-sweep-initial-step", type=float, default=2.0)
-    parser.add_argument("--cp-sweep-step-decay", type=float, default=0.5)
-    parser.add_argument("--cp-sweep-min-gain", type=float, default=0.0)
+
+    parser.add_argument(
+        "--level0-sweep-step",
+        type=float,
+        default=0.25,
+        help="Sweep step in ref pixels. Use 1.0 for integer-pel, 0.5 or 0.25 for sub-pel.",
+    )
+
+    parser.add_argument(
+        "--level0-sweep-min-gain",
+        type=float,
+        default=0.0,
+        help="Minimum MAE gain required to apply the swept shift.",
+    )
 
     parser.add_argument("--output-dir", required=True)
 
@@ -1352,8 +1195,13 @@ def main():
     print(f"[INFO] size={width}x{height}, bitdepth={args.bitdepth}")
     print(f"[INFO] start_block={args.start_block_size}, levels={args.levels}, min_block={args.min_block_size}")
     print(f"[INFO] edge_anchored_fit={edge_anchored_fit}")
-    print(f"[INFO] cp_sweep_enabled={not args.disable_cp_sweep}, cp_sweep_levels={args.cp_sweep_levels}")
-    print(f"[INFO] gain_gate_mode={args.gain_gate_mode}, child_min_rel_gain={args.child_min_rel_gain}")
+    print(
+        "[INFO] level0_sweep="
+        f"{not args.disable_level0_sweep}, "
+        f"radius={args.level0_sweep_radius}, "
+        f"step={args.level0_sweep_step}, "
+        f"min_gain={args.level0_sweep_min_gain}"
+    )
 
     target = read_y_frame(args.input, width, height, args.bitdepth, args.target_idx)
     ref = read_y_frame(args.input, width, height, args.bitdepth, args.ref_idx)
@@ -1422,6 +1270,7 @@ def main():
 
     final_pred = None
     final_valid = None
+    final_H_grid = None
     final_block_size = None
 
     block_size = args.start_block_size
@@ -1443,7 +1292,6 @@ def main():
             parent_H_grid=parent_H_grid,
             parent_block_size=parent_block_size,
             root_fallback_H=root_H,
-            level=level,
             args=args,
         )
 
@@ -1508,26 +1356,42 @@ def main():
         )
 
         save_scalar_map_png(
-            os.path.join(args.output_dir, f"cp_sweep_gain_{level_tag}.png"),
-            aux["cp_sweep_gain_grid"],
+            os.path.join(args.output_dir, f"level0_sweep_applied_{level_tag}.png"),
+            aux["level0_sweep_applied_grid"],
+            width,
+            height,
+            block_size,
+        )
+
+        save_scalar_map_png(
+            os.path.join(args.output_dir, f"level0_sweep_dx_{level_tag}.png"),
+            aux["level0_sweep_dx_grid"],
+            width,
+            height,
+            block_size,
+        )
+
+        save_scalar_map_png(
+            os.path.join(args.output_dir, f"level0_sweep_dy_{level_tag}.png"),
+            aux["level0_sweep_dy_grid"],
             width,
             height,
             block_size,
         )
 
         accepted = int(aux["accepted"][0])
-        accepted_cp_sweep = int(aux["accepted_cp_sweep"][0])
         inherited = int(aux["inherited"][0])
         rejected = int(aux["rejected"][0])
+        level0_sweep_applied_count = int(aux["level0_sweep_applied_count"][0])
 
         summary = {
             "level": int(level),
             "block_size": int(block_size),
             "num_blocks": int(H_grid.shape[0] * H_grid.shape[1]),
             "accepted_local_fit": accepted,
-            "accepted_cp_sweep": accepted_cp_sweep,
             "inherited_no_fit": inherited,
             "rejected_by_cost": rejected,
+            "level0_sweep_applied_count": level0_sweep_applied_count,
             "cost": cost,
             "output_yuv": yuv_path,
         }
@@ -1542,17 +1406,37 @@ def main():
                 "source_grid": aux["source_grid"].tolist(),
                 "match_count_grid": aux["match_count_grid"].tolist(),
                 "inlier_count_grid": aux["inlier_count_grid"].tolist(),
-                "reproj_mae_grid": np.where(np.isfinite(aux["reproj_mae_grid"]), aux["reproj_mae_grid"], -1).tolist(),
-                "candidate_cost_grid": np.where(np.isfinite(aux["candidate_cost_grid"]), aux["candidate_cost_grid"], -1).tolist(),
-                "fallback_cost_grid": np.where(np.isfinite(aux["fallback_cost_grid"]), aux["fallback_cost_grid"], -1).tolist(),
-                "chosen_cost_grid": np.where(np.isfinite(aux["chosen_cost_grid"]), aux["chosen_cost_grid"], -1).tolist(),
+                "reproj_mae_grid": np.where(
+                    np.isfinite(aux["reproj_mae_grid"]),
+                    aux["reproj_mae_grid"],
+                    -1,
+                ).tolist(),
+                "candidate_cost_grid": np.where(
+                    np.isfinite(aux["candidate_cost_grid"]),
+                    aux["candidate_cost_grid"],
+                    -1,
+                ).tolist(),
+                "fallback_cost_grid": np.where(
+                    np.isfinite(aux["fallback_cost_grid"]),
+                    aux["fallback_cost_grid"],
+                    -1,
+                ).tolist(),
+                "chosen_cost_grid": np.where(
+                    np.isfinite(aux["chosen_cost_grid"]),
+                    aux["chosen_cost_grid"],
+                    -1,
+                ).tolist(),
                 "valid_ratio_grid": aux["valid_ratio_grid"].tolist(),
-                "cp_sweep_gain_grid": aux["cp_sweep_gain_grid"].tolist(),
+
+                "level0_sweep_applied_grid": aux["level0_sweep_applied_grid"].tolist(),
+                "level0_sweep_dx_grid": aux["level0_sweep_dx_grid"].tolist(),
+                "level0_sweep_dy_grid": aux["level0_sweep_dy_grid"].tolist(),
             }
         )
 
         final_pred = pred
         final_valid = valid
+        final_H_grid = H_grid
         final_block_size = block_size
 
         parent_H_grid = H_grid
@@ -1594,7 +1478,7 @@ def main():
         "ref_idx": int(args.ref_idx),
 
         "method": {
-            "description": "hierarchical block-wise homography fitting with root CP sweep and strong parent propagation",
+            "description": "hierarchical block-wise homography fitting",
             "coordinate": "target pixel -> ref pixel",
             "start_block_size": int(args.start_block_size),
             "levels": int(args.levels),
@@ -1607,21 +1491,13 @@ def main():
             "fit_output_region_separation": (
                 "H is fitted from fit tile; photometric accept/reject and final rendering use output tile only."
             ),
-            "root_cp_sweep": {
-                "enabled": bool(not args.disable_cp_sweep),
-                "cp_sweep_levels": int(args.cp_sweep_levels),
-                "cost_region": args.cp_sweep_cost_region,
-                "steps": int(args.cp_sweep_steps),
-                "passes": int(args.cp_sweep_passes),
-                "initial_step": float(args.cp_sweep_initial_step),
-                "step_decay": float(args.cp_sweep_step_decay),
-                "min_gain": float(args.cp_sweep_min_gain),
-            },
-            "gain_gate": {
-                "mode": args.gain_gate_mode,
-                "min_abs_gain": float(args.min_gain),
-                "root_min_rel_gain": float(args.root_min_rel_gain),
-                "child_min_rel_gain": float(args.child_min_rel_gain),
+            "level0_shift_sweep": {
+                "enabled": bool(not args.disable_level0_sweep),
+                "radius": float(args.level0_sweep_radius),
+                "step": float(args.level0_sweep_step),
+                "min_gain": float(args.level0_sweep_min_gain),
+                "applied_only_to": "first largest-block level",
+                "transform": "H_refined = T(dx, dy) @ H",
             },
         },
 
@@ -1639,9 +1515,6 @@ def main():
             "parent_match_gate": float(args.parent_match_gate),
             "min_block_valid_ratio": float(args.min_block_valid_ratio),
             "min_gain": float(args.min_gain),
-            "root_min_rel_gain": float(args.root_min_rel_gain),
-            "child_min_rel_gain": float(args.child_min_rel_gain),
-            "gain_gate_mode": args.gain_gate_mode,
         },
 
         "root_H": {
@@ -1669,12 +1542,14 @@ def main():
 
         "interpretation": [
             "source_map value 2 means local homography accepted.",
-            "source_map value 4 means local homography accepted after CP sweep refinement.",
             "source_map value 1 means parent homography inherited.",
-            "source_map value 3 means local homography was fitted but rejected by cost gate.",
-            "Root level CP sweep refines RANSAC H by photometric control-point coordinate descent.",
-            "Child levels skip CP sweep by default and accept local H only when it significantly beats parent H.",
-            "For edge blocks, fit_x/fit_y/fit_w/fit_h may differ from output block region.",
+            "source_map value 3 means local homography was fitted but rejected by photometric cost.",
+            "For edge blocks, fit_x/fit_y/fit_w/fit_h in JSON may differ from block_x/block_y/block_w/block_h.",
+            "Edge-anchored fitting uses inward full-size fitting windows for partial right/bottom blocks.",
+            "The final prediction still writes only the non-overlap output tile, so adjacent blocks are not overwritten.",
+            "Level-0 sweep is applied only on the first largest-block level before passing H_grid to the next level.",
+            "Level-0 sweep modifies the ref sampling coordinate by H_refined = T(dx,dy) @ H.",
+            "If an edge block improves after this change, the previous issue was likely caused by too few matches in a partial tile.",
             "This code is diagnostic only; it does not yet compress block homographies into global parameters + scalar c.",
         ],
     }
