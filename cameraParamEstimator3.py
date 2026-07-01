@@ -3111,3 +3111,45 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+python gop_camera_like_torch_lowres_rho.py \
+  --input input.yuv \
+  --width 1920 --height 1080 --bitdepth 10 \
+  --gop-start 0 --gop-size 10 \
+  --pair-mode dyadic \
+  --output-dir gop0_9_torchfit \
+  --reuse-pair-results \
+  --pair-results-dir 기존_pair_output_dir \
+  --obs-exclude-rejected \
+  --cp-pattern center4 \
+  --device cuda \
+  --torch-steps 2000 \
+  --pose-only-steps 300 \
+  --rho-grid-stride 128 \
+  --lr-pose 1e-3 \
+  --lr-depth 5e-3 \
+  --depth-tv-weight 0.1 \
+  --depth-prior-weight 0.1 \
+  --valid-ratio-weight-gamma 2.0 \
+  --block-weight-update-every 200 \
+  --block-trim-start-step 500 \
+  --block-trim-fraction 0.05 \
+  --block-downweight-factor 0.2
