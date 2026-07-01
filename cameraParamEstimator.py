@@ -1505,3 +1505,39 @@ direct_edges_json.append({
 
 
 
+
+
+
+
+
+
+
+
+
+
+import json
+
+with open("gop_rt.json", "r") as f:
+    data = json.load(f)
+
+res = data["pose_graph_residuals"]
+
+res_sorted = sorted(
+    res,
+    key=lambda x: x["translation_dir_error_deg"],
+    reverse=True,
+)
+
+for r in res_sorted[:20]:
+    print(
+        f'target={r["target_idx"]:3d}, ref={r["ref_idx"]:3d}, '
+        f'rot={r["rotation_error_deg"]:.4f} deg, '
+        f'trans={r["translation_dir_error_deg"]:.4f} deg, '
+        f'matches={r["num_matches"]}, '
+        f'inliers={r["pose_inliers"]}, '
+        f'sampson_med={r["sampson_error_median"]:.4f}'
+    )
+
+
+
+
