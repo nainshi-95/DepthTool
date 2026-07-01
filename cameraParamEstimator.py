@@ -1,56 +1,54 @@
 #!/usr/bin/env python3
-# pair_homography_c_strength_refine_ecc.py
+# pair_camera_coarse_depth_search.py
 #
-# Pairwise homography-flow + block-wise C strength matching
-# with optional ECC-based homography refinement.
+# Pairwise camera-parameter-first coarse-to-fine search.
 #
-# Model:
-#   p_hom(x)  = H * x
-#   flow(x)   = p_hom(x) - x
-#   p_pred(x) = x + c_block * flow(x)
+# Goal:
+#   Find camera parameters that produce globally natural alignment.
+#   Depth C is treated as a coarse nuisance/block variable, not as an accurate depth map.
 #
-# Meaning:
-#   c = 0 : identity / no warp
-#   c = 1 : homography
-#   c > 1 : stronger than homography along the same flow direction
-#   c < 1 : weaker / opposite direction
+# Camera model:
+#   ray_t = K^-1 * p_target
+#   X_ref = R_ref_target * ray_t + c_b * t_ref_target
+#   p_ref = K * X_ref
 #
-# Homography:
-#   1. Initial H by ORB matching + RANSAC findHomography
-#   2. Optional H refinement by cv2.findTransformECC()
+# Search objective:
+#   Score(R, t, f) = sum_b min_{c_b in coarse C candidates} D_b(R, t, f, c_b)
 #
-# Important convention:
-#   H maps target pixel coordinates to ref pixel coordinates:
-#      p_ref ~ H * p_target
+# Important:
+#   - R/f/t are refined more carefully.
+#   - C is kept very coarse and large-block-based.
+#   - This avoids scaling full homography flow, so C does not scale rotation.
 #
 # Example:
-#   python pair_homography_c_strength_refine_ecc.py \
+#   python pair_camera_coarse_depth_search.py \
 #     --input input.yuv \
 #     --width 1920 \
 #     --height 1080 \
 #     --bitdepth 10 \
 #     --target-idx 1 \
 #     --ref-idx 0 \
-#     --block-size 64 \
+#     --search-scale 0.25 \
+#     --search-iters 4 \
+#     --search-block-size 128 \
+#     --final-block-size 64 \
+#     --f-rel-list 0.8,1.0,1.2,1.5 \
+#     --r-step-deg 1.0 \
+#     --r-grid 3 \
+#     --c-list 0,0.02,0.08 \
 #     --max-features 20000 \
 #     --match-ratio 0.70 \
 #     --ransac-thresh 1.0 \
 #     --h-refine-iters 100 \
 #     --h-refine-scale 0.5 \
-#     --h-refine-eps 1e-7 \
-#     --h-refine-blur 5 \
-#     --c-min 0.97 \
-#     --c-max 1.03 \
-#     --c-samples 25 \
-#     --c-search-iters 5 \
-#     --min-range-width 1e-7 \
-#     --output-dir pair_homo_ecc_t1_r0
+#     --output-dir cam_search_t1_r0
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -76,12 +74,30 @@ class MatchResult:
     good_matches: list
 
 
+@dataclass
+class PoseCandidateResult:
+    score: float
+    mae: float
+    valid_ratio: float
+    R: np.ndarray
+    t: np.ndarray
+    f_full: float
+    c_block_grid: np.ndarray
+    c_block_cost_grid: np.ndarray
+    pred: Optional[np.ndarray]
+    valid: Optional[np.ndarray]
+
+
 # ============================================================
-# I/O
+# I/O utilities
 # ============================================================
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+def parse_float_list(s: str) -> List[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip() != ""]
 
 
 def yuv420_frame_size_bytes(width: int, height: int, bitdepth: int) -> int:
@@ -141,29 +157,33 @@ def write_single_yuv420(path: str, y: np.ndarray, width: int, height: int, bitde
 def to_8bit(y: np.ndarray, bitdepth: int) -> np.ndarray:
     if bitdepth == 8:
         return np.clip(y, 0, 255).astype(np.uint8)
-
     return np.clip(y.astype(np.float32) / 4.0, 0, 255).astype(np.uint8)
 
 
 def to_8bit_feature(y: np.ndarray, bitdepth: int) -> np.ndarray:
     if bitdepth == 8:
         return y.astype(np.uint8)
-
     return (np.clip(y, 0, 1023).astype(np.uint16) >> 2).astype(np.uint8)
 
 
-def to_float_for_ecc(y: np.ndarray, bitdepth: int) -> np.ndarray:
-    if bitdepth == 8:
-        maxv = 255.0
-    else:
-        maxv = 1023.0
+def to_float_ecc(y: np.ndarray, bitdepth: int) -> np.ndarray:
+    maxv = 255.0 if bitdepth == 8 else 1023.0
+    return np.clip(y.astype(np.float32) / maxv, 0.0, 1.0).astype(np.float32)
 
-    img = np.clip(y.astype(np.float32) / maxv, 0.0, 1.0)
-    return img.astype(np.float32)
+
+def resize_frame(y: np.ndarray, scale: float) -> np.ndarray:
+    if abs(scale - 1.0) < 1e-12:
+        return y.copy()
+
+    h, w = y.shape
+    new_w = max(8, int(round(w * scale)))
+    new_h = max(8, int(round(h * scale)))
+
+    return cv2.resize(y, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 # ============================================================
-# Feature matching + initial homography
+# Feature matching / Homography / ECC
 # ============================================================
 
 def detect_and_match_orb(
@@ -197,9 +217,6 @@ def detect_and_match_orb(
     if des_t is None or des_r is None:
         raise RuntimeError("ORB failed to extract descriptors.")
 
-    if len(kp_t) < 8 or len(kp_r) < 8:
-        raise RuntimeError(f"Not enough keypoints: target={len(kp_t)}, ref={len(kp_r)}")
-
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     knn = matcher.knnMatch(des_t, des_r, k=2)
 
@@ -209,7 +226,6 @@ def detect_and_match_orb(
             continue
 
         m, n = pair
-
         if m.distance < ratio * n.distance:
             good.append(m)
 
@@ -230,10 +246,8 @@ def detect_and_match_orb(
 
 def normalize_homography(H: np.ndarray) -> np.ndarray:
     H = np.asarray(H, dtype=np.float64)
-
     if abs(H[2, 2]) > 1e-12:
         H = H / H[2, 2]
-
     return H
 
 
@@ -254,9 +268,7 @@ def estimate_initial_homography(
     if H is None:
         raise RuntimeError("cv2.findHomography failed.")
 
-    H = normalize_homography(H)
-
-    return H, mask
+    return normalize_homography(H), mask
 
 
 def save_match_vis(
@@ -292,19 +304,7 @@ def save_match_vis(
     cv2.imwrite(out_path, vis)
 
 
-# ============================================================
-# ECC homography refinement
-# ============================================================
-
 def scale_homography_for_resized_image(H_full: np.ndarray, scale: float) -> np.ndarray:
-    """
-    Convert full-resolution H to resized-image H.
-
-    If p_ref_full ~ H_full * p_target_full,
-    and p_scaled = S * p_full,
-    then:
-      H_scaled = S * H_full * S^-1
-    """
     S = np.array(
         [
             [scale, 0.0, 0.0],
@@ -313,17 +313,10 @@ def scale_homography_for_resized_image(H_full: np.ndarray, scale: float) -> np.n
         ],
         dtype=np.float64,
     )
-
-    H_scaled = S @ H_full @ np.linalg.inv(S)
-    return normalize_homography(H_scaled)
+    return normalize_homography(S @ H_full @ np.linalg.inv(S))
 
 
 def unscale_homography_to_full_image(H_scaled: np.ndarray, scale: float) -> np.ndarray:
-    """
-    Convert resized-image H back to full-resolution H.
-
-      H_full = S^-1 * H_scaled * S
-    """
     S = np.array(
         [
             [scale, 0.0, 0.0],
@@ -332,30 +325,15 @@ def unscale_homography_to_full_image(H_scaled: np.ndarray, scale: float) -> np.n
         ],
         dtype=np.float64,
     )
-
-    H_full = np.linalg.inv(S) @ H_scaled @ S
-    return normalize_homography(H_full)
+    return normalize_homography(np.linalg.inv(S) @ H_scaled @ S)
 
 
-def resize_for_ecc(img: np.ndarray, scale: float) -> np.ndarray:
-    if abs(scale - 1.0) < 1e-12:
-        return img.astype(np.float32)
-
-    h, w = img.shape
-    new_w = max(8, int(round(w * scale)))
-    new_h = max(8, int(round(h * scale)))
-
-    out = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return out.astype(np.float32)
-
-
-def preprocess_ecc_image(img: np.ndarray, blur_ksize: int) -> np.ndarray:
+def preprocess_ecc(img: np.ndarray, blur_ksize: int) -> np.ndarray:
     out = img.astype(np.float32)
 
     if blur_ksize > 0:
         if blur_ksize % 2 == 0:
             blur_ksize += 1
-
         out = cv2.GaussianBlur(out, (blur_ksize, blur_ksize), 0)
 
     return out.astype(np.float32)
@@ -371,22 +349,6 @@ def refine_homography_ecc(
     scale: float,
     blur_ksize: int,
 ) -> Tuple[np.ndarray, dict]:
-    """
-    Refine H using ECC.
-
-    Convention:
-      templateImage = target
-      inputImage    = ref
-
-    OpenCV ECC homography convention is compatible with:
-      output_target(x) = ref(H * x)
-    when the returned warp matrix is used as target->ref mapping.
-
-    So the refined H can be directly used for our remap:
-      p_ref ~ H_refined * p_target
-    """
-    H_init_full = normalize_homography(H_init_full)
-
     meta = {
         "enabled": bool(iters > 0),
         "success": False,
@@ -398,23 +360,21 @@ def refine_homography_ecc(
         "error": None,
     }
 
+    H_init_full = normalize_homography(H_init_full)
+
     if iters <= 0:
         return H_init_full, meta
 
     if scale <= 0.0 or scale > 1.0:
         raise ValueError("--h-refine-scale must be in (0, 1].")
 
-    target_f = to_float_for_ecc(target_y, bitdepth)
-    ref_f = to_float_for_ecc(ref_y, bitdepth)
+    target_f = resize_frame(to_float_ecc(target_y, bitdepth), scale)
+    ref_f = resize_frame(to_float_ecc(ref_y, bitdepth), scale)
 
-    target_s = resize_for_ecc(target_f, scale)
-    ref_s = resize_for_ecc(ref_f, scale)
+    target_f = preprocess_ecc(target_f, blur_ksize)
+    ref_f = preprocess_ecc(ref_f, blur_ksize)
 
-    target_s = preprocess_ecc_image(target_s, blur_ksize)
-    ref_s = preprocess_ecc_image(ref_s, blur_ksize)
-
-    H_scaled = scale_homography_for_resized_image(H_init_full, scale)
-    warp = H_scaled.astype(np.float32)
+    H_scaled = scale_homography_for_resized_image(H_init_full, scale).astype(np.float32)
 
     criteria = (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
@@ -425,9 +385,9 @@ def refine_homography_ecc(
     try:
         try:
             cc, warp_refined = cv2.findTransformECC(
-                target_s,
-                ref_s,
-                warp,
+                target_f,
+                ref_f,
+                H_scaled,
                 cv2.MOTION_HOMOGRAPHY,
                 criteria,
                 None,
@@ -435,20 +395,19 @@ def refine_homography_ecc(
             )
         except TypeError:
             cc, warp_refined = cv2.findTransformECC(
-                target_s,
-                ref_s,
-                warp,
+                target_f,
+                ref_f,
+                H_scaled,
                 cv2.MOTION_HOMOGRAPHY,
                 criteria,
             )
 
-        H_refined_scaled = normalize_homography(warp_refined.astype(np.float64))
-        H_refined_full = unscale_homography_to_full_image(H_refined_scaled, scale)
+        H_refined = unscale_homography_to_full_image(warp_refined.astype(np.float64), scale)
 
         meta["success"] = True
         meta["cc"] = float(cc)
 
-        return H_refined_full, meta
+        return H_refined, meta
 
     except cv2.error as e:
         meta["error"] = str(e)
@@ -456,50 +415,249 @@ def refine_homography_ecc(
 
 
 # ============================================================
-# Homography flow
+# Camera model
 # ============================================================
 
-def make_identity_grid(width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
+def build_K(width: int, height: int, f: float) -> np.ndarray:
+    cx = (width - 1.0) * 0.5
+    cy = (height - 1.0) * 0.5
+
+    return np.array(
+        [
+            [f, 0.0, cx],
+            [0.0, f, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def project_to_so3(M: np.ndarray) -> np.ndarray:
+    U, _, Vt = np.linalg.svd(M)
+    R = U @ Vt
+
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+
+    return R.astype(np.float64)
+
+
+def rotation_from_homography(H: np.ndarray, K: np.ndarray) -> np.ndarray:
+    R_approx = np.linalg.inv(K) @ H @ K
+
+    det = np.linalg.det(R_approx)
+    if abs(det) > 1e-12:
+        scale = np.cbrt(abs(det))
+        R_approx = R_approx / scale
+
+    return project_to_so3(R_approx)
+
+
+def rot_x(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+
+def rot_y(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+
+
+def rot_z(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+
+
+def make_delta_R(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
+    # yaw: Y-axis, pitch: X-axis, roll: Z-axis
+    return rot_z(roll_deg) @ rot_y(yaw_deg) @ rot_x(pitch_deg)
+
+
+def normalize_t(t: np.ndarray) -> np.ndarray:
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(t))
+
+    if n < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+
+    return t / n
+
+
+def estimate_essential_pose(
+    pts_target: np.ndarray,
+    pts_ref: np.ndarray,
+    K: np.ndarray,
+    ransac_thresh: float,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], dict]:
+    meta = {
+        "success": False,
+        "inliers": 0,
+        "error": None,
+    }
+
+    try:
+        E, mask = cv2.findEssentialMat(
+            pts_target,
+            pts_ref,
+            K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=ransac_thresh,
+        )
+
+        if E is None:
+            meta["error"] = "findEssentialMat returned None"
+            return None, None, meta
+
+        _, R, t, pose_mask = cv2.recoverPose(E, pts_target, pts_ref, K)
+
+        meta["success"] = True
+        meta["inliers"] = int(np.count_nonzero(pose_mask)) if pose_mask is not None else 0
+
+        return R.astype(np.float64), normalize_t(t.reshape(3)), meta
+
+    except cv2.error as e:
+        meta["error"] = str(e)
+        return None, None, meta
+
+
+def unique_t_candidates(cands: List[np.ndarray], eps: float = 1e-5) -> List[np.ndarray]:
+    out = []
+
+    for t in cands:
+        t = normalize_t(t)
+
+        duplicate = False
+        for u in out:
+            if np.linalg.norm(t - u) < eps:
+                duplicate = True
+                break
+
+        if not duplicate:
+            out.append(t)
+
+    return out
+
+
+def build_initial_t_candidates(
+    essential_t: Optional[np.ndarray],
+    include_axes: bool,
+    include_zero: bool,
+) -> List[np.ndarray]:
+    cands = []
+
+    if essential_t is not None:
+        cands.append(essential_t)
+        cands.append(-essential_t)
+
+    if include_axes:
+        cands += [
+            np.array([1.0, 0.0, 0.0]),
+            np.array([-1.0, 0.0, 0.0]),
+            np.array([0.0, 1.0, 0.0]),
+            np.array([0.0, -1.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
+            np.array([0.0, 0.0, -1.0]),
+        ]
+
+    if include_zero:
+        cands.append(np.zeros(3, dtype=np.float64))
+
+    return unique_t_candidates(cands)
+
+
+def perturb_t_candidates(t_center: np.ndarray, step_deg: float, grid: int) -> List[np.ndarray]:
+    t_center = normalize_t(t_center)
+
+    if step_deg <= 0.0 or np.linalg.norm(t_center) < 1e-12:
+        return [t_center]
+
+    offsets = np.linspace(-step_deg, step_deg, grid)
+
+    cands = []
+    for ax in offsets:
+        for ay in offsets:
+            for az in offsets:
+                R_delta = make_delta_R(yaw_deg=ay, pitch_deg=ax, roll_deg=az)
+                cands.append(normalize_t(R_delta @ t_center))
+
+    return unique_t_candidates(cands)
+
+
+def make_rays(width: int, height: int, K: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+
     xs, ys = np.meshgrid(
         np.arange(width, dtype=np.float32),
         np.arange(height, dtype=np.float32),
     )
-    return xs, ys
+
+    rx = (xs.astype(np.float32) - cx) / fx
+    ry = (ys.astype(np.float32) - cy) / fy
+    rz = np.ones_like(rx, dtype=np.float32)
+
+    return rx, ry, rz
 
 
-def homography_map(H: np.ndarray, width: int, height: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    H = normalize_homography(H)
+def camera_maps_from_rays(
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    c: float,
+    rays: Tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rx, ry, rz = rays
 
-    xs, ys = make_identity_grid(width, height)
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
 
-    x = xs.astype(np.float64)
-    y = ys.astype(np.float64)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
 
-    denom = H[2, 0] * x + H[2, 1] * y + H[2, 2]
-    denom_safe = denom + 1e-12
+    X = (
+        R[0, 0] * rx
+        + R[0, 1] * ry
+        + R[0, 2] * rz
+        + float(c) * t[0]
+    )
+    Y = (
+        R[1, 0] * rx
+        + R[1, 1] * ry
+        + R[1, 2] * rz
+        + float(c) * t[1]
+    )
+    Z = (
+        R[2, 0] * rx
+        + R[2, 1] * ry
+        + R[2, 2] * rz
+        + float(c) * t[2]
+    )
 
-    map_x = (H[0, 0] * x + H[0, 1] * y + H[0, 2]) / denom_safe
-    map_y = (H[1, 0] * x + H[1, 1] * y + H[1, 2]) / denom_safe
+    valid_z = Z > 1e-6
+    Z_safe = Z + 1e-12
+
+    map_x = fx * (X / Z_safe) + cx
+    map_y = fy * (Y / Z_safe) + cy
+
+    h, w = rx.shape
 
     valid = (
-        (np.abs(denom) > 1e-9)
+        valid_z
         & (map_x >= 0.0)
-        & (map_x <= width - 1.0)
+        & (map_x <= w - 1.0)
         & (map_y >= 0.0)
-        & (map_y <= height - 1.0)
+        & (map_y <= h - 1.0)
     )
 
     return map_x.astype(np.float32), map_y.astype(np.float32), valid
-
-
-def build_homography_flow(H: np.ndarray, width: int, height: int):
-    xs, ys = make_identity_grid(width, height)
-    hom_x, hom_y, hom_valid = homography_map(H, width, height)
-
-    flow_x = hom_x - xs
-    flow_y = hom_y - ys
-
-    return xs, ys, flow_x, flow_y, hom_x, hom_y, hom_valid
 
 
 def remap_full(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
@@ -513,34 +671,304 @@ def remap_full(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.nd
     )
 
 
-def remap_roi(ref_y: np.ndarray, map_x_roi: np.ndarray, map_y_roi: np.ndarray) -> np.ndarray:
-    return cv2.remap(
-        ref_y.astype(np.float32),
-        map_x_roi.astype(np.float32),
-        map_y_roi.astype(np.float32),
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+# ============================================================
+# Scoring
+# ============================================================
+
+def block_grid_shape(width: int, height: int, block_size: int) -> Tuple[int, int]:
+    nx = (width + block_size - 1) // block_size
+    ny = (height + block_size - 1) // block_size
+    return ny, nx
+
+
+def calc_pose_score(
+    target_y: np.ndarray,
+    ref_y: np.ndarray,
+    K: np.ndarray,
+    rays: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    R: np.ndarray,
+    t: np.ndarray,
+    f_full: float,
+    c_list: List[float],
+    block_size: int,
+    min_block_valid_ratio: float,
+    c_smooth_lambda: float,
+    return_pred: bool = False,
+) -> PoseCandidateResult:
+    h, w = target_y.shape
+    target_f = target_y.astype(np.float32)
+
+    ny, nx = block_grid_shape(w, h, block_size)
+
+    best_cost_grid = np.full((ny, nx), np.inf, dtype=np.float64)
+    best_c_grid = np.zeros((ny, nx), dtype=np.float64)
+    best_valid_grid = np.zeros((ny, nx), dtype=np.float64)
+
+    out_pred = np.zeros((h, w), dtype=np.float32) if return_pred else None
+    out_valid = np.zeros((h, w), dtype=bool) if return_pred else None
+
+    for c in c_list:
+        map_x, map_y, valid = camera_maps_from_rays(K, R, t, c, rays)
+        pred = remap_full(ref_y, map_x, map_y)
+
+        diff = np.abs(target_f - pred)
+
+        for by_idx, by in enumerate(range(0, h, block_size)):
+            y1 = min(by + block_size, h)
+
+            for bx_idx, bx in enumerate(range(0, w, block_size)):
+                x1 = min(bx + block_size, w)
+
+                v = valid[by:y1, bx:x1]
+                valid_ratio = float(np.mean(v))
+
+                if valid_ratio < min_block_valid_ratio or not np.any(v):
+                    cost = np.inf
+                else:
+                    cost = float(np.mean(diff[by:y1, bx:x1][v]))
+
+                if cost < best_cost_grid[by_idx, bx_idx]:
+                    best_cost_grid[by_idx, bx_idx] = cost
+                    best_c_grid[by_idx, bx_idx] = float(c)
+                    best_valid_grid[by_idx, bx_idx] = valid_ratio
+
+                    if return_pred:
+                        out_pred[by:y1, bx:x1] = pred[by:y1, bx:x1]
+                        out_valid[by:y1, bx:x1] = v
+
+    finite = np.isfinite(best_cost_grid)
+
+    if not np.any(finite):
+        score = float("inf")
+        mae = float("inf")
+        valid_ratio_total = 0.0
+    else:
+        mae = float(np.mean(best_cost_grid[finite]))
+        valid_ratio_total = float(np.mean(best_valid_grid[finite]))
+        score = mae
+
+        if c_smooth_lambda > 0.0:
+            smooth_terms = []
+
+            if best_c_grid.shape[1] > 1:
+                smooth_terms.append(np.abs(np.diff(best_c_grid, axis=1)))
+
+            if best_c_grid.shape[0] > 1:
+                smooth_terms.append(np.abs(np.diff(best_c_grid, axis=0)))
+
+            if smooth_terms:
+                smooth = float(np.mean([np.mean(x) for x in smooth_terms]))
+                score += float(c_smooth_lambda) * smooth
+
+    return PoseCandidateResult(
+        score=float(score),
+        mae=float(mae),
+        valid_ratio=float(valid_ratio_total),
+        R=R.astype(np.float64),
+        t=normalize_t(t),
+        f_full=float(f_full),
+        c_block_grid=best_c_grid,
+        c_block_cost_grid=best_cost_grid,
+        pred=out_pred,
+        valid=out_valid,
     )
 
 
+def make_rotation_offsets(step_deg: float, grid: int) -> np.ndarray:
+    if grid <= 1 or step_deg <= 0.0:
+        return np.array([0.0], dtype=np.float64)
+
+    return np.linspace(-step_deg, step_deg, grid, dtype=np.float64)
+
+
+def candidate_f_values_iter0(width: int, f_rel_list: List[float]) -> List[float]:
+    return [float(fr * width) for fr in f_rel_list]
+
+
+def candidate_f_values_refine(f_center: float, f_step_rel: float, grid: int) -> List[float]:
+    if grid <= 1 or f_step_rel <= 0.0:
+        return [float(f_center)]
+
+    offsets = np.linspace(-f_step_rel, f_step_rel, grid, dtype=np.float64)
+    vals = [float(f_center * (1.0 + off)) for off in offsets]
+    vals = [max(1.0, v) for v in vals]
+    return vals
+
+
 # ============================================================
-# Cost
+# Search
 # ============================================================
 
-def valid_from_map(map_x: np.ndarray, map_y: np.ndarray, width: int, height: int) -> np.ndarray:
-    return (
-        (map_x >= 0.0)
-        & (map_x <= width - 1.0)
-        & (map_y >= 0.0)
-        & (map_y <= height - 1.0)
+def run_camera_search(
+    target_s: np.ndarray,
+    ref_s: np.ndarray,
+    full_width: int,
+    full_height: int,
+    scale: float,
+    H_refined_full: np.ndarray,
+    pts_target: np.ndarray,
+    pts_ref: np.ndarray,
+    args,
+) -> Tuple[PoseCandidateResult, List[dict]]:
+    search_h, search_w = target_s.shape
+
+    c_list = parse_float_list(args.c_list)
+    f_rel_list = parse_float_list(args.f_rel_list)
+
+    # Essential pose from center/default focal.
+    f0_full = float(args.essential_f_rel * full_width)
+    K0_full = build_K(full_width, full_height, f0_full)
+
+    R_E, t_E, essential_meta = estimate_essential_pose(
+        pts_target=pts_target,
+        pts_ref=pts_ref,
+        K=K0_full,
+        ransac_thresh=args.essential_thresh,
     )
 
+    print("[INFO] Essential meta:")
+    print(json.dumps(essential_meta, indent=2))
 
-def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, min_valid_ratio: float):
+    fixed_t_candidates = build_initial_t_candidates(
+        essential_t=t_E,
+        include_axes=args.include_axis_t,
+        include_zero=args.include_zero_t,
+    )
+
+    if not fixed_t_candidates:
+        fixed_t_candidates = [np.zeros(3, dtype=np.float64)]
+
+    best: Optional[PoseCandidateResult] = None
+    history = []
+
+    r_step = float(args.r_step_deg)
+    f_step_rel = float(args.f_step_rel)
+    t_step = float(args.t_step_deg)
+
+    for it in range(args.search_iters):
+        print(f"[SEARCH] iter={it}")
+
+        if it == 0 or best is None:
+            f_values_full = candidate_f_values_iter0(full_width, f_rel_list)
+            t_candidates = fixed_t_candidates
+        else:
+            f_values_full = candidate_f_values_refine(best.f_full, f_step_rel, args.f_grid)
+
+            if args.refine_t and t_step > 0.0:
+                t_candidates = perturb_t_candidates(best.t, t_step, args.t_grid)
+                # Keep zero fallback if enabled.
+                if args.include_zero_t:
+                    t_candidates.append(np.zeros(3, dtype=np.float64))
+                t_candidates = unique_t_candidates(t_candidates)
+            else:
+                t_candidates = [best.t]
+
+        r_offsets = make_rotation_offsets(r_step, args.r_grid)
+
+        iter_best: Optional[PoseCandidateResult] = None
+        eval_count = 0
+
+        for f_full in f_values_full:
+            f_search = float(f_full * scale)
+            K_search = build_K(search_w, search_h, f_search)
+            rays = make_rays(search_w, search_h, K_search)
+
+            # For iteration 0, derive an R center from H for each focal candidate.
+            # Later, refine around the previous best R.
+            R_centers = []
+
+            if it == 0 or best is None:
+                K_full = build_K(full_width, full_height, f_full)
+                R_H = rotation_from_homography(H_refined_full, K_full)
+                R_centers.append(R_H)
+
+                if R_E is not None:
+                    R_centers.append(R_E)
+
+                R_centers = [project_to_so3(R) for R in R_centers]
+            else:
+                R_centers.append(best.R)
+
+            # Remove duplicate R centers roughly by matrix distance.
+            unique_R_centers = []
+            for R in R_centers:
+                duplicate = False
+                for U in unique_R_centers:
+                    if np.linalg.norm(R - U) < 1e-5:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    unique_R_centers.append(R)
+
+            for R_center in unique_R_centers:
+                for yaw in r_offsets:
+                    for pitch in r_offsets:
+                        for roll in r_offsets:
+                            R = make_delta_R(yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll) @ R_center
+                            R = project_to_so3(R)
+
+                            for t in t_candidates:
+                                res = calc_pose_score(
+                                    target_y=target_s,
+                                    ref_y=ref_s,
+                                    K=K_search,
+                                    rays=rays,
+                                    R=R,
+                                    t=t,
+                                    f_full=f_full,
+                                    c_list=c_list,
+                                    block_size=max(4, int(round(args.search_block_size * scale))),
+                                    min_block_valid_ratio=args.min_block_valid_ratio,
+                                    c_smooth_lambda=args.c_smooth_lambda,
+                                    return_pred=False,
+                                )
+
+                                eval_count += 1
+
+                                if iter_best is None or res.score < iter_best.score:
+                                    iter_best = res
+
+        if iter_best is None:
+            raise RuntimeError("Search produced no valid candidate.")
+
+        best = iter_best
+
+        iter_record = {
+            "iter": int(it),
+            "eval_count": int(eval_count),
+            "best_score": float(best.score),
+            "best_mae": float(best.mae),
+            "best_valid_ratio": float(best.valid_ratio),
+            "best_f_full": float(best.f_full),
+            "best_f_rel_to_width": float(best.f_full / full_width),
+            "best_t": best.t.tolist(),
+            "best_R": best.R.tolist(),
+            "r_step_deg": float(r_step),
+            "f_step_rel": float(f_step_rel),
+            "t_step_deg": float(t_step),
+            "num_t_candidates": int(len(t_candidates)),
+            "num_f_candidates": int(len(f_values_full)),
+        }
+
+        history.append(iter_record)
+
+        print(json.dumps(iter_record, indent=2))
+
+        r_step *= float(args.r_shrink)
+        f_step_rel *= float(args.f_shrink)
+        t_step *= float(args.t_shrink)
+
+    return best, history
+
+
+# ============================================================
+# Final output
+# ============================================================
+
+def calc_basic_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray) -> dict:
     valid_ratio = float(np.mean(valid))
 
-    if valid_ratio < min_valid_ratio or not np.any(valid):
+    if not np.any(valid):
         return {
             "valid_ratio": valid_ratio,
             "mae": float("inf"),
@@ -553,11 +981,8 @@ def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, min_v
     mae = float(np.mean(np.abs(diff)))
     mse = float(np.mean(diff ** 2))
 
-    if mse <= 1e-12:
-        psnr = 999.0
-    else:
-        maxv = 255.0 if target_y.dtype == np.uint8 else 1023.0
-        psnr = float(10.0 * np.log10((maxv * maxv) / mse))
+    maxv = 255.0 if target_y.dtype == np.uint8 else 1023.0
+    psnr = 999.0 if mse <= 1e-12 else float(10.0 * np.log10((maxv * maxv) / mse))
 
     return {
         "valid_ratio": valid_ratio,
@@ -566,344 +991,6 @@ def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, min_v
         "psnr": psnr,
     }
 
-
-# ============================================================
-# Coarse-to-fine C search
-# ============================================================
-
-def update_range_around_best(
-    candidates: np.ndarray,
-    best_idx: int,
-    c_global_min: float,
-    c_global_max: float,
-    min_width: float,
-) -> Tuple[float, float]:
-    n = len(candidates)
-
-    if n <= 1:
-        c = float(candidates[best_idx])
-        return c, c
-
-    best_c = float(candidates[best_idx])
-
-    if best_idx == 0:
-        step = float(candidates[1] - candidates[0])
-    elif best_idx == n - 1:
-        step = float(candidates[-1] - candidates[-2])
-    else:
-        step_left = float(candidates[best_idx] - candidates[best_idx - 1])
-        step_right = float(candidates[best_idx + 1] - candidates[best_idx])
-        step = max(step_left, step_right)
-
-    new_lo = best_c - step
-    new_hi = best_c + step
-
-    if new_hi - new_lo < min_width:
-        mid = 0.5 * (new_lo + new_hi)
-        new_lo = mid - 0.5 * min_width
-        new_hi = mid + 0.5 * min_width
-
-    new_lo = max(c_global_min, new_lo)
-    new_hi = min(c_global_max, new_hi)
-
-    if new_hi < new_lo:
-        new_lo, new_hi = new_hi, new_lo
-
-    return new_lo, new_hi
-
-
-def search_best_c_for_block(
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    flow_x: np.ndarray,
-    flow_y: np.ndarray,
-    bx: int,
-    by: int,
-    bw: int,
-    bh: int,
-    c_min: float,
-    c_max: float,
-    c_samples: int,
-    c_search_iters: int,
-    min_block_valid_ratio: float,
-    min_range_width: float,
-) -> dict:
-    height, width = target_y.shape
-
-    x1 = bx + bw
-    y1 = by + bh
-
-    target_roi = target_y[by:y1, bx:x1].astype(np.float32)
-    xs_roi = xs[by:y1, bx:x1]
-    ys_roi = ys[by:y1, bx:x1]
-    flow_x_roi = flow_x[by:y1, bx:x1]
-    flow_y_roi = flow_y[by:y1, bx:x1]
-
-    lo = float(c_min)
-    hi = float(c_max)
-
-    history = []
-
-    final_best = {
-        "c": 0.0,
-        "cost": float("inf"),
-        "valid_ratio": 0.0,
-        "second_cost": float("inf"),
-        "confidence": 0.0,
-    }
-
-    for it in range(c_search_iters):
-        if c_samples <= 1 or abs(hi - lo) < 1e-12:
-            candidates = np.array([0.5 * (lo + hi)], dtype=np.float64)
-        else:
-            candidates = np.linspace(lo, hi, c_samples, dtype=np.float64)
-
-        costs = []
-        valid_ratios = []
-
-        for c in candidates:
-            map_x = xs_roi + float(c) * flow_x_roi
-            map_y = ys_roi + float(c) * flow_y_roi
-
-            valid = valid_from_map(map_x, map_y, width, height)
-            valid_ratio = float(np.mean(valid))
-            valid_ratios.append(valid_ratio)
-
-            if valid_ratio < min_block_valid_ratio or not np.any(valid):
-                costs.append(float("inf"))
-                continue
-
-            pred = remap_roi(ref_y, map_x, map_y)
-            diff = target_roi[valid] - pred[valid]
-            cost = float(np.mean(np.abs(diff)))
-            costs.append(cost)
-
-        costs_np = np.asarray(costs, dtype=np.float64)
-        order = np.argsort(costs_np)
-
-        best_idx = int(order[0])
-        best_c = float(candidates[best_idx])
-        best_cost = float(costs_np[best_idx])
-        best_valid_ratio = float(valid_ratios[best_idx])
-
-        if len(order) > 1:
-            second_cost = float(costs_np[int(order[1])])
-        else:
-            second_cost = float("inf")
-
-        confidence = 0.0
-        if np.isfinite(best_cost) and np.isfinite(second_cost):
-            confidence = max(0.0, second_cost - best_cost)
-
-        history.append(
-            {
-                "iter": int(it),
-                "range": [float(lo), float(hi)],
-                "best_c": best_c,
-                "best_cost_mae": best_cost,
-                "second_best_cost_mae": second_cost,
-                "confidence_second_minus_best": float(confidence),
-            }
-        )
-
-        final_best = {
-            "c": best_c,
-            "cost": best_cost,
-            "valid_ratio": best_valid_ratio,
-            "second_cost": second_cost,
-            "confidence": confidence,
-        }
-
-        lo, hi = update_range_around_best(
-            candidates=candidates,
-            best_idx=best_idx,
-            c_global_min=c_min,
-            c_global_max=c_max,
-            min_width=min_range_width,
-        )
-
-    best_c = float(final_best["c"])
-
-    map_x = xs_roi + best_c * flow_x_roi
-    map_y = ys_roi + best_c * flow_y_roi
-    valid = valid_from_map(map_x, map_y, width, height)
-    pred = remap_roi(ref_y, map_x, map_y)
-
-    return {
-        "best_c": best_c,
-        "best_cost_mae": float(final_best["cost"]),
-        "second_best_cost_mae": float(final_best["second_cost"]),
-        "confidence_second_minus_best": float(final_best["confidence"]),
-        "valid_ratio": float(np.mean(valid)),
-        "pred": pred,
-        "valid": valid,
-        "history": history,
-    }
-
-
-def blockwise_c_refine(
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    flow_x: np.ndarray,
-    flow_y: np.ndarray,
-    block_size: int,
-    c_min: float,
-    c_max: float,
-    c_samples: int,
-    c_search_iters: int,
-    min_block_valid_ratio: float,
-    min_range_width: float,
-):
-    height, width = target_y.shape
-
-    out_pred = np.zeros((height, width), dtype=np.float32)
-    out_valid = np.zeros((height, width), dtype=bool)
-    c_map = np.zeros((height, width), dtype=np.float32)
-    conf_map = np.zeros((height, width), dtype=np.float32)
-
-    block_records = []
-    valid_blocks = 0
-    total_blocks = 0
-
-    for by in range(0, height, block_size):
-        for bx in range(0, width, block_size):
-            bw = min(block_size, width - bx)
-            bh = min(block_size, height - by)
-
-            res = search_best_c_for_block(
-                target_y=target_y,
-                ref_y=ref_y,
-                xs=xs,
-                ys=ys,
-                flow_x=flow_x,
-                flow_y=flow_y,
-                bx=bx,
-                by=by,
-                bw=bw,
-                bh=bh,
-                c_min=c_min,
-                c_max=c_max,
-                c_samples=c_samples,
-                c_search_iters=c_search_iters,
-                min_block_valid_ratio=min_block_valid_ratio,
-                min_range_width=min_range_width,
-            )
-
-            x1 = bx + bw
-            y1 = by + bh
-
-            out_pred[by:y1, bx:x1] = res["pred"]
-            out_valid[by:y1, bx:x1] = res["valid"]
-            c_map[by:y1, bx:x1] = res["best_c"]
-            conf_map[by:y1, bx:x1] = res["confidence_second_minus_best"]
-
-            if np.isfinite(res["best_cost_mae"]):
-                valid_blocks += 1
-
-            total_blocks += 1
-
-            block_records.append(
-                {
-                    "bx": int(bx),
-                    "by": int(by),
-                    "w": int(bw),
-                    "h": int(bh),
-                    "best_c": float(res["best_c"]),
-                    "best_cost_mae": float(res["best_cost_mae"]),
-                    "second_best_cost_mae": float(res["second_best_cost_mae"]),
-                    "confidence_second_minus_best": float(res["confidence_second_minus_best"]),
-                    "valid_ratio": float(res["valid_ratio"]),
-                    "history": res["history"],
-                }
-            )
-
-    cost = calc_cost(target_y, out_pred, out_valid, min_valid_ratio=0.0)
-
-    summary = {
-        "block_size": int(block_size),
-        "num_blocks": int(total_blocks),
-        "valid_blocks": int(valid_blocks),
-        "valid_block_ratio": float(valid_blocks / max(total_blocks, 1)),
-        "valid_ratio": float(cost["valid_ratio"]),
-        "mae": float(cost["mae"]),
-        "mse": float(cost["mse"]),
-        "psnr": cost["psnr"],
-        "c_mean": float(np.mean(c_map)),
-        "c_median": float(np.median(c_map)),
-        "c_min": float(np.min(c_map)),
-        "c_max": float(np.max(c_map)),
-        "confidence_mean": float(np.mean(conf_map)),
-        "confidence_median": float(np.median(conf_map)),
-    }
-
-    return out_pred, out_valid, c_map, conf_map, {
-        "summary": summary,
-        "blocks": block_records,
-    }
-
-
-def framewise_c_refine(
-    target_y: np.ndarray,
-    ref_y: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    flow_x: np.ndarray,
-    flow_y: np.ndarray,
-    c_min: float,
-    c_max: float,
-    c_samples: int,
-    c_search_iters: int,
-    min_valid_ratio: float,
-    min_range_width: float,
-):
-    height, width = target_y.shape
-
-    res = search_best_c_for_block(
-        target_y=target_y,
-        ref_y=ref_y,
-        xs=xs,
-        ys=ys,
-        flow_x=flow_x,
-        flow_y=flow_y,
-        bx=0,
-        by=0,
-        bw=width,
-        bh=height,
-        c_min=c_min,
-        c_max=c_max,
-        c_samples=c_samples,
-        c_search_iters=c_search_iters,
-        min_block_valid_ratio=min_valid_ratio,
-        min_range_width=min_range_width,
-    )
-
-    pred = res["pred"]
-    valid = res["valid"]
-
-    cost = calc_cost(target_y, pred, valid, min_valid_ratio=0.0)
-
-    meta = {
-        "best_c": float(res["best_c"]),
-        "best_cost_mae": float(res["best_cost_mae"]),
-        "second_best_cost_mae": float(res["second_best_cost_mae"]),
-        "confidence_second_minus_best": float(res["confidence_second_minus_best"]),
-        "valid_ratio": float(cost["valid_ratio"]),
-        "mae": float(cost["mae"]),
-        "mse": float(cost["mse"]),
-        "psnr": cost["psnr"],
-        "history": res["history"],
-    }
-
-    return pred, valid, meta
-
-
-# ============================================================
-# Visualization
-# ============================================================
 
 def save_gray_png(path: str, y: np.ndarray, bitdepth: int):
     cv2.imwrite(path, to_8bit(y, bitdepth))
@@ -926,28 +1013,28 @@ def save_diff_png(path: str, target_y: np.ndarray, pred_y: np.ndarray, valid: np
     cv2.imwrite(path, color)
 
 
-def save_c_map_png(path: str, c_map: np.ndarray):
-    c = c_map.astype(np.float32)
+def save_c_map_png(path: str, c_block_grid: np.ndarray, out_w: int, out_h: int, block_size: int):
+    ny, nx = c_block_grid.shape
+    c_img = np.zeros((out_h, out_w), dtype=np.float32)
 
-    c_min = float(np.min(c))
-    c_max = float(np.max(c))
+    for by_idx in range(ny):
+        by = by_idx * block_size
+        y1 = min(by + block_size, out_h)
+
+        for bx_idx in range(nx):
+            bx = bx_idx * block_size
+            x1 = min(bx + block_size, out_w)
+            c_img[by:y1, bx:x1] = float(c_block_grid[by_idx, bx_idx])
+
+    c_min = float(np.min(c_img))
+    c_max = float(np.max(c_img))
 
     if abs(c_max - c_min) < 1e-12:
-        c8 = np.full_like(c, 128, dtype=np.uint8)
+        c8 = np.full_like(c_img, 128, dtype=np.uint8)
     else:
-        c8 = np.clip((c - c_min) / (c_max - c_min) * 255.0, 0, 255).astype(np.uint8)
+        c8 = np.clip((c_img - c_min) / (c_max - c_min) * 255.0, 0, 255).astype(np.uint8)
 
     color = cv2.applyColorMap(c8, cv2.COLORMAP_TURBO)
-    cv2.imwrite(path, color)
-
-
-def save_conf_png(path: str, conf_map: np.ndarray):
-    conf = conf_map.astype(np.float32)
-    p99 = float(np.percentile(conf, 99))
-    p99 = max(p99, 1e-6)
-
-    conf8 = np.clip(conf / p99 * 255.0, 0, 255).astype(np.uint8)
-    color = cv2.applyColorMap(conf8, cv2.COLORMAP_VIRIDIS)
     cv2.imwrite(path, color)
 
 
@@ -966,51 +1053,47 @@ def main():
     parser.add_argument("--target-idx", type=int, required=True)
     parser.add_argument("--ref-idx", type=int, required=True)
 
-    parser.add_argument("--max-features", type=int, default=8000)
-    parser.add_argument("--match-ratio", type=float, default=0.75)
-    parser.add_argument("--ransac-thresh", type=float, default=2.0)
+    # Matching / H init
+    parser.add_argument("--max-features", type=int, default=20000)
+    parser.add_argument("--match-ratio", type=float, default=0.70)
+    parser.add_argument("--ransac-thresh", type=float, default=1.0)
     parser.add_argument("--no-clahe", action="store_true")
 
-    parser.add_argument(
-        "--h-refine-iters",
-        type=int,
-        default=100,
-        help="ECC iterations for refining homography H. Use 0 to disable.",
-    )
-    parser.add_argument(
-        "--h-refine-eps",
-        type=float,
-        default=1e-7,
-        help="ECC convergence epsilon.",
-    )
-    parser.add_argument(
-        "--h-refine-scale",
-        type=float,
-        default=0.5,
-        help="Image scale for ECC homography refinement. Must be in (0, 1].",
-    )
-    parser.add_argument(
-        "--h-refine-blur",
-        type=int,
-        default=5,
-        help="Gaussian blur kernel for ECC images. 0 disables blur. Even values are rounded up.",
-    )
+    # ECC H refinement
+    parser.add_argument("--h-refine-iters", type=int, default=100)
+    parser.add_argument("--h-refine-eps", type=float, default=1e-7)
+    parser.add_argument("--h-refine-scale", type=float, default=0.5)
+    parser.add_argument("--h-refine-blur", type=int, default=5)
 
-    parser.add_argument("--block-size", type=int, default=64)
+    # Search
+    parser.add_argument("--search-scale", type=float, default=0.25)
+    parser.add_argument("--search-iters", type=int, default=4)
 
-    parser.add_argument("--c-min", type=float, default=0.0)
-    parser.add_argument("--c-max", type=float, default=2.0)
-    parser.add_argument("--c-samples", type=int, default=9)
-    parser.add_argument("--c-search-iters", type=int, default=4)
-    parser.add_argument(
-        "--min-range-width",
-        type=float,
-        default=1e-4,
-        help="Minimum C search range width during refinement.",
-    )
+    parser.add_argument("--search-block-size", type=int, default=128)
+    parser.add_argument("--final-block-size", type=int, default=64)
 
-    parser.add_argument("--min-valid-ratio", type=float, default=0.50)
+    parser.add_argument("--f-rel-list", default="0.8,1.0,1.2,1.5")
+    parser.add_argument("--f-grid", type=int, default=3)
+    parser.add_argument("--f-step-rel", type=float, default=0.10)
+    parser.add_argument("--f-shrink", type=float, default=0.5)
+
+    parser.add_argument("--r-step-deg", type=float, default=1.0)
+    parser.add_argument("--r-grid", type=int, default=3)
+    parser.add_argument("--r-shrink", type=float, default=0.5)
+
+    parser.add_argument("--essential-f-rel", type=float, default=1.0)
+    parser.add_argument("--essential-thresh", type=float, default=1.0)
+    parser.add_argument("--include-axis-t", action="store_true")
+    parser.add_argument("--include-zero-t", action="store_true", default=True)
+
+    parser.add_argument("--refine-t", action="store_true")
+    parser.add_argument("--t-step-deg", type=float, default=2.0)
+    parser.add_argument("--t-grid", type=int, default=3)
+    parser.add_argument("--t-shrink", type=float, default=0.5)
+
+    parser.add_argument("--c-list", default="0,0.02,0.08")
     parser.add_argument("--min-block-valid-ratio", type=float, default=0.50)
+    parser.add_argument("--c-smooth-lambda", type=float, default=0.0)
 
     parser.add_argument("--output-dir", required=True)
 
@@ -1018,23 +1101,18 @@ def main():
 
     ensure_dir(args.output_dir)
 
-    if args.c_max < args.c_min:
-        raise ValueError("--c-max must be >= --c-min")
+    if args.search_scale <= 0.0 or args.search_scale > 1.0:
+        raise ValueError("--search-scale must be in (0, 1].")
 
     print(f"[INFO] target_idx={args.target_idx}, ref_idx={args.ref_idx}")
     print(f"[INFO] resolution={args.width}x{args.height}, bitdepth={args.bitdepth}")
-    print(f"[INFO] block_size={args.block_size}")
-    print(f"[INFO] c range=[{args.c_min}, {args.c_max}], samples={args.c_samples}, iters={args.c_search_iters}")
-    print(
-        f"[INFO] H ECC refine: iters={args.h_refine_iters}, "
-        f"scale={args.h_refine_scale}, eps={args.h_refine_eps}, blur={args.h_refine_blur}"
-    )
+    print(f"[INFO] search_scale={args.search_scale}, search_iters={args.search_iters}")
 
     target = read_y_frame(args.input, args.width, args.height, args.bitdepth, args.target_idx)
     ref = read_y_frame(args.input, args.width, args.height, args.bitdepth, args.ref_idx)
 
     # ------------------------------------------------------------
-    # Match + initial homography.
+    # Match + H init + ECC refine.
     # ------------------------------------------------------------
 
     match_result = detect_and_match_orb(
@@ -1048,16 +1126,16 @@ def main():
 
     print(f"[INFO] good matches = {len(match_result.good_matches)}")
 
-    H_init, h_mask = estimate_initial_homography(
+    H_init, H_mask = estimate_initial_homography(
         pts_target=match_result.pts_target,
         pts_ref=match_result.pts_ref,
         ransac_thresh=args.ransac_thresh,
     )
 
-    h_inliers = int(np.count_nonzero(h_mask)) if h_mask is not None else 0
+    H_inliers = int(np.count_nonzero(H_mask)) if H_mask is not None else 0
 
-    print(f"[INFO] homography inliers = {h_inliers}")
-    print("[INFO] Initial H target->ref:")
+    print(f"[INFO] H inliers = {H_inliers}")
+    print("[INFO] Initial H:")
     print(H_init)
 
     save_match_vis(
@@ -1066,22 +1144,8 @@ def main():
         ref.y,
         args.bitdepth,
         match_result,
-        h_mask,
+        H_mask,
     )
-
-    # ------------------------------------------------------------
-    # Evaluate initial H.
-    # ------------------------------------------------------------
-
-    init_hom_x, init_hom_y, init_hom_valid = homography_map(H_init, args.width, args.height)
-    pred_hom_init = remap_full(ref.y, init_hom_x, init_hom_y)
-    init_hom_cost = calc_cost(target.y, pred_hom_init, init_hom_valid, args.min_valid_ratio)
-
-    print(f"[INFO] initial homography c=1 cost: {init_hom_cost}")
-
-    # ------------------------------------------------------------
-    # Refine homography H by ECC.
-    # ------------------------------------------------------------
 
     H_refined, ecc_meta = refine_homography_ecc(
         H_init_full=H_init,
@@ -1096,122 +1160,131 @@ def main():
 
     print("[INFO] ECC meta:")
     print(json.dumps(ecc_meta, indent=2))
-    print("[INFO] Refined H target->ref:")
+    print("[INFO] Refined H:")
     print(H_refined)
 
     # ------------------------------------------------------------
-    # Build refined homography flow.
+    # Search images.
     # ------------------------------------------------------------
 
-    xs, ys, flow_x, flow_y, hom_x, hom_y, hom_valid = build_homography_flow(
-        H=H_refined,
-        width=args.width,
-        height=args.height,
+    target_s = resize_frame(target.y, args.search_scale)
+    ref_s = resize_frame(ref.y, args.search_scale)
+
+    # ------------------------------------------------------------
+    # Camera-first search.
+    # ------------------------------------------------------------
+
+    best_search, search_history = run_camera_search(
+        target_s=target_s,
+        ref_s=ref_s,
+        full_width=args.width,
+        full_height=args.height,
+        scale=args.search_scale,
+        H_refined_full=H_refined,
+        pts_target=match_result.pts_target,
+        pts_ref=match_result.pts_ref,
+        args=args,
     )
 
-    pred_hom_refined = remap_full(ref.y, hom_x, hom_y)
-    refined_hom_cost = calc_cost(target.y, pred_hom_refined, hom_valid, args.min_valid_ratio)
-
-    print(f"[INFO] refined homography c=1 cost: {refined_hom_cost}")
-
-    # Identity baseline.
-    pred_identity = remap_full(ref.y, xs, ys)
-    identity_valid = valid_from_map(xs, ys, args.width, args.height)
-    identity_cost = calc_cost(target.y, pred_identity, identity_valid, args.min_valid_ratio)
-
-    print(f"[INFO] identity c=0 cost: {identity_cost}")
-
-    # ------------------------------------------------------------
-    # Frame-level C coarse-to-fine using refined H flow.
-    # ------------------------------------------------------------
-
-    pred_frame_c, valid_frame_c, frame_c_meta = framewise_c_refine(
-        target_y=target.y,
-        ref_y=ref.y,
-        xs=xs,
-        ys=ys,
-        flow_x=flow_x,
-        flow_y=flow_y,
-        c_min=args.c_min,
-        c_max=args.c_max,
-        c_samples=args.c_samples,
-        c_search_iters=args.c_search_iters,
-        min_valid_ratio=args.min_valid_ratio,
-        min_range_width=args.min_range_width,
+    print("[INFO] Best search result:")
+    print(
+        json.dumps(
+            {
+                "score": best_search.score,
+                "mae": best_search.mae,
+                "valid_ratio": best_search.valid_ratio,
+                "f_full": best_search.f_full,
+                "f_rel_to_width": best_search.f_full / args.width,
+                "t": best_search.t.tolist(),
+                "R": best_search.R.tolist(),
+            },
+            indent=2,
+        )
     )
 
-    print("[INFO] frame-level C refine:")
-    print(json.dumps(frame_c_meta, indent=2))
-
     # ------------------------------------------------------------
-    # Block-level C coarse-to-fine using refined H flow.
+    # Final full-res evaluation/output.
     # ------------------------------------------------------------
 
-    pred_block_c, valid_block_c, c_map, conf_map, block_meta = blockwise_c_refine(
+    K_full = build_K(args.width, args.height, best_search.f_full)
+    rays_full = make_rays(args.width, args.height, K_full)
+
+    c_list = parse_float_list(args.c_list)
+
+    # R-only / c=0 baseline.
+    map_x0, map_y0, valid0 = camera_maps_from_rays(
+        K_full,
+        best_search.R,
+        best_search.t,
+        0.0,
+        rays_full,
+    )
+    pred_c0 = remap_full(ref.y, map_x0, map_y0)
+    cost_c0 = calc_basic_cost(target.y, pred_c0, valid0)
+
+    # Final block-wise coarse C.
+    final_res = calc_pose_score(
         target_y=target.y,
         ref_y=ref.y,
-        xs=xs,
-        ys=ys,
-        flow_x=flow_x,
-        flow_y=flow_y,
-        block_size=args.block_size,
-        c_min=args.c_min,
-        c_max=args.c_max,
-        c_samples=args.c_samples,
-        c_search_iters=args.c_search_iters,
+        K=K_full,
+        rays=rays_full,
+        R=best_search.R,
+        t=best_search.t,
+        f_full=best_search.f_full,
+        c_list=c_list,
+        block_size=args.final_block_size,
         min_block_valid_ratio=args.min_block_valid_ratio,
-        min_range_width=args.min_range_width,
+        c_smooth_lambda=args.c_smooth_lambda,
+        return_pred=True,
     )
 
-    print("[INFO] block-level C summary:")
-    print(json.dumps(block_meta["summary"], indent=2))
+    cost_block = calc_basic_cost(target.y, final_res.pred, final_res.valid)
+
+    print("[INFO] Final c=0 cost:")
+    print(json.dumps(cost_c0, indent=2))
+    print("[INFO] Final block-C cost:")
+    print(json.dumps(cost_block, indent=2))
 
     # ------------------------------------------------------------
-    # Save YUV outputs.
+    # Save files.
     # ------------------------------------------------------------
 
     paths = {
         "target_yuv": os.path.join(args.output_dir, "target_pair.yuv"),
         "ref_yuv": os.path.join(args.output_dir, "ref_pair.yuv"),
-        "pred_identity_yuv": os.path.join(args.output_dir, "pred_identity_c0.yuv"),
-        "pred_homography_initial_yuv": os.path.join(args.output_dir, "pred_homography_initial_c1.yuv"),
-        "pred_homography_refined_yuv": os.path.join(args.output_dir, "pred_homography_refined_c1.yuv"),
-        "pred_frame_c_yuv": os.path.join(args.output_dir, "pred_frameC_refined.yuv"),
-        "pred_block_c_yuv": os.path.join(args.output_dir, f"pred_block{args.block_size}C_refined.yuv"),
+        "pred_c0_yuv": os.path.join(args.output_dir, "pred_camera_c0.yuv"),
+        "pred_block_c_yuv": os.path.join(args.output_dir, f"pred_camera_block{args.final_block_size}C.yuv"),
     }
 
     write_single_yuv420(paths["target_yuv"], target.y, args.width, args.height, args.bitdepth)
     write_single_yuv420(paths["ref_yuv"], ref.y, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_identity_yuv"], pred_identity, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_homography_initial_yuv"], pred_hom_init, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_homography_refined_yuv"], pred_hom_refined, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_frame_c_yuv"], pred_frame_c, args.width, args.height, args.bitdepth)
-    write_single_yuv420(paths["pred_block_c_yuv"], pred_block_c, args.width, args.height, args.bitdepth)
-
-    # ------------------------------------------------------------
-    # Save PNG outputs.
-    # ------------------------------------------------------------
+    write_single_yuv420(paths["pred_c0_yuv"], pred_c0, args.width, args.height, args.bitdepth)
+    write_single_yuv420(paths["pred_block_c_yuv"], final_res.pred, args.width, args.height, args.bitdepth)
 
     save_gray_png(os.path.join(args.output_dir, "target.png"), target.y, args.bitdepth)
     save_gray_png(os.path.join(args.output_dir, "ref.png"), ref.y, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_identity_c0.png"), pred_identity, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_homography_initial_c1.png"), pred_hom_init, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_homography_refined_c1.png"), pred_hom_refined, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, "pred_frameC_refined.png"), pred_frame_c, args.bitdepth)
-    save_gray_png(os.path.join(args.output_dir, f"pred_block{args.block_size}C_refined.png"), pred_block_c, args.bitdepth)
+    save_gray_png(os.path.join(args.output_dir, "pred_camera_c0.png"), pred_c0, args.bitdepth)
+    save_gray_png(
+        os.path.join(args.output_dir, f"pred_camera_block{args.final_block_size}C.png"),
+        final_res.pred,
+        args.bitdepth,
+    )
 
-    save_diff_png(os.path.join(args.output_dir, "diff_identity_c0.png"), target.y, pred_identity, identity_valid)
-    save_diff_png(os.path.join(args.output_dir, "diff_homography_initial_c1.png"), target.y, pred_hom_init, init_hom_valid)
-    save_diff_png(os.path.join(args.output_dir, "diff_homography_refined_c1.png"), target.y, pred_hom_refined, hom_valid)
-    save_diff_png(os.path.join(args.output_dir, "diff_frameC_refined.png"), target.y, pred_frame_c, valid_frame_c)
-    save_diff_png(os.path.join(args.output_dir, f"diff_block{args.block_size}C_refined.png"), target.y, pred_block_c, valid_block_c)
+    save_diff_png(os.path.join(args.output_dir, "diff_camera_c0.png"), target.y, pred_c0, valid0)
+    save_diff_png(
+        os.path.join(args.output_dir, f"diff_camera_block{args.final_block_size}C.png"),
+        target.y,
+        final_res.pred,
+        final_res.valid,
+    )
 
-    save_c_map_png(os.path.join(args.output_dir, f"c_map_block{args.block_size}.png"), c_map)
-    save_conf_png(os.path.join(args.output_dir, f"c_confidence_block{args.block_size}.png"), conf_map)
-
-    # ------------------------------------------------------------
-    # Save JSON.
-    # ------------------------------------------------------------
+    save_c_map_png(
+        os.path.join(args.output_dir, f"c_map_block{args.final_block_size}.png"),
+        final_res.c_block_grid,
+        args.width,
+        args.height,
+        args.final_block_size,
+    )
 
     result = {
         "input": args.input,
@@ -1223,47 +1296,64 @@ def main():
         "target_idx": int(args.target_idx),
         "ref_idx": int(args.ref_idx),
 
-        "model": "p_pred = p_identity + c_block * (p_homography_refined - p_identity)",
-        "c_meaning": {
-            "c=0": "identity / no warp",
-            "c=1": "refined homography",
-            "c<1": "weaker than refined homography",
-            "c>1": "stronger than refined homography along the same flow direction",
-        },
+        "model": "p_ref = project(K * (R * ray_target + c_block * t))",
+        "search_objective": "Score(R,t,f)=sum_blocks min_c block_MAE",
 
         "matching": {
             "num_good_matches": int(len(match_result.good_matches)),
-            "homography_inliers": int(h_inliers),
-            "ransac_thresh": float(args.ransac_thresh),
+            "homography_inliers": int(H_inliers),
             "max_features": int(args.max_features),
             "match_ratio": float(args.match_ratio),
+            "ransac_thresh": float(args.ransac_thresh),
             "clahe": bool(not args.no_clahe),
         },
 
         "homography": {
-            "H_initial_target_to_ref": H_init.tolist(),
-            "H_refined_target_to_ref": H_refined.tolist(),
+            "H_initial": H_init.tolist(),
+            "H_refined": H_refined.tolist(),
             "ecc": ecc_meta,
         },
 
-        "search": {
-            "block_size": int(args.block_size),
-            "c_min": float(args.c_min),
-            "c_max": float(args.c_max),
-            "c_samples": int(args.c_samples),
-            "c_search_iters": int(args.c_search_iters),
-            "min_range_width": float(args.min_range_width),
-            "min_valid_ratio": float(args.min_valid_ratio),
-            "min_block_valid_ratio": float(args.min_block_valid_ratio),
+        "best_camera": {
+            "f_full": float(best_search.f_full),
+            "f_rel_to_width": float(best_search.f_full / args.width),
+            "K": K_full.tolist(),
+            "R_ref_target": best_search.R.tolist(),
+            "t_ref_target_unit": best_search.t.tolist(),
+            "search_score": float(best_search.score),
+            "search_mae": float(best_search.mae),
+            "search_valid_ratio": float(best_search.valid_ratio),
         },
 
-        "costs": {
-            "identity_c0": identity_cost,
-            "homography_initial_c1": init_hom_cost,
-            "homography_refined_c1": refined_hom_cost,
-            "frame_c_refined": frame_c_meta,
-            "block_c_refined_summary": block_meta["summary"],
+        "search_args": {
+            "search_scale": float(args.search_scale),
+            "search_iters": int(args.search_iters),
+            "search_block_size": int(args.search_block_size),
+            "final_block_size": int(args.final_block_size),
+            "f_rel_list": parse_float_list(args.f_rel_list),
+            "f_grid": int(args.f_grid),
+            "f_step_rel": float(args.f_step_rel),
+            "f_shrink": float(args.f_shrink),
+            "r_step_deg": float(args.r_step_deg),
+            "r_grid": int(args.r_grid),
+            "r_shrink": float(args.r_shrink),
+            "refine_t": bool(args.refine_t),
+            "t_step_deg": float(args.t_step_deg),
+            "t_grid": int(args.t_grid),
+            "t_shrink": float(args.t_shrink),
+            "c_list": c_list,
+            "c_smooth_lambda": float(args.c_smooth_lambda),
         },
+
+        "search_history": search_history,
+
+        "final_costs": {
+            "camera_c0": cost_c0,
+            "camera_block_c": cost_block,
+        },
+
+        "final_c_block_grid": final_res.c_block_grid.tolist(),
+        "final_c_block_cost_grid": final_res.c_block_cost_grid.tolist(),
 
         "outputs": paths,
 
@@ -1271,30 +1361,21 @@ def main():
             "match_vis": os.path.join(args.output_dir, "match_vis_homography_inliers.png"),
             "target_png": os.path.join(args.output_dir, "target.png"),
             "ref_png": os.path.join(args.output_dir, "ref.png"),
-            "pred_identity_png": os.path.join(args.output_dir, "pred_identity_c0.png"),
-            "pred_homography_initial_png": os.path.join(args.output_dir, "pred_homography_initial_c1.png"),
-            "pred_homography_refined_png": os.path.join(args.output_dir, "pred_homography_refined_c1.png"),
-            "pred_frame_c_png": os.path.join(args.output_dir, "pred_frameC_refined.png"),
-            "pred_block_c_png": os.path.join(args.output_dir, f"pred_block{args.block_size}C_refined.png"),
-            "diff_identity_png": os.path.join(args.output_dir, "diff_identity_c0.png"),
-            "diff_homography_initial_png": os.path.join(args.output_dir, "diff_homography_initial_c1.png"),
-            "diff_homography_refined_png": os.path.join(args.output_dir, "diff_homography_refined_c1.png"),
-            "diff_frame_c_png": os.path.join(args.output_dir, "diff_frameC_refined.png"),
-            "diff_block_c_png": os.path.join(args.output_dir, f"diff_block{args.block_size}C_refined.png"),
-            "c_map_png": os.path.join(args.output_dir, f"c_map_block{args.block_size}.png"),
-            "c_confidence_png": os.path.join(args.output_dir, f"c_confidence_block{args.block_size}.png"),
+            "pred_c0_png": os.path.join(args.output_dir, "pred_camera_c0.png"),
+            "pred_block_c_png": os.path.join(args.output_dir, f"pred_camera_block{args.final_block_size}C.png"),
+            "diff_c0_png": os.path.join(args.output_dir, "diff_camera_c0.png"),
+            "diff_block_c_png": os.path.join(args.output_dir, f"diff_camera_block{args.final_block_size}C.png"),
+            "c_map_png": os.path.join(args.output_dir, f"c_map_block{args.final_block_size}.png"),
         },
 
-        "block_records": block_meta["blocks"],
-
         "notes": [
-            "Initial homography is estimated by ORB matching and RANSAC.",
-            "Refined homography is obtained by ECC photometric alignment.",
-            "Use --h-refine-iters 0 to disable ECC refinement.",
-            "C search is separate from H refinement.",
-            "c=1 means the refined homography itself.",
-            "If the scene is pure camera rotation, pred_homography_refined_c1 should usually be the most physically meaningful baseline.",
-            "If block-wise C improves over c=1, the homography flow direction is useful but local strength differs spatially.",
+            "Depth C is intentionally coarse and used only as a nuisance variable during camera search.",
+            "R/f/t receive more search budget than C.",
+            "C is applied only to the translation/parallax term, not to the rotation term.",
+            "pred_camera_c0.yuv shows the selected R-only camera warp.",
+            "pred_camera_block*C.yuv shows the selected R/t camera warp with block-wise coarse C.",
+            "If pred_camera_c0 is already good, the scene is rotation-dominant.",
+            "If block C improves significantly, translation/depth parallax is useful.",
         ],
     }
 
@@ -1304,9 +1385,7 @@ def main():
 
     print(f"[DONE] result JSON: {json_path}")
     print(f"[DONE] target YUV: {paths['target_yuv']}")
-    print(f"[DONE] initial homography YUV: {paths['pred_homography_initial_yuv']}")
-    print(f"[DONE] refined homography YUV: {paths['pred_homography_refined_yuv']}")
-    print(f"[DONE] frame C YUV: {paths['pred_frame_c_yuv']}")
+    print(f"[DONE] c0 YUV: {paths['pred_c0_yuv']}")
     print(f"[DONE] block C YUV: {paths['pred_block_c_yuv']}")
 
 
