@@ -13,10 +13,13 @@
 #   estimated from a full block_size x block_size window whenever possible.
 #
 # Additional update:
-#   Level-0 only small ref-coordinate translation sweep.
-#   After the first largest-block level chooses each block homography,
-#   the code sweeps small dx/dy offsets and keeps T(dx,dy) @ H if it reduces MAE.
-#   The refined H is then passed to the next hierarchical level as parent H.
+#   Small ref-coordinate translation sweep can be applied at:
+#     none  : no sweep
+#     first : first largest-block level only
+#     last  : last smallest-block level only
+#
+#   Sweep transform:
+#     H_refined = T(dx, dy) @ H
 #
 # Outputs:
 #   target_pair.yuv
@@ -193,11 +196,6 @@ def make_tiles(
     If edge_anchored_fit is True:
         For partial right/bottom edge blocks, the fitting region is shifted
         inward so that fit_w/fit_h becomes block_size whenever possible.
-
-    Example:
-        width=1856, block_size=256
-        last output tile: out_x0=1792, out_x1=1856, out_w=64
-        last fitting tile: fit_x0=1600, fit_x1=1856, fit_w=256
     """
     tiles: List[List[Tile]] = []
 
@@ -524,7 +522,7 @@ def shift_homography_ref_translation(H: np.ndarray, dx: float, dy: float) -> np.
     Coordinate convention:
         target pixel -> ref pixel
 
-    This applies a small translation in the ref sampling coordinate:
+    Apply small translation in ref sampling coordinate:
         x_ref' = x_ref + dx
         y_ref' = y_ref + dy
 
@@ -745,13 +743,15 @@ def run_one_level(
     parent_H_grid: Optional[np.ndarray],
     parent_block_size: Optional[int],
     root_fallback_H: np.ndarray,
+    level: int,
+    is_last_level: bool,
     args,
 ) -> Tuple[np.ndarray, List[List[Dict]], Dict[str, np.ndarray]]:
     height, width = target_y.shape
     ny, nx = block_grid_shape(width, height, block_size)
 
     edge_anchored_fit = not args.disable_edge_anchored_fit
-    is_first_largest_level = parent_H_grid is None
+    is_first_largest_level = level == 0
 
     tiles = make_tiles(
         width=width,
@@ -771,9 +771,9 @@ def run_one_level(
     chosen_cost_grid = np.full((ny, nx), np.inf, dtype=np.float64)
     valid_ratio_grid = np.zeros((ny, nx), dtype=np.float64)
 
-    level0_sweep_applied_grid = np.zeros((ny, nx), dtype=np.float64)
-    level0_sweep_dx_grid = np.zeros((ny, nx), dtype=np.float64)
-    level0_sweep_dy_grid = np.zeros((ny, nx), dtype=np.float64)
+    shift_sweep_applied_grid = np.zeros((ny, nx), dtype=np.float64)
+    shift_sweep_dx_grid = np.zeros((ny, nx), dtype=np.float64)
+    shift_sweep_dy_grid = np.zeros((ny, nx), dtype=np.float64)
 
     # source id:
     # 0 root_fallback
@@ -792,7 +792,12 @@ def run_one_level(
     accepted = 0
     inherited = 0
     rejected = 0
-    level0_sweep_applied_count = 0
+    shift_sweep_applied_count = 0
+
+    apply_sweep_this_level = (
+        (args.sweep_level == "first" and is_first_largest_level)
+        or (args.sweep_level == "last" and is_last_level)
+    )
 
     for by_idx, row in enumerate(tiles):
         row_records = []
@@ -895,20 +900,21 @@ def run_one_level(
                 inherited += 1
 
             # ------------------------------------------------------------
-            # Level-0 only small translation sweep.
+            # Optional small translation sweep.
             #
-            # This is applied only at the first largest-block level.
-            # The refined H becomes the parent H for the next level.
+            # args.sweep_level:
+            #   none  : disabled
+            #   first : first largest-block level only
+            #   last  : last smallest-block level only
             # ------------------------------------------------------------
-            level0_sweep_applied = False
-            level0_sweep_dx = 0.0
-            level0_sweep_dy = 0.0
+            shift_sweep_applied = False
+            shift_sweep_dx = 0.0
+            shift_sweep_dy = 0.0
 
             if (
-                is_first_largest_level
-                and not args.disable_level0_sweep
-                and args.level0_sweep_radius > 0.0
-                and args.level0_sweep_step > 0.0
+                apply_sweep_this_level
+                and args.shift_sweep_radius > 0.0
+                and args.shift_sweep_step > 0.0
             ):
                 swept_H, swept_dx, swept_dy, swept_cost, swept_valid_ratio, swept_applied = (
                     sweep_homography_ref_translation_mae(
@@ -920,9 +926,9 @@ def run_one_level(
                         bw=tile.out_w,
                         bh=tile.out_h,
                         min_valid_ratio=args.min_block_valid_ratio,
-                        radius=args.level0_sweep_radius,
-                        step=args.level0_sweep_step,
-                        min_gain=args.level0_sweep_min_gain,
+                        radius=args.shift_sweep_radius,
+                        step=args.shift_sweep_step,
+                        min_gain=args.shift_sweep_min_gain,
                     )
                 )
 
@@ -931,17 +937,17 @@ def run_one_level(
                     chosen_cost = swept_cost
                     chosen_valid_ratio = swept_valid_ratio
 
-                    level0_sweep_applied = True
-                    level0_sweep_dx = swept_dx
-                    level0_sweep_dy = swept_dy
-                    level0_sweep_applied_count += 1
+                    shift_sweep_applied = True
+                    shift_sweep_dx = swept_dx
+                    shift_sweep_dy = swept_dy
+                    shift_sweep_applied_count += 1
 
                     reason = (
-                        f"{reason}+level0_sweep"
-                        f"(dx={swept_dx:.3f},dy={swept_dy:.3f})"
+                        f"{reason}+shift_sweep"
+                        f"(level={level},dx={swept_dx:.3f},dy={swept_dy:.3f})"
                     )
                 else:
-                    reason = f"{reason}+level0_sweep_no_gain"
+                    reason = f"{reason}+shift_sweep_no_gain"
 
             H_grid[by_idx, bx_idx] = normalize_homography(chosen_H)
             source_grid[by_idx, bx_idx] = source_id.get(chosen_source, 0)
@@ -953,9 +959,9 @@ def run_one_level(
             chosen_cost_grid[by_idx, bx_idx] = chosen_cost
             valid_ratio_grid[by_idx, bx_idx] = chosen_valid_ratio
 
-            level0_sweep_applied_grid[by_idx, bx_idx] = 1.0 if level0_sweep_applied else 0.0
-            level0_sweep_dx_grid[by_idx, bx_idx] = level0_sweep_dx
-            level0_sweep_dy_grid[by_idx, bx_idx] = level0_sweep_dy
+            shift_sweep_applied_grid[by_idx, bx_idx] = 1.0 if shift_sweep_applied else 0.0
+            shift_sweep_dx_grid[by_idx, bx_idx] = shift_sweep_dx
+            shift_sweep_dy_grid[by_idx, bx_idx] = shift_sweep_dy
 
             row_records.append(
                 {
@@ -988,9 +994,9 @@ def run_one_level(
                     "chosen_cost": float(chosen_cost) if np.isfinite(chosen_cost) else None,
                     "valid_ratio": float(chosen_valid_ratio),
 
-                    "level0_sweep_applied": bool(level0_sweep_applied),
-                    "level0_sweep_dx": float(level0_sweep_dx),
-                    "level0_sweep_dy": float(level0_sweep_dy),
+                    "shift_sweep_applied": bool(shift_sweep_applied),
+                    "shift_sweep_dx": float(shift_sweep_dx),
+                    "shift_sweep_dy": float(shift_sweep_dy),
 
                     "H": H_grid[by_idx, bx_idx].tolist(),
                 }
@@ -1008,14 +1014,14 @@ def run_one_level(
         "chosen_cost_grid": chosen_cost_grid,
         "valid_ratio_grid": valid_ratio_grid,
 
-        "level0_sweep_applied_grid": level0_sweep_applied_grid,
-        "level0_sweep_dx_grid": level0_sweep_dx_grid,
-        "level0_sweep_dy_grid": level0_sweep_dy_grid,
+        "shift_sweep_applied_grid": shift_sweep_applied_grid,
+        "shift_sweep_dx_grid": shift_sweep_dx_grid,
+        "shift_sweep_dy_grid": shift_sweep_dy_grid,
 
         "accepted": np.array([accepted], dtype=np.float64),
         "inherited": np.array([inherited], dtype=np.float64),
         "rejected": np.array([rejected], dtype=np.float64),
-        "level0_sweep_applied_count": np.array([level0_sweep_applied_count], dtype=np.float64),
+        "shift_sweep_applied_count": np.array([shift_sweep_applied_count], dtype=np.float64),
     }
 
     return H_grid, level_records, aux
@@ -1155,27 +1161,37 @@ def main():
     parser.add_argument("--disable-cost-gate", action="store_true")
 
     parser.add_argument(
-        "--disable-level0-sweep",
-        action="store_true",
-        help="Disable small dx/dy MAE sweep for the first largest-block level.",
+        "--sweep-level",
+        choices=["none", "first", "last"],
+        default="last",
+        help=(
+            "Apply small dx/dy MAE sweep at no level, first largest level, "
+            "or last smallest level."
+        ),
     )
 
     parser.add_argument(
+        "--shift-sweep-radius",
         "--level0-sweep-radius",
+        dest="shift_sweep_radius",
         type=float,
         default=2.0,
-        help="Sweep radius in ref pixels for the first level. Example: 2.0 means [-2, +2].",
+        help="Sweep radius in ref pixels. Example: 2.0 means [-2, +2].",
     )
 
     parser.add_argument(
+        "--shift-sweep-step",
         "--level0-sweep-step",
+        dest="shift_sweep_step",
         type=float,
         default=0.25,
         help="Sweep step in ref pixels. Use 1.0 for integer-pel, 0.5 or 0.25 for sub-pel.",
     )
 
     parser.add_argument(
+        "--shift-sweep-min-gain",
         "--level0-sweep-min-gain",
+        dest="shift_sweep_min_gain",
         type=float,
         default=0.0,
         help="Minimum MAE gain required to apply the swept shift.",
@@ -1196,11 +1212,11 @@ def main():
     print(f"[INFO] start_block={args.start_block_size}, levels={args.levels}, min_block={args.min_block_size}")
     print(f"[INFO] edge_anchored_fit={edge_anchored_fit}")
     print(
-        "[INFO] level0_sweep="
-        f"{not args.disable_level0_sweep}, "
-        f"radius={args.level0_sweep_radius}, "
-        f"step={args.level0_sweep_step}, "
-        f"min_gain={args.level0_sweep_min_gain}"
+        "[INFO] shift_sweep="
+        f"{args.sweep_level}, "
+        f"radius={args.shift_sweep_radius}, "
+        f"step={args.shift_sweep_step}, "
+        f"min_gain={args.shift_sweep_min_gain}"
     )
 
     target = read_y_frame(args.input, width, height, args.bitdepth, args.target_idx)
@@ -1280,7 +1296,13 @@ def main():
             print(f"[INFO] stop: block_size={block_size} < min_block_size={args.min_block_size}")
             break
 
-        print(f"[LEVEL {level}] block_size={block_size}")
+        next_block_size = block_size // 2
+        is_last_level = (
+            level == args.levels - 1
+            or next_block_size < args.min_block_size
+        )
+
+        print(f"[LEVEL {level}] block_size={block_size}, is_last_level={is_last_level}")
 
         H_grid, level_records, aux = run_one_level(
             target_y=target.y,
@@ -1292,6 +1314,8 @@ def main():
             parent_H_grid=parent_H_grid,
             parent_block_size=parent_block_size,
             root_fallback_H=root_H,
+            level=level,
+            is_last_level=is_last_level,
             args=args,
         )
 
@@ -1356,24 +1380,24 @@ def main():
         )
 
         save_scalar_map_png(
-            os.path.join(args.output_dir, f"level0_sweep_applied_{level_tag}.png"),
-            aux["level0_sweep_applied_grid"],
+            os.path.join(args.output_dir, f"shift_sweep_applied_{level_tag}.png"),
+            aux["shift_sweep_applied_grid"],
             width,
             height,
             block_size,
         )
 
         save_scalar_map_png(
-            os.path.join(args.output_dir, f"level0_sweep_dx_{level_tag}.png"),
-            aux["level0_sweep_dx_grid"],
+            os.path.join(args.output_dir, f"shift_sweep_dx_{level_tag}.png"),
+            aux["shift_sweep_dx_grid"],
             width,
             height,
             block_size,
         )
 
         save_scalar_map_png(
-            os.path.join(args.output_dir, f"level0_sweep_dy_{level_tag}.png"),
-            aux["level0_sweep_dy_grid"],
+            os.path.join(args.output_dir, f"shift_sweep_dy_{level_tag}.png"),
+            aux["shift_sweep_dy_grid"],
             width,
             height,
             block_size,
@@ -1382,16 +1406,17 @@ def main():
         accepted = int(aux["accepted"][0])
         inherited = int(aux["inherited"][0])
         rejected = int(aux["rejected"][0])
-        level0_sweep_applied_count = int(aux["level0_sweep_applied_count"][0])
+        shift_sweep_applied_count = int(aux["shift_sweep_applied_count"][0])
 
         summary = {
             "level": int(level),
             "block_size": int(block_size),
+            "is_last_level": bool(is_last_level),
             "num_blocks": int(H_grid.shape[0] * H_grid.shape[1]),
             "accepted_local_fit": accepted,
             "inherited_no_fit": inherited,
             "rejected_by_cost": rejected,
-            "level0_sweep_applied_count": level0_sweep_applied_count,
+            "shift_sweep_applied_count": shift_sweep_applied_count,
             "cost": cost,
             "output_yuv": yuv_path,
         }
@@ -1428,9 +1453,9 @@ def main():
                 ).tolist(),
                 "valid_ratio_grid": aux["valid_ratio_grid"].tolist(),
 
-                "level0_sweep_applied_grid": aux["level0_sweep_applied_grid"].tolist(),
-                "level0_sweep_dx_grid": aux["level0_sweep_dx_grid"].tolist(),
-                "level0_sweep_dy_grid": aux["level0_sweep_dy_grid"].tolist(),
+                "shift_sweep_applied_grid": aux["shift_sweep_applied_grid"].tolist(),
+                "shift_sweep_dx_grid": aux["shift_sweep_dx_grid"].tolist(),
+                "shift_sweep_dy_grid": aux["shift_sweep_dy_grid"].tolist(),
             }
         )
 
@@ -1441,7 +1466,7 @@ def main():
 
         parent_H_grid = H_grid
         parent_block_size = block_size
-        block_size = block_size // 2
+        block_size = next_block_size
 
     if final_pred is None or final_valid is None:
         raise RuntimeError("No level was processed.")
@@ -1491,13 +1516,16 @@ def main():
             "fit_output_region_separation": (
                 "H is fitted from fit tile; photometric accept/reject and final rendering use output tile only."
             ),
-            "level0_shift_sweep": {
-                "enabled": bool(not args.disable_level0_sweep),
-                "radius": float(args.level0_sweep_radius),
-                "step": float(args.level0_sweep_step),
-                "min_gain": float(args.level0_sweep_min_gain),
-                "applied_only_to": "first largest-block level",
+            "shift_sweep": {
+                "sweep_level": args.sweep_level,
+                "radius": float(args.shift_sweep_radius),
+                "step": float(args.shift_sweep_step),
+                "min_gain": float(args.shift_sweep_min_gain),
                 "transform": "H_refined = T(dx, dy) @ H",
+                "description": (
+                    "none disables sweep; first applies sweep only to the first largest-block level; "
+                    "last applies sweep only to the final smallest-block level."
+                ),
             },
         },
 
@@ -1547,9 +1575,9 @@ def main():
             "For edge blocks, fit_x/fit_y/fit_w/fit_h in JSON may differ from block_x/block_y/block_w/block_h.",
             "Edge-anchored fitting uses inward full-size fitting windows for partial right/bottom blocks.",
             "The final prediction still writes only the non-overlap output tile, so adjacent blocks are not overwritten.",
-            "Level-0 sweep is applied only on the first largest-block level before passing H_grid to the next level.",
-            "Level-0 sweep modifies the ref sampling coordinate by H_refined = T(dx,dy) @ H.",
-            "If an edge block improves after this change, the previous issue was likely caused by too few matches in a partial tile.",
+            "Shift sweep modifies the ref sampling coordinate by H_refined = T(dx,dy) @ H.",
+            "With sweep_level=last, shift sweep is applied only to the final smallest-block level.",
+            "With sweep_level=first, shift sweep is applied only to the first largest-block level and passed to child levels as parent H.",
             "This code is diagnostic only; it does not yet compress block homographies into global parameters + scalar c.",
         ],
     }
