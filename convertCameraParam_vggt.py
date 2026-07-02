@@ -14,7 +14,7 @@ import numpy as np
 # NPZ
 # ============================================================
 
-def npz_scalar_to_str(x) -> str:
+def npz_scalar_to_str(x):
     arr = np.asarray(x)
     v = arr.item() if arr.shape == () else arr.tolist()
     if isinstance(v, bytes):
@@ -33,8 +33,16 @@ def load_vggt_npz(npz_path: Path):
     extrinsic = z["extrinsic"].astype(np.float32)
     intrinsic = z["intrinsic_original"].astype(np.float32)
 
+    # Optional batch/channel cleanup
     if depth.ndim == 4 and depth.shape[-1] == 1:
         depth = depth[..., 0]
+    if depth.ndim == 4 and depth.shape[0] == 1:
+        depth = depth[0]
+
+    if extrinsic.ndim == 4 and extrinsic.shape[0] == 1:
+        extrinsic = extrinsic[0]
+    if intrinsic.ndim == 4 and intrinsic.shape[0] == 1:
+        intrinsic = intrinsic[0]
 
     if depth.ndim != 3:
         raise ValueError(f"{npz_path}: depth_original must be SxHxW. Got {depth.shape}")
@@ -112,28 +120,47 @@ def infer_sequence_and_rap(npz_path: Path, rap_name_from_npz=None, rap_index_fro
 
 
 # ============================================================
-# Depth YUV
+# Fixed-point depth scale
 # ============================================================
 
-def choose_auto_depth_scale(depth: np.ndarray, percentile: float, max_code: int = 1023):
+def choose_fixed_point_depth_scale(
+    depth: np.ndarray,
+    percentile: float,
+    precision: int,
+    max_code: int = 1023,
+):
     """
-    Choose depth_scale automatically.
-
     Convention:
-      depth_y = round(depth / depth_scale)
-      depth ~= depth_y * depth_scale
 
-    To avoid outliers, use percentile depth as the target max.
+      depth_scale_int = round(depth_scale_float * precision)
+      depth_scale_real = depth_scale_int / precision
+
+      depth_y = round(depth_original / depth_scale_real)
+      depth_decoded = depth_y * depth_scale_real
+
+    Header stores:
+      depth_scale = depth_scale_int
+      depth_scale_precision = precision
     """
     valid = np.isfinite(depth) & (depth > 0)
 
     if not np.any(valid):
+        scale_float = 1.0
+        scale_int = int(round(scale_float * precision))
+        scale_int = max(1, scale_int)
+        scale_real = scale_int / float(precision)
+
         return {
-            "depth_scale": 1.0,
-            "depth_ref": 1023.0,
-            "depth_percentile": percentile,
-            "max_code": max_code,
-            "scale_policy": "fallback",
+            "depth_scale": int(scale_int),
+            "depth_scale_precision": int(precision),
+            "depth_scale_real": float(scale_real),
+            "depth_scale_float_before_fixed_point": float(scale_float),
+            "depth_ref": float(max_code),
+            "depth_percentile": float(percentile),
+            "max_code": int(max_code),
+            "scale_policy": "fallback_no_valid_depth",
+            "encode_formula": "depth_y = round(depth_original / (depth_scale / depth_scale_precision))",
+            "decode_formula": "depth = depth_y * depth_scale / depth_scale_precision",
         }
 
     vals = depth[valid].astype(np.float64)
@@ -143,37 +170,84 @@ def choose_auto_depth_scale(depth: np.ndarray, percentile: float, max_code: int 
         depth_ref = float(np.max(vals))
 
     if not np.isfinite(depth_ref) or depth_ref <= 0:
-        depth_ref = 1023.0
+        depth_ref = float(max_code)
 
-    # Integer-friendly policy:
-    # If depth_ref is small, use integer multiplier internally.
-    # Example: depth_ref=100, multiplier=10, depth_scale=0.1.
-    # If depth_ref is large, use integer depth_scale divisor.
-    if depth_ref <= max_code:
-        depth_multiplier = max(1, int(np.floor(max_code / depth_ref)))
-        depth_scale = 1.0 / float(depth_multiplier)
-        scale_policy = "integer_multiplier"
-        depth_divisor = None
-    else:
-        depth_divisor = max(1, int(np.ceil(depth_ref / max_code)))
-        depth_scale = float(depth_divisor)
-        scale_policy = "integer_depth_scale"
-        depth_multiplier = None
+    scale_float = depth_ref / float(max_code)
+
+    # User-requested policy: multiply by 1e5 and round.
+    scale_int = int(round(scale_float * float(precision)))
+
+    # Avoid zero scale.
+    scale_int = max(1, scale_int)
+
+    scale_real = scale_int / float(precision)
 
     return {
-        "depth_scale": float(depth_scale),
+        "depth_scale": int(scale_int),
+        "depth_scale_precision": int(precision),
+        "depth_scale_real": float(scale_real),
+        "depth_scale_float_before_fixed_point": float(scale_float),
         "depth_ref": float(depth_ref),
         "depth_percentile": float(percentile),
         "max_code": int(max_code),
-        "scale_policy": scale_policy,
-        "depth_multiplier": depth_multiplier,
-        "depth_divisor": depth_divisor,
-        "encode_formula": "depth_y = round(depth / depth_scale)",
-        "decode_formula": "depth = depth_y * depth_scale",
+        "scale_policy": "fixed_point_round",
+        "encode_formula": "depth_y = round(depth_original / (depth_scale / depth_scale_precision))",
+        "decode_formula": "depth = depth_y * depth_scale / depth_scale_precision",
     }
 
 
-def write_depth_yuv420p10le(out_path: Path, depth: np.ndarray, depth_scale: float):
+def quantize_depth_with_fixed_point_scale(depth: np.ndarray, depth_meta: dict):
+    scale_real = float(depth_meta["depth_scale_real"])
+    max_code = int(depth_meta["max_code"])
+
+    if scale_real <= 0:
+        raise ValueError("depth_scale_real must be positive")
+
+    y = np.nan_to_num(
+        depth,
+        nan=0.0,
+        posinf=max_code * scale_real,
+        neginf=0.0,
+    )
+
+    y = np.round(y / scale_real)
+    y = np.clip(y, 0, max_code).astype(np.dtype("<u2"))
+
+    return y
+
+
+def compute_depth_quant_stats(depth: np.ndarray, yq: np.ndarray, depth_meta: dict):
+    scale_real = float(depth_meta["depth_scale_real"])
+    max_code = int(depth_meta["max_code"])
+
+    valid = np.isfinite(depth) & (depth > 0)
+
+    if not np.any(valid):
+        return {
+            "valid_count": 0,
+            "clip_ratio": 0.0,
+            "mae": None,
+            "rmse": None,
+            "max_abs_err": None,
+        }
+
+    recon = yq.astype(np.float32) * scale_real
+
+    err = recon[valid].astype(np.float64) - depth[valid].astype(np.float64)
+    abs_err = np.abs(err)
+
+    clip = valid & (yq >= max_code)
+
+    return {
+        "valid_count": int(np.count_nonzero(valid)),
+        "clip_ratio": float(np.count_nonzero(clip) / max(np.count_nonzero(valid), 1)),
+        "mae": float(np.mean(abs_err)),
+        "rmse": float(np.sqrt(np.mean(err * err))),
+        "max_abs_err": float(np.max(abs_err)),
+    }
+
+
+def write_depth_yuv420p10le(out_path: Path, depth: np.ndarray, depth_meta: dict):
     n, h, w = depth.shape
 
     if w % 2 or h % 2:
@@ -181,15 +255,30 @@ def write_depth_yuv420p10le(out_path: Path, depth: np.ndarray, depth_scale: floa
 
     uv = np.full((h // 2, w // 2), 512, dtype=np.dtype("<u2"))
 
+    all_stats = []
+
     with open(out_path, "wb") as f:
         for i in range(n):
-            y = np.nan_to_num(depth[i], nan=0.0, posinf=1023.0 * depth_scale, neginf=0.0)
-            y = np.round(y / depth_scale)
-            y = np.clip(y, 0, 1023).astype(np.dtype("<u2"))
+            y = quantize_depth_with_fixed_point_scale(depth[i], depth_meta)
 
             f.write(np.ascontiguousarray(y).tobytes())
             f.write(uv.tobytes())
             f.write(uv.tobytes())
+
+            all_stats.append(compute_depth_quant_stats(depth[i], y, depth_meta))
+
+    valid_maes = [s["mae"] for s in all_stats if s["mae"] is not None]
+    valid_rmses = [s["rmse"] for s in all_stats if s["rmse"] is not None]
+    clip_ratios = [s["clip_ratio"] for s in all_stats]
+
+    summary = {
+        "frame_stats": all_stats,
+        "mean_mae": float(np.mean(valid_maes)) if valid_maes else None,
+        "mean_rmse": float(np.mean(valid_rmses)) if valid_rmses else None,
+        "max_clip_ratio": float(np.max(clip_ratios)) if clip_ratios else 0.0,
+    }
+
+    return summary
 
 
 # ============================================================
@@ -223,7 +312,6 @@ def rt_cur_to_prev_from_extrinsics(extrinsics: np.ndarray):
     T_cur_to_prev = W2C_prev @ C2W_cur
     """
     n = extrinsics.shape[0]
-
     W2Cs = [extrinsic_to_4x4(extrinsics[i]) for i in range(n)]
 
     rvecs = np.zeros((n, 3), dtype=np.float32)
@@ -306,6 +394,7 @@ def write_camparam_jsonl(
     tvecs: np.ndarray,
     intrinsic: np.ndarray,
     depth_meta: dict,
+    quant_summary: dict,
     z_sign: float,
     pose_mode: str,
     width: int,
@@ -315,19 +404,40 @@ def write_camparam_jsonl(
 ):
     header = {
         "type": "header",
-        "depth_scale": float(depth_meta["depth_scale"]),
+
+        # Fixed-point integer scale.
+        # Decoder:
+        #   depth = depth_y * depth_scale / depth_scale_precision
+        "depth_scale": int(depth_meta["depth_scale"]),
+        "depth_scale_precision": int(depth_meta["depth_scale_precision"]),
+
+        # Debug/readability only. Encoder/decoder does not need this if it uses precision.
+        "depth_scale_real": float(depth_meta["depth_scale_real"]),
+
         "width": int(width),
         "height": int(height),
         "bit_depth": 10,
         "depth_yuv": str(depth_yuv_path.name),
+
         "intrinsic": intrinsic_to_header_dict(intrinsic[0], z_sign=z_sign),
+
         "camera_param": "rvec_tvec_6d",
         "pose_mode": pose_mode,
-        "depth_quant": depth_meta,
+
+        "depth_quant": {
+            **depth_meta,
+            "quant_summary": {
+                "mean_mae": quant_summary["mean_mae"],
+                "mean_rmse": quant_summary["mean_rmse"],
+                "max_clip_ratio": quant_summary["max_clip_ratio"],
+            },
+        },
+
         "frame_line_format": {
             "type": "omitted",
             "fields": ["poc", "rvec", "tvec"],
         },
+
         "source_npz": str(source_npz.resolve()),
     }
 
@@ -368,21 +478,22 @@ def process_one_npz(npz_path: Path, args):
     if not args.overwrite:
         if out_cam.exists():
             print(f"[SKIP] exists: {out_cam}")
-            return
+            return False
         if out_depth.exists():
             print(f"[SKIP] exists: {out_depth}")
-            return
+            return False
 
-    depth_meta = choose_auto_depth_scale(
+    depth_meta = choose_fixed_point_depth_scale(
         depth=depth,
         percentile=args.depth_percentile,
+        precision=args.depth_scale_precision,
         max_code=1023,
     )
 
-    write_depth_yuv420p10le(
+    quant_summary = write_depth_yuv420p10le(
         out_path=out_depth,
         depth=depth,
-        depth_scale=float(depth_meta["depth_scale"]),
+        depth_meta=depth_meta,
     )
 
     if args.pose_mode == "current_to_previous":
@@ -398,6 +509,7 @@ def process_one_npz(npz_path: Path, args):
         tvecs=tvecs,
         intrinsic=intrinsic,
         depth_meta=depth_meta,
+        quant_summary=quant_summary,
         z_sign=args.z_sign,
         pose_mode=args.pose_mode,
         width=w,
@@ -411,11 +523,19 @@ def process_one_npz(npz_path: Path, args):
     dmax = float(np.max(depth[valid])) if np.any(valid) else 0.0
 
     print(f"[OK] {npz_path}")
-    print(f"     depth range raw : {dmin:.6g} ~ {dmax:.6g}")
-    print(f"     depth ref       : {depth_meta['depth_ref']:.6g} @ p{args.depth_percentile}")
-    print(f"     depth_scale     : {depth_meta['depth_scale']:.9g}")
-    print(f"     camParam        : {out_cam}")
-    print(f"     depth yuv       : {out_depth}")
+    print(f"     raw depth range     : {dmin:.6g} ~ {dmax:.6g}")
+    print(f"     depth_ref           : {depth_meta['depth_ref']:.6g} @ p{args.depth_percentile}")
+    print(f"     scale_float         : {depth_meta['depth_scale_float_before_fixed_point']:.9g}")
+    print(f"     depth_scale int     : {depth_meta['depth_scale']}")
+    print(f"     precision           : {depth_meta['depth_scale_precision']}")
+    print(f"     depth_scale real    : {depth_meta['depth_scale_real']:.9g}")
+    print(f"     quant mean MAE      : {quant_summary['mean_mae']}")
+    print(f"     quant mean RMSE     : {quant_summary['mean_rmse']}")
+    print(f"     max clip ratio      : {quant_summary['max_clip_ratio']:.6g}")
+    print(f"     camParam            : {out_cam}")
+    print(f"     depth yuv           : {out_depth}")
+
+    return True
 
 
 # ============================================================
@@ -445,6 +565,13 @@ def main():
     )
 
     ap.add_argument(
+        "--depth-scale-precision",
+        type=int,
+        default=100000,
+        help="Fixed-point precision for depth_scale. Default: 100000.",
+    )
+
+    ap.add_argument(
         "--z-sign",
         type=float,
         default=1.0,
@@ -469,23 +596,31 @@ def main():
     if not (0.0 < args.depth_percentile <= 100.0):
         raise ValueError("--depth-percentile must be in (0, 100]")
 
+    if args.depth_scale_precision <= 0:
+        raise ValueError("--depth-scale-precision must be positive")
+
     npz_files = sorted(root.rglob(args.pattern))
 
     if not npz_files:
         print(f"No NPZ files found under: {root}")
         return
 
-    print(f"Found NPZ files : {len(npz_files)}")
-    print(f"pose_mode       : {args.pose_mode}")
-    print(f"depth_percentile: {args.depth_percentile}")
+    print(f"Found NPZ files       : {len(npz_files)}")
+    print(f"pose_mode             : {args.pose_mode}")
+    print(f"depth_percentile      : {args.depth_percentile}")
+    print(f"depth_scale_precision : {args.depth_scale_precision}")
 
     ok = 0
     fail = 0
+    skip = 0
 
     for npz_path in npz_files:
         try:
-            process_one_npz(npz_path, args)
-            ok += 1
+            converted = process_one_npz(npz_path, args)
+            if converted:
+                ok += 1
+            else:
+                skip += 1
         except Exception as exc:
             fail += 1
             print(f"[FAIL] {npz_path}")
@@ -493,6 +628,7 @@ def main():
 
     print("Done.")
     print(f"converted: {ok}")
+    print(f"skipped  : {skip}")
     print(f"failed   : {fail}")
 
 
