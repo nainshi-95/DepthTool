@@ -912,3 +912,83 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def infer_total_frames_from_yuv(
+    yuv_path: str,
+    width: int,
+    height: int,
+    pix_fmt: PixFmt,
+) -> int:
+    fs = frame_size_bytes(width, height, pix_fmt)
+    file_size = os.path.getsize(yuv_path)
+
+    total_frames = file_size // fs
+    trailing_bytes = file_size % fs
+
+    if total_frames <= 0:
+        raise ValueError(
+            f"Input YUV has no complete frame: file_size={file_size}, frame_size={fs}"
+        )
+
+    if trailing_bytes != 0:
+        print(
+            f"Warning: YUV file has {trailing_bytes} trailing bytes. "
+            f"Ignoring incomplete tail."
+        )
+
+    return total_frames
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if args.start < 0:
+    raise ValueError("Require start >= 0")
+
+total_frames = infer_total_frames_from_yuv(
+    args.yuv,
+    args.width,
+    args.height,
+    pix_fmt,
+)
+
+if args.end < 0:
+    args.end = total_frames - 1
+    print(f"Inferred total frames: {total_frames}")
+    print(f"Using --end {args.end}")
+elif args.end >= total_frames:
+    raise ValueError(
+        f"--end {args.end} exceeds last frame index {total_frames - 1}"
+    )
+
+if args.end < args.start:
+    raise ValueError("Require start <= end")
