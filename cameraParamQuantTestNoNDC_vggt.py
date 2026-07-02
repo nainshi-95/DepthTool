@@ -210,16 +210,6 @@ def load_param_jsonl(path):
 
 
 def get_depth_scale_real_from_header(header):
-    """
-    Supports both old float format and new fixed-point integer format.
-
-    New format:
-      depth_scale = integer
-      depth_scale_precision = 100000
-
-    Decoder:
-      depth_scale_real = depth_scale / depth_scale_precision
-    """
     if "depth_scale_precision" in header:
         precision = float(header["depth_scale_precision"])
         if precision <= 0:
@@ -256,7 +246,7 @@ def quant_u(value, lo, hi, bits):
 
 def signed_q_abs_max(bits):
     if bits < 2:
-        raise ValueError("ext-bits must be >= 2")
+        raise ValueError("bits must be >= 2")
     return (1 << (bits - 1)) - 1
 
 
@@ -275,13 +265,6 @@ def quant_s(value, step, bits):
 
 
 def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
-    """
-    right/bottom padding only:
-      pad_left=0, pad_top=0 -> intrinsic unchanged.
-
-    left/top padding:
-      principal point shifts.
-    """
     return {
         "fx": float(intr["fx"]),
         "fy": float(intr["fy"]),
@@ -291,10 +274,29 @@ def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
     }
 
 
+def add_intrinsic_delta(intr, delta):
+    return {
+        "fx": float(intr["fx"]) + float(delta[0]),
+        "fy": float(intr["fy"]) + float(delta[1]),
+        "cx": float(intr["cx"]) + float(delta[2]),
+        "cy": float(intr["cy"]) + float(delta[3]),
+        "z_sign": float(intr.get("z_sign", 1.0)),
+    }
+
+
+def intrinsic_to_vec4(intr):
+    return np.array(
+        [
+            float(intr["fx"]),
+            float(intr["fy"]),
+            float(intr["cx"]),
+            float(intr["cy"]),
+        ],
+        dtype=np.float32,
+    )
+
+
 def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
-    """
-    w, h are coded size known by decoder.
-    """
     fx_n = intr["fx"] / w
     fy_n = intr["fy"] / h
     cx_n = intr["cx"] / w
@@ -325,11 +327,20 @@ def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
     return intr_q, intr_dec, clipped
 
 
+def quantize_intrinsic_delta_4(delta, step, bits):
+    """
+    delta order:
+      [dfx, dfy, dcx, dcy]
+
+    q = round(delta / step)
+    dec_delta = q * step
+    """
+    delta = np.asarray(delta, dtype=np.float32).reshape(4)
+    q, dec, clipped = quant_s(delta, step=step, bits=bits)
+    return q.astype(np.int32), dec.astype(np.float32), clipped
+
+
 def param6_from_frame(frame, depth_scale_real):
-    """
-    param6 order:
-      rx, ry, rz, tx/depth_scale_real, ty/depth_scale_real, tz/depth_scale_real
-    """
     r = np.array(frame["rvec"], dtype=np.float32)
     t = np.array(frame["tvec"], dtype=np.float32) / float(depth_scale_real)
 
@@ -430,57 +441,64 @@ def predict_from_history(decoded_hist, pred_n, pred_degree):
 # Fast Pixel-coordinate Projection
 # ============================================================
 
-def make_projection_precompute(w, h, intr):
+def make_projection_precompute_dual(w, h, intr_tar, intr_ref):
     """
-    Pixel-coordinate projection.
+    target unprojection uses intr_tar.
+    reference projection uses intr_ref.
 
-      x_norm = (x - cx) / fx
-      y_norm = (y - cy) / fy
+      X_tar = [(x-cx_tar)/fx_tar*z,
+               (y-cy_tar)/fy_tar*z,
+               z_sign*z]
+
+      X_ref = R * X_tar + t
+
+      map_x = fx_ref * X_ref.x / |X_ref.z| + cx_ref
+      map_y = fy_ref * X_ref.y / |X_ref.z| + cy_ref
     """
-    fx = float(intr["fx"])
-    fy = float(intr["fy"])
-    cx = float(intr["cx"])
-    cy = float(intr["cy"])
-    z_sign = float(intr["z_sign"])
+    fx_t = float(intr_tar["fx"])
+    fy_t = float(intr_tar["fy"])
+    cx_t = float(intr_tar["cx"])
+    cy_t = float(intr_tar["cy"])
+
+    fx_r = float(intr_ref["fx"])
+    fy_r = float(intr_ref["fy"])
+    cx_r = float(intr_ref["cx"])
+    cy_r = float(intr_ref["cy"])
+
+    z_sign = float(intr_tar.get("z_sign", intr_ref.get("z_sign", 1.0)))
 
     x, y = np.meshgrid(
         np.arange(w, dtype=np.float32),
         np.arange(h, dtype=np.float32),
     )
 
-    x_norm = (x - cx) / fx
-    y_norm = (y - cy) / fy
+    x_norm = (x - cx_t) / fx_t
+    y_norm = (y - cy_t) / fy_t
 
     return {
         "w": int(w),
         "h": int(h),
-        "fx": fx,
-        "fy": fy,
-        "cx": cx,
-        "cy": cy,
+
+        "fx_ref": fx_r,
+        "fy_ref": fy_r,
+        "cx_ref": cx_r,
+        "cy_ref": cy_r,
+
         "z_sign": z_sign,
         "x_norm": x_norm.astype(np.float32),
         "y_norm": y_norm.astype(np.float32),
     }
 
 
-def backward_map_fast_pixel_coord(depth_linear, precomp, rt):
-    """
-    target pixel + target depth
-      -> target camera coord
-      -> previous camera coord
-      -> previous pixel coordinate
-
-    rt:
-      X_prev = R * X_cur + t
-    """
+def backward_map_fast_pixel_coord_dual(depth_linear, precomp, rt):
     w = precomp["w"]
     h = precomp["h"]
 
-    fx = precomp["fx"]
-    fy = precomp["fy"]
-    cx = precomp["cx"]
-    cy = precomp["cy"]
+    fx = precomp["fx_ref"]
+    fy = precomp["fy_ref"]
+    cx = precomp["cx_ref"]
+    cy = precomp["cy_ref"]
+
     z_sign = precomp["z_sign"]
 
     x_norm = precomp["x_norm"]
@@ -845,9 +863,22 @@ def main():
     ap.add_argument("--pred-n", type=int, default=3)
     ap.add_argument("--pred-degree", type=int, default=2)
 
-    ap.add_argument("--ext-bits", type=int, default=8)
-    ap.add_argument("--r-step", type=float, default=2 ** -12)
-    ap.add_argument("--t-step-norm", type=float, default=2 ** -10)
+    # User-requested defaults
+    ap.add_argument("--ext-bits", type=int, default=16)
+    ap.add_argument("--r-step", type=float, default=1.0 / 16.0)
+    ap.add_argument("--t-step-norm", type=float, default=1.0 / 4.0)
+
+    # Intrinsic delta coding
+    ap.add_argument("--intr-delta-bits", type=int, default=16)
+    ap.add_argument(
+        "--intr-step",
+        type=float,
+        default=1.0 / 16.0,
+        help=(
+            "Intrinsic delta quantization step in pixel units. "
+            "q_intr_delta = round(delta / intr_step). Default: 1/16 pixel."
+        ),
+    )
 
     ap.add_argument("--intr-f-max", type=float, default=4.0)
     ap.add_argument("--intr-c-min", type=float, default=-1.0)
@@ -878,6 +909,13 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
 
     args = ap.parse_args()
+
+    if args.r_step <= 0:
+        raise ValueError("--r-step must be positive")
+    if args.t_step_norm <= 0:
+        raise ValueError("--t-step-norm must be positive")
+    if args.intr_step <= 0:
+        raise ValueError("--intr-step must be positive")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -934,33 +972,34 @@ def main():
 
     header, frames = load_param_jsonl(param_jsonl)
 
+    pose_mode = header.get("pose_mode", "current_to_previous")
+    if pose_mode != "current_to_previous":
+        raise RuntimeError(
+            f"This script expects pose_mode='current_to_previous', got '{pose_mode}'."
+        )
+
     depth_scale_real = get_depth_scale_real_from_header(header)
     depth_scale_precision = get_depth_scale_precision_from_header(header)
 
     if depth_scale_real <= 0:
         raise ValueError(f"Invalid depth_scale_real: {depth_scale_real}")
 
-    intr_gt_original = header["intrinsic"]
+    intr_gt_original0 = header["intrinsic"]
 
-    intr_gt_padded = make_padded_intrinsic_from_original(
-        intr_gt_original,
+    intr_gt_padded0 = make_padded_intrinsic_from_original(
+        intr_gt_original0,
         pad_left=pad_left,
         pad_top=pad_top,
     )
 
-    intr_q, intr_dec, intr_clip = quantize_intrinsic_16(
-        intr_gt_padded,
+    # Header first-frame intrinsic absolute coding.
+    intr_q0, intr_dec0, intr_clip0 = quantize_intrinsic_16(
+        intr_gt_padded0,
         coded_w,
         coded_h,
         f_max=args.intr_f_max,
         c_min=args.intr_c_min,
         c_max=args.intr_c_max,
-    )
-
-    projection_precomp = make_projection_precompute(
-        coded_w,
-        coded_h,
-        intr_dec,
     )
 
     seq_count = count_frames(seq_yuv, src_w, src_h, bit_depth)
@@ -989,17 +1028,23 @@ def main():
 
     decoded_hist = []
 
-    q_abs_max = signed_q_abs_max(args.ext_bits)
+    q_abs_max_ext = signed_q_abs_max(args.ext_bits)
+    q_abs_max_intr = signed_q_abs_max(args.intr_delta_bits)
 
-    intrinsic_bits = 4 * 16
+    header_intrinsic_bits = 4 * 16
     depth_scale_bits = int(args.depth_scale_bits)
     z_sign_bits = 1
-    header_bits = intrinsic_bits + depth_scale_bits + z_sign_bits
+    header_bits = header_intrinsic_bits + depth_scale_bits + z_sign_bits
 
     total_ext_bits = 0
     total_ext_bits_r = 0
     total_ext_bits_t = 0
     total_ext_bits_each = np.zeros(6, dtype=np.int64)
+
+    total_intr_delta_bits = 0
+    total_intr_delta_bits_each = np.zeros(4, dtype=np.int64)
+    total_intr_delta_frames = 0
+    total_intr_clipped_frames = 0
 
     total_coded_frames = 0
     total_clipped_frames = 0
@@ -1012,6 +1057,8 @@ def main():
     psnr_count_coded = 0
 
     ys_active, xs_active = active_slice(src_w, src_h, pad_left, pad_top)
+
+    decoded_intrinsics = [intr_dec0]
 
     print("============================================================")
     print("Input summary")
@@ -1027,7 +1074,14 @@ def main():
     print(f"depth_scale header    : {header['depth_scale']}")
     print(f"depth_scale_precision : {depth_scale_precision}")
     print(f"depth_scale_real      : {depth_scale_real}")
+    print(f"pose_mode             : {pose_mode}")
     print(f"warp_filter           : {args.warp_filter}")
+    print("------------------------------------------------------------")
+    print(f"ext-bits              : {args.ext_bits}")
+    print(f"r-step                : {args.r_step}")
+    print(f"t-step-norm           : {args.t_step_norm}")
+    print(f"intr-delta-bits       : {args.intr_delta_bits}")
+    print(f"intr-step             : {args.intr_step}")
     print("============================================================")
 
     with open(out_q_jsonl, "w", encoding="utf-8") as fq:
@@ -1051,12 +1105,12 @@ def main():
 
             "seq_start": int(args.seq_start),
 
-            "projection_mode": "fast_pixel_coordinate_no_ndc",
+            "projection_mode": "fast_pixel_coordinate_no_ndc_dual_intrinsic",
             "warp_filter": args.warp_filter,
             "precompute": [
-                "x_norm=(x-cx)/fx",
-                "y_norm=(y-cy)/fy",
-                "fx,fy,cx,cy,z_sign cached",
+                "target: x_norm=(x-cx_tar)/fx_tar",
+                "target: y_norm=(y-cy_tar)/fy_tar",
+                "reference: fx_ref,fy_ref,cx_ref,cy_ref cached",
             ],
             "depth_padding": "edge",
             "image_padding": "edge",
@@ -1070,26 +1124,38 @@ def main():
                 else "depth_linear = depth_y * depth_scale"
             ),
 
-            "intrinsic_gt_original": intr_gt_original,
-            "intrinsic_gt_padded": intr_gt_padded,
-            "intrinsic_q16": intr_q,
-            "intrinsic_dec": intr_dec,
-            "intrinsic_clipped": intr_clip,
+            "intrinsic_gt_original0": intr_gt_original0,
+            "intrinsic_gt_padded0": intr_gt_padded0,
+            "intrinsic_q16_first": intr_q0,
+            "intrinsic_dec_first": intr_dec0,
+            "intrinsic_first_clipped": intr_clip0,
+
+            "intrinsic_delta_code": "signed_truncated_exp_golomb",
+            "intrinsic_delta_bits": args.intr_delta_bits,
+            "intrinsic_delta_q_abs_max": q_abs_max_intr,
+            "intrinsic_delta_q_range": [-q_abs_max_intr, q_abs_max_intr],
+            "intrinsic_delta_step": args.intr_step,
+            "intrinsic_delta_order": ["dfx", "dfy", "dcx", "dcy"],
+            "intrinsic_decode": (
+                "intrinsic_dec[poc] = intrinsic_dec[poc-1] "
+                "+ q_intrinsic_delta[poc] * intrinsic_delta_step"
+            ),
 
             "extrinsic_bits": args.ext_bits,
-            "extrinsic_q_abs_max": q_abs_max,
-            "extrinsic_q_range": [-q_abs_max, q_abs_max],
+            "extrinsic_q_abs_max": q_abs_max_ext,
+            "extrinsic_q_range": [-q_abs_max_ext, q_abs_max_ext],
             "r_step": args.r_step,
             "t_step_norm": args.t_step_norm,
             "pred_n": args.pred_n,
             "pred_degree": args.pred_degree,
 
             "bit_count": {
-                "intrinsic_bits": intrinsic_bits,
+                "header_intrinsic_bits": header_intrinsic_bits,
                 "depth_scale_bits": depth_scale_bits,
                 "z_sign_bits": z_sign_bits,
                 "header_bits": header_bits,
                 "extrinsic_code": "signed_truncated_exp_golomb",
+                "intrinsic_delta_code": "signed_truncated_exp_golomb",
             },
 
             "param6_order": [
@@ -1132,10 +1198,18 @@ def main():
                 fq.write(json.dumps({
                     "poc": 0,
                     "seq_idx": int(seq_idx),
+
                     "q_residual": [0, 0, 0, 0, 0, 0],
                     "q_residual_bits": [0, 0, 0, 0, 0, 0],
                     "q_residual_total_bits": 0,
                     "param6_dec": p0_dec.astype(float).tolist(),
+
+                    "intrinsic_delta_gt": [0.0, 0.0, 0.0, 0.0],
+                    "q_intrinsic_delta": [0, 0, 0, 0],
+                    "q_intrinsic_delta_bits": [0, 0, 0, 0],
+                    "q_intrinsic_delta_total_bits": 0,
+                    "intrinsic_dec": intr_dec0,
+
                     "mae_y_active": 0.0,
                     "mae_y_coded": 0.0,
                     "psnr_y_active": "inf",
@@ -1148,7 +1222,52 @@ def main():
             if poc not in frames:
                 raise RuntimeError(f"POC {poc} not found in param jsonl")
 
-            p_gt = param6_from_frame(frames[poc], depth_scale_real)
+            frame = frames[poc]
+
+            if "intrinsic_delta" not in frame:
+                raise RuntimeError(
+                    f"POC {poc} has no intrinsic_delta. "
+                    f"Regenerate camParam JSONL with per-frame intrinsic_delta."
+                )
+
+            # ------------------------------------------------------------
+            # Intrinsic delta coding
+            # ------------------------------------------------------------
+            intr_delta_gt = np.array(frame["intrinsic_delta"], dtype=np.float32).reshape(4)
+
+            q_intr, d_intr, clip_intr = quantize_intrinsic_delta_4(
+                intr_delta_gt,
+                step=args.intr_step,
+                bits=args.intr_delta_bits,
+            )
+
+            q_intr_bits_each, q_intr_bits_total = q_residual_bits_signed_trunc_exp_golomb(
+                q_intr,
+                q_abs_max=q_abs_max_intr,
+            )
+
+            total_intr_delta_bits += q_intr_bits_total
+            total_intr_delta_bits_each += np.array(q_intr_bits_each, dtype=np.int64)
+            total_intr_delta_frames += 1
+
+            intrinsic_clipped = bool(np.any(clip_intr))
+            if intrinsic_clipped:
+                total_intr_clipped_frames += 1
+
+            intr_dec_cur = add_intrinsic_delta(
+                decoded_intrinsics[-1],
+                d_intr,
+            )
+
+            decoded_intrinsics.append(intr_dec_cur)
+
+            intr_dec_ref = decoded_intrinsics[poc - 1]
+            intr_dec_tar = decoded_intrinsics[poc]
+
+            # ------------------------------------------------------------
+            # Extrinsic coding
+            # ------------------------------------------------------------
+            p_gt = param6_from_frame(frame, depth_scale_real)
 
             p_pred = predict_from_history(
                 decoded_hist,
@@ -1174,7 +1293,7 @@ def main():
 
             q_bits_each, q_bits_total = q_residual_bits_signed_trunc_exp_golomb(
                 q_residual,
-                q_abs_max=q_abs_max,
+                q_abs_max=q_abs_max_ext,
             )
 
             total_ext_bits += q_bits_total
@@ -1192,6 +1311,9 @@ def main():
 
             rt_dec = rt_from_param6(p_dec, depth_scale_real)
 
+            # ------------------------------------------------------------
+            # Depth
+            # ------------------------------------------------------------
             depth_y, _, _ = read_yuv420(
                 depth_yuv,
                 poc,
@@ -1200,9 +1322,6 @@ def main():
                 10,
             )
 
-            # 핵심 수정:
-            # camParam JSONL이 fixed-point scale이면:
-            #   depth_linear = depth_y * depth_scale / depth_scale_precision
             depth_linear = depth_y.astype(np.float32) * float(depth_scale_real)
 
             depth_linear_pad = pad_2d_edge(
@@ -1213,7 +1332,19 @@ def main():
                 pad_top,
             ).astype(np.float32)
 
-            map_x, map_y = backward_map_fast_pixel_coord(
+            # ------------------------------------------------------------
+            # Projection with dual intrinsic
+            # target: current intrinsic
+            # ref   : previous intrinsic
+            # ------------------------------------------------------------
+            projection_precomp = make_projection_precompute_dual(
+                coded_w,
+                coded_h,
+                intr_tar=intr_dec_tar,
+                intr_ref=intr_dec_ref,
+            )
+
+            map_x, map_y = backward_map_fast_pixel_coord_dual(
                 depth_linear=depth_linear_pad,
                 precomp=projection_precomp,
                 rt=rt_dec,
@@ -1302,6 +1433,7 @@ def main():
             fq.write(json.dumps({
                 "poc": int(poc),
                 "seq_idx": int(seq_idx),
+
                 "q_residual": q_residual.astype(int).tolist(),
                 "q_residual_bits": q_bits_each,
                 "q_residual_total_bits": int(q_bits_total),
@@ -1309,7 +1441,17 @@ def main():
                 "param6_dec": p_dec.astype(float).tolist(),
                 "param6_gt": p_gt.astype(float).tolist(),
                 "rt_dec": rt_dec,
-                "clipped": clipped,
+                "extrinsic_clipped": clipped,
+
+                "intrinsic_delta_gt": intr_delta_gt.astype(float).tolist(),
+                "q_intrinsic_delta": q_intr.astype(int).tolist(),
+                "intrinsic_delta_dec": d_intr.astype(float).tolist(),
+                "q_intrinsic_delta_bits": q_intr_bits_each,
+                "q_intrinsic_delta_total_bits": int(q_intr_bits_total),
+                "intrinsic_ref_dec": intr_dec_ref,
+                "intrinsic_tar_dec": intr_dec_tar,
+                "intrinsic_clipped": intrinsic_clipped,
+
                 "mae_y_active": mae_y_active,
                 "mae_y_coded": mae_y_coded,
                 "psnr_y_active": json_safe_float(psnr_y_active),
@@ -1323,12 +1465,13 @@ def main():
                 f"Y-PSNR-coded={psnr_y_coded:.3f} dB, "
                 f"Y-MAE-active={mae_y_active:.3f}, "
                 f"Y-MAE-coded={mae_y_coded:.3f}, "
-                f"clipped={clipped}, "
-                f"param_bits={q_bits_total}, "
-                f"bits_each={q_bits_each}"
+                f"ext_clip={clipped}, "
+                f"intr_clip={intrinsic_clipped}, "
+                f"ext_bits={q_bits_total}, "
+                f"intr_bits={q_intr_bits_total}"
             )
 
-    total_bits = header_bits + total_ext_bits
+    total_bits = header_bits + total_ext_bits + total_intr_delta_bits
 
     print("============================================================")
     print("Padding / projection summary")
@@ -1341,9 +1484,8 @@ def main():
         f"R={pad_right}, B={pad_bottom}"
     )
     print(f"seq_start             : {args.seq_start}")
-    print("projection            : fast pixel-coordinate, no NDC")
+    print("projection            : fast pixel-coordinate, dual intrinsic, no NDC")
     print(f"warp filter           : {args.warp_filter}")
-    print("precompute            : x_norm, y_norm")
     print("image/depth padding   : edge")
     print("------------------------------------------------------------")
     print("Depth scale")
@@ -1355,10 +1497,13 @@ def main():
     print("------------------------------------------------------------")
     print("Intrinsic")
     print("------------------------------------------------------------")
-    print(f"original intrinsic    : {intr_gt_original}")
-    print(f"padded intrinsic gt   : {intr_gt_padded}")
-    print(f"padded intrinsic dec  : {intr_dec}")
-    print(f"intrinsic clipped     : {intr_clip}")
+    print(f"first intrinsic gt    : {intr_gt_original0}")
+    print(f"first intrinsic padded: {intr_gt_padded0}")
+    print(f"first intrinsic dec   : {intr_dec0}")
+    print(f"first intrinsic clip  : {intr_clip0}")
+    print(f"intrinsic delta step  : {args.intr_step}")
+    print(f"intrinsic delta bits  : {args.intr_delta_bits}")
+    print(f"intrinsic q range     : [-{q_abs_max_intr}, {q_abs_max_intr}]")
     print("============================================================")
     print("Metric summary")
     print("============================================================")
@@ -1385,16 +1530,16 @@ def main():
     print("============================================================")
     print("Bit summary")
     print("============================================================")
-    print(f"intrinsic bits        : {intrinsic_bits} bits")
+    print(f"header intrinsic bits : {header_intrinsic_bits} bits")
     print(f"  fx, fy, cx, cy      : 16 bits each")
     print(f"depth_scale bits      : {depth_scale_bits} bits")
     print(f"z_sign bits           : {z_sign_bits} bits")
     print(f"header bits           : {header_bits} bits")
     print("------------------------------------------------------------")
     print(f"extrinsic code        : signed truncated Exp-Golomb")
-    print(f"extrinsic q range     : [-{q_abs_max}, {q_abs_max}]")
-    print(f"coded frames          : {total_coded_frames}")
-    print(f"clipped frames        : {total_clipped_frames}")
+    print(f"extrinsic q range     : [-{q_abs_max_ext}, {q_abs_max_ext}]")
+    print(f"extrinsic frames      : {total_coded_frames}")
+    print(f"extrinsic clipped     : {total_clipped_frames}")
     print(f"extrinsic total bits  : {total_ext_bits} bits")
 
     if total_coded_frames > 0:
@@ -1407,13 +1552,33 @@ def main():
         print(f"avg rotation bits     : {avg_r_bits:.3f} / frame")
         print(f"avg translation bits  : {avg_t_bits:.3f} / frame")
         print(
-            "avg bits each         : "
+            "avg ext bits each     : "
             f"rx={avg_bits_each[0]:.3f}, "
             f"ry={avg_bits_each[1]:.3f}, "
             f"rz={avg_bits_each[2]:.3f}, "
             f"tx={avg_bits_each[3]:.3f}, "
             f"ty={avg_bits_each[4]:.3f}, "
             f"tz={avg_bits_each[5]:.3f}"
+        )
+
+    print("------------------------------------------------------------")
+    print(f"intrinsic delta code  : signed truncated Exp-Golomb")
+    print(f"intrinsic delta range : [-{q_abs_max_intr}, {q_abs_max_intr}]")
+    print(f"intrinsic delta frames: {total_intr_delta_frames}")
+    print(f"intrinsic clipped     : {total_intr_clipped_frames}")
+    print(f"intrinsic delta bits  : {total_intr_delta_bits} bits")
+
+    if total_intr_delta_frames > 0:
+        avg_intr_bits = total_intr_delta_bits / total_intr_delta_frames
+        avg_intr_each = total_intr_delta_bits_each.astype(np.float64) / total_intr_delta_frames
+
+        print(f"avg intr bits/frame   : {avg_intr_bits:.3f}")
+        print(
+            "avg intr bits each    : "
+            f"dfx={avg_intr_each[0]:.3f}, "
+            f"dfy={avg_intr_each[1]:.3f}, "
+            f"dcx={avg_intr_each[2]:.3f}, "
+            f"dcy={avg_intr_each[3]:.3f}"
         )
 
     print("------------------------------------------------------------")
