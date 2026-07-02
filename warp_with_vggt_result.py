@@ -5,26 +5,18 @@ Warp a reference YUV frame to a target frame using VGGT-Omega depth + camera out
 
 Expected inputs from run_vggt_omega_yuv.py default output:
   - input original YUV sequence
-  - *_depth_inverse_yuv420p10le.yuv
+  - *_depth_inverse_yuv420p10le.yuv, or *_vggt_omega_outputs.npz
   - *_camera.jsonl
 
 Default warping direction:
   target pixel + target depth -> world -> reference camera -> reference pixel
   then cv2.remap(ref_frame, ref_x, ref_y) to synthesize target view.
 
-Example:
-  python warp_vggt_omega_yuv.py \
-    --yuv /path/to/input_1920x1080_420p10le.yuv \
-    --width 1920 --height 1080 --pix-fmt yuv420p10le \
-    --depth-yuv out/test_000_015_depth_inverse_yuv420p10le.yuv \
-    --camera-jsonl out/test_000_015_camera.jsonl \
-    --ref-idx 0 --tar-idx 7 \
-    --output-prefix out/warp_ref000_to_tar007
-
 Outputs:
   <prefix>_warped.yuv                 single-frame YUV420 warped ref image
+  <prefix>_target.yuv                 single-frame original target image
   <prefix>_valid_mask_yuv420p.yuv     single-frame 8-bit YUV420 valid mask
-  <prefix>_map_stats.json             projection/validity statistics
+  <prefix>_map_stats.json             projection/validity/error statistics
 """
 
 from __future__ import annotations
@@ -114,6 +106,7 @@ def write_yuv420_frame(
     y = np.clip(np.rint(y), 0, maxv)
     u = np.clip(np.rint(u), 0, maxv)
     v = np.clip(np.rint(v), 0, maxv)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         if pix_fmt == "yuv420p":
             f.write(y.astype(np.uint8).tobytes())
@@ -127,9 +120,10 @@ def write_yuv420_frame(
 
 def write_mask_yuv420p(path: str, mask: np.ndarray) -> None:
     h, w = mask.shape
-    y = (mask.astype(np.uint8) * 255)
+    y = mask.astype(np.uint8) * 255
     u = np.full((h // 2, w // 2), 128, dtype=np.uint8)
     v = np.full((h // 2, w // 2), 128, dtype=np.uint8)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         f.write(y.tobytes())
         f.write(u.tobytes())
@@ -299,15 +293,17 @@ def remap_plane(
         borderMode=border_mode,
         borderValue=float(border_value),
     )
-    # cv2 border is not enough because invalid positions have map -1 and can still sample border in some modes.
     remapped[~valid] = border_value
     return remapped
 
 
-def chroma_maps_from_luma(map_x: np.ndarray, map_y: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def chroma_maps_from_luma(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     h, w = map_x.shape
     cw, ch = w // 2, h // 2
-    # Approximate chroma-center mapping by resizing luma maps, then convert full-res ref coords to chroma coords.
     cmx = cv2.resize(map_x, (cw, ch), interpolation=cv2.INTER_LINEAR) * 0.5
     cmy = cv2.resize(map_y, (cw, ch), interpolation=cv2.INTER_LINEAR) * 0.5
     cvalid_f = cv2.resize(valid.astype(np.float32), (cw, ch), interpolation=cv2.INTER_AREA)
@@ -319,12 +315,10 @@ def chroma_maps_from_luma(map_x: np.ndarray, map_y: np.ndarray, valid: np.ndarra
 
 def fill_invalid_with_target(
     warped: tuple[np.ndarray, np.ndarray, np.ndarray],
-    target: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    target: tuple[np.ndarray, np.ndarray, np.ndarray],
     valid_luma: np.ndarray,
     valid_chroma: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if target is None:
-        return warped
     wy, wu, wv = warped
     ty, tu, tv = target
     out_y = wy.copy()
@@ -334,6 +328,25 @@ def fill_invalid_with_target(
     out_u[~valid_chroma] = tu.astype(np.float32)[~valid_chroma]
     out_v[~valid_chroma] = tv.astype(np.float32)[~valid_chroma]
     return out_y, out_u, out_v
+
+
+def y_mae_psnr(
+    pred_y: np.ndarray,
+    target_y: np.ndarray,
+    valid: np.ndarray,
+    bit_depth: int,
+) -> tuple[float | None, float | None]:
+    if valid.sum() == 0:
+        return None, None
+    diff = pred_y.astype(np.float64)[valid] - target_y.astype(np.float64)[valid]
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff * diff))
+    if mse <= 0.0:
+        psnr = float("inf")
+    else:
+        maxv = float((1 << bit_depth) - 1)
+        psnr = float(10.0 * np.log10((maxv * maxv) / mse))
+    return mae, psnr
 
 
 def parse_args() -> argparse.Namespace:
@@ -349,16 +362,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--depth-pix-fmt", default="yuv420p10le", help="depth YUV pix fmt; default yuv420p10le")
     p.add_argument("--npz", default=None, help="optional *_vggt_omega_outputs.npz. If set, uses raw float depth instead of quantized depth YUV")
     p.add_argument("--output-prefix", required=True)
+    p.add_argument("--target-output", default=None, help="Optional explicit output path for original target frame YUV")
 
     p.add_argument("--tenbit-shift-right", type=int, default=0,
                    help="Use 0 for normal yuv420p10le. Use 6 only if samples are MSB-aligned in uint16.")
     p.add_argument("--interp", choices=["linear", "nearest", "cubic"], default="linear")
     p.add_argument("--border", choices=["constant", "replicate"], default="constant")
     p.add_argument("--invalid-fill", choices=["black", "neutral", "copy_target"], default="black",
-                   help="How to fill pixels with no valid projection. copy_target reads target frame and fills holes with target.")
+                   help="How to fill pixels with no valid projection. copy_target fills holes with target.")
     p.add_argument("--min-depth", type=float, default=1e-8)
     p.add_argument("--chunk-rows", type=int, default=128)
-    p.add_argument("--write-mask", action="store_true", default=True)
+    p.add_argument("--no-write-mask", action="store_true", help="Disable valid mask YUV output")
     return p.parse_args()
 
 
@@ -367,8 +381,8 @@ def main() -> None:
     pix_fmt: PixFmt = normalize_pix_fmt(args.pix_fmt)
     depth_pix_fmt: PixFmt = normalize_pix_fmt(args.depth_pix_fmt)
     bit_depth = 8 if pix_fmt == "yuv420p" else 10
-    maxv = (1 << bit_depth) - 1
     neutral = 128 if bit_depth == 8 else 512
+    write_mask = not args.no_write_mask
 
     if args.npz is None and args.depth_yuv is None:
         raise ValueError("Provide either --depth-yuv or --npz")
@@ -394,6 +408,18 @@ def main() -> None:
     R_ref, t_ref = as_rt34(ref_rec["extrinsic"])
     R_tar, t_tar = as_rt34(tar_rec["extrinsic"])
 
+    # Read both reference and target frames from the original sequence.
+    ref_y, ref_u, ref_v = read_yuv420_frame(
+        args.yuv, args.ref_idx, args.width, args.height, pix_fmt, args.tenbit_shift_right
+    )
+    tar_y, tar_u, tar_v = read_yuv420_frame(
+        args.yuv, args.tar_idx, args.width, args.height, pix_fmt, args.tenbit_shift_right
+    )
+
+    # Save original target immediately, before projection/warp.
+    out_target = args.target_output or (args.output_prefix + "_target.yuv")
+    write_yuv420_frame(out_target, tar_y, tar_u, tar_v, pix_fmt, bit_depth)
+
     if args.npz:
         depth_tar = load_depth_from_npz(args.npz, args.tar_idx)
         depth_source = args.npz
@@ -414,10 +440,6 @@ def main() -> None:
 
     if depth_tar.shape != (args.height, args.width):
         raise ValueError(f"depth shape {depth_tar.shape} != {(args.height, args.width)}")
-
-    ref_y, ref_u, ref_v = read_yuv420_frame(
-        args.yuv, args.ref_idx, args.width, args.height, pix_fmt, args.tenbit_shift_right
-    )
 
     map_x, map_y, valid, stats = make_backward_map(
         depth_tar=depth_tar,
@@ -442,20 +464,24 @@ def main() -> None:
     y_fill = 0.0 if args.invalid_fill in ["black", "copy_target"] else float(neutral)
     uv_fill = float(neutral)
 
-    wy = remap_plane(ref_y, map_x, map_y, valid, interp, border_mode, y_fill)
+    raw_wy = remap_plane(ref_y, map_x, map_y, valid, interp, border_mode, y_fill)
     cmx, cmy, cvalid = chroma_maps_from_luma(map_x, map_y, valid)
-    wu = remap_plane(ref_u, cmx, cmy, cvalid, interp, border_mode, uv_fill)
-    wv = remap_plane(ref_v, cmx, cmy, cvalid, interp, border_mode, uv_fill)
+    raw_wu = remap_plane(ref_u, cmx, cmy, cvalid, interp, border_mode, uv_fill)
+    raw_wv = remap_plane(ref_v, cmx, cmy, cvalid, interp, border_mode, uv_fill)
 
+    wy, wu, wv = raw_wy, raw_wu, raw_wv
     if args.invalid_fill == "copy_target":
-        target = read_yuv420_frame(args.yuv, args.tar_idx, args.width, args.height, pix_fmt, args.tenbit_shift_right)
-        wy, wu, wv = fill_invalid_with_target((wy, wu, wv), target, valid, cvalid)
+        wy, wu, wv = fill_invalid_with_target((raw_wy, raw_wu, raw_wv), (tar_y, tar_u, tar_v), valid, cvalid)
+
+    raw_mae, raw_psnr = y_mae_psnr(raw_wy, tar_y, valid, bit_depth)
+    final_valid = np.ones_like(valid, dtype=bool) if args.invalid_fill == "copy_target" else valid
+    final_mae, final_psnr = y_mae_psnr(wy, tar_y, final_valid, bit_depth)
 
     out_yuv = args.output_prefix + "_warped.yuv"
     write_yuv420_frame(out_yuv, wy, wu, wv, pix_fmt, bit_depth)
 
     out_mask = args.output_prefix + "_valid_mask_yuv420p.yuv"
-    if args.write_mask:
+    if write_mask:
         write_mask_yuv420p(out_mask, valid)
 
     stats.update(
@@ -473,8 +499,14 @@ def main() -> None:
             "depth_min": float(np.nanmin(depth_tar)),
             "depth_max": float(np.nanmax(depth_tar)),
             "depth_mean": float(np.nanmean(depth_tar)),
+            "raw_warp_y_mae_valid": raw_mae,
+            "raw_warp_y_psnr_valid": raw_psnr,
+            "final_warp_y_mae": final_mae,
+            "final_warp_y_psnr": final_psnr,
+            "invalid_fill": args.invalid_fill,
             "output_warped_yuv": os.path.abspath(out_yuv),
-            "output_valid_mask_yuv420p": os.path.abspath(out_mask) if args.write_mask else None,
+            "output_target_yuv": os.path.abspath(out_target),
+            "output_valid_mask_yuv420p": os.path.abspath(out_mask) if write_mask else None,
             "note": "Backward warp: target depth -> target camera -> world -> reference camera -> reference pixel.",
         }
     )
@@ -484,10 +516,15 @@ def main() -> None:
 
     print("Done")
     print(f"  warped yuv : {out_yuv}")
-    if args.write_mask:
+    print(f"  target yuv : {out_target}")
+    if write_mask:
         print(f"  valid mask : {out_mask}")
     print(f"  stats      : {out_stats}")
     print(f"  valid ratio: {stats['projection_inside_ref_ratio']:.6f}")
+    if raw_mae is not None:
+        print(f"  raw Y MAE(valid): {raw_mae:.6f}")
+    if raw_psnr is not None:
+        print(f"  raw Y PSNR(valid): {raw_psnr:.6f} dB")
 
 
 if __name__ == "__main__":
