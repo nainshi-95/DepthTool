@@ -174,10 +174,7 @@ def choose_fixed_point_depth_scale(
 
     scale_float = depth_ref / float(max_code)
 
-    # User-requested policy: multiply by 1e5 and round.
     scale_int = int(round(scale_float * float(precision)))
-
-    # Avoid zero scale.
     scale_int = max(1, scale_int)
 
     scale_real = scale_int / float(precision)
@@ -340,7 +337,7 @@ def rt_cur_to_prev_from_extrinsics(extrinsics: np.ndarray):
 def rt_gop_local_from_extrinsics(extrinsics: np.ndarray):
     """
     Alternative:
-      poc i is relative to GOP first frame.
+      poc i is relative to GOP/RAP first frame.
 
     poc 0:
       identity
@@ -373,10 +370,10 @@ def rt_gop_local_from_extrinsics(extrinsics: np.ndarray):
 
 
 # ============================================================
-# JSONL
+# Intrinsic conversion
 # ============================================================
 
-def intrinsic_to_header_dict(K: np.ndarray, z_sign: float):
+def intrinsic_to_dict(K: np.ndarray, z_sign: float):
     K = np.asarray(K, dtype=np.float64)
 
     return {
@@ -387,6 +384,74 @@ def intrinsic_to_header_dict(K: np.ndarray, z_sign: float):
         "z_sign": float(z_sign),
     }
 
+
+def intrinsic_to_vec4(K: np.ndarray) -> np.ndarray:
+    K = np.asarray(K, dtype=np.float64)
+
+    return np.array(
+        [
+            K[0, 0],  # fx
+            K[1, 1],  # fy
+            K[0, 2],  # cx
+            K[1, 2],  # cy
+        ],
+        dtype=np.float64,
+    )
+
+
+def intrinsic_delta_from_previous(intrinsic: np.ndarray) -> np.ndarray:
+    """
+    intrinsic_delta[poc] = intrinsic[poc] - intrinsic[poc - 1]
+
+    poc 0:
+      [0, 0, 0, 0]
+
+    order:
+      [dfx, dfy, dcx, dcy]
+    """
+    n = intrinsic.shape[0]
+
+    vecs = np.stack(
+        [intrinsic_to_vec4(intrinsic[i]) for i in range(n)],
+        axis=0,
+    ).astype(np.float64)
+
+    deltas = np.zeros_like(vecs)
+    deltas[1:] = vecs[1:] - vecs[:-1]
+
+    return deltas.astype(np.float32)
+
+
+def compute_intrinsic_delta_stats(intrinsic: np.ndarray):
+    deltas = intrinsic_delta_from_previous(intrinsic)
+
+    if deltas.shape[0] <= 1:
+        body = deltas
+    else:
+        body = deltas[1:]
+
+    abs_body = np.abs(body).astype(np.float64)
+
+    return {
+        "delta_order": ["dfx", "dfy", "dcx", "dcy"],
+        "max_abs_delta": {
+            "dfx": float(np.max(abs_body[:, 0])) if body.size else 0.0,
+            "dfy": float(np.max(abs_body[:, 1])) if body.size else 0.0,
+            "dcx": float(np.max(abs_body[:, 2])) if body.size else 0.0,
+            "dcy": float(np.max(abs_body[:, 3])) if body.size else 0.0,
+        },
+        "mean_abs_delta": {
+            "dfx": float(np.mean(abs_body[:, 0])) if body.size else 0.0,
+            "dfy": float(np.mean(abs_body[:, 1])) if body.size else 0.0,
+            "dcx": float(np.mean(abs_body[:, 2])) if body.size else 0.0,
+            "dcy": float(np.mean(abs_body[:, 3])) if body.size else 0.0,
+        },
+    }
+
+
+# ============================================================
+# JSONL
+# ============================================================
 
 def write_camparam_jsonl(
     out_path: Path,
@@ -402,6 +467,9 @@ def write_camparam_jsonl(
     source_npz: Path,
     depth_yuv_path: Path,
 ):
+    intrinsic_deltas = intrinsic_delta_from_previous(intrinsic)
+    intrinsic_delta_stats = compute_intrinsic_delta_stats(intrinsic)
+
     header = {
         "type": "header",
 
@@ -411,7 +479,7 @@ def write_camparam_jsonl(
         "depth_scale": int(depth_meta["depth_scale"]),
         "depth_scale_precision": int(depth_meta["depth_scale_precision"]),
 
-        # Debug/readability only. Encoder/decoder does not need this if it uses precision.
+        # Debug/readability only.
         "depth_scale_real": float(depth_meta["depth_scale_real"]),
 
         "width": int(width),
@@ -419,7 +487,16 @@ def write_camparam_jsonl(
         "bit_depth": 10,
         "depth_yuv": str(depth_yuv_path.name),
 
-        "intrinsic": intrinsic_to_header_dict(intrinsic[0], z_sign=z_sign),
+        # First-frame absolute intrinsic.
+        # Frame lines carry only intrinsic_delta from previous frame.
+        "intrinsic": intrinsic_to_dict(intrinsic[0], z_sign=z_sign),
+        "intrinsic_param": "fx_fy_cx_cy",
+        "intrinsic_delta_mode": "previous_frame_delta",
+        "intrinsic_delta_order": ["dfx", "dfy", "dcx", "dcy"],
+        "intrinsic_delta_decode": (
+            "cur_fx += dfx; cur_fy += dfy; cur_cx += dcx; cur_cy += dcy"
+        ),
+        "intrinsic_delta_stats": intrinsic_delta_stats,
 
         "camera_param": "rvec_tvec_6d",
         "pose_mode": pose_mode,
@@ -435,7 +512,7 @@ def write_camparam_jsonl(
 
         "frame_line_format": {
             "type": "omitted",
-            "fields": ["poc", "rvec", "tvec"],
+            "fields": ["poc", "rvec", "tvec", "intrinsic_delta"],
         },
 
         "source_npz": str(source_npz.resolve()),
@@ -449,7 +526,14 @@ def write_camparam_jsonl(
                 "poc": int(poc),
                 "rvec": [float(x) for x in rvecs[poc]],
                 "tvec": [float(x) for x in tvecs[poc]],
+
+                # Only delta from previous frame.
+                # poc 0 is always zero because header has the absolute first intrinsic.
+                "intrinsic_delta": [
+                    float(x) for x in intrinsic_deltas[poc]
+                ],
             }
+
             fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -522,6 +606,9 @@ def process_one_npz(npz_path: Path, args):
     dmin = float(np.min(depth[valid])) if np.any(valid) else 0.0
     dmax = float(np.max(depth[valid])) if np.any(valid) else 0.0
 
+    intr_deltas = intrinsic_delta_from_previous(intrinsic)
+    intr_delta_abs = np.abs(intr_deltas[1:]) if intr_deltas.shape[0] > 1 else intr_deltas
+
     print(f"[OK] {npz_path}")
     print(f"     raw depth range     : {dmin:.6g} ~ {dmax:.6g}")
     print(f"     depth_ref           : {depth_meta['depth_ref']:.6g} @ p{args.depth_percentile}")
@@ -532,6 +619,16 @@ def process_one_npz(npz_path: Path, args):
     print(f"     quant mean MAE      : {quant_summary['mean_mae']}")
     print(f"     quant mean RMSE     : {quant_summary['mean_rmse']}")
     print(f"     max clip ratio      : {quant_summary['max_clip_ratio']:.6g}")
+
+    if intr_delta_abs.size:
+        print(
+            "     intrinsic delta max : "
+            f"dfx={np.max(intr_delta_abs[:, 0]):.6g}, "
+            f"dfy={np.max(intr_delta_abs[:, 1]):.6g}, "
+            f"dcx={np.max(intr_delta_abs[:, 2]):.6g}, "
+            f"dcy={np.max(intr_delta_abs[:, 3]):.6g}"
+        )
+
     print(f"     camParam            : {out_cam}")
     print(f"     depth yuv           : {out_depth}")
 
@@ -609,6 +706,7 @@ def main():
     print(f"pose_mode             : {args.pose_mode}")
     print(f"depth_percentile      : {args.depth_percentile}")
     print(f"depth_scale_precision : {args.depth_scale_precision}")
+    print("intrinsic mode        : first intrinsic in header + per-frame previous delta")
 
     ok = 0
     fail = 0
