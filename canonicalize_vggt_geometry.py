@@ -54,6 +54,7 @@ import math
 import os
 import re
 import unicodedata
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -121,6 +122,12 @@ def json_safe_float(x: Any) -> Any:
 
 def as_float_list(a: np.ndarray) -> list[float]:
     return [float(x) for x in np.asarray(a).reshape(-1)]
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
 
 
 # ============================================================
@@ -546,6 +553,10 @@ class CanonicalizationConfig:
     depth_scale_percentile: float
     bit_est_r_step: float
     bit_est_t_step: float
+    progress_every: int
+    save_debug_arrays: bool
+    compressed_npz: bool
+    epe_stride: int
 
 
 def load_camera_jsonl_optional(path: Path | None) -> list[dict[str, Any]] | None:
@@ -568,9 +579,11 @@ def canonicalize(
     cfg: CanonicalizationConfig,
     overwrite: bool,
 ) -> None:
+    log(f"Start canonicalization: {npz_path}")
     if not npz_path.is_file():
         raise FileNotFoundError(npz_path)
 
+    log("Loading NPZ metadata/arrays...")
     data = np.load(npz_path, allow_pickle=True)
     required = ["depth_original", "extrinsic", "intrinsic_original"]
     for k in required:
@@ -580,6 +593,7 @@ def canonicalize(
     depth = data["depth_original"].astype(np.float32)
     E_abs = data["extrinsic"].astype(np.float64)
     K_orig = data["intrinsic_original"].astype(np.float64)
+    log(f"Loaded arrays: depth={depth.shape}, extrinsic={E_abs.shape}, intrinsic={K_orig.shape}")
 
     if depth.ndim != 3:
         raise ValueError(f"depth_original must be [N,H,W], got {depth.shape}")
@@ -595,6 +609,7 @@ def canonicalize(
         raise ValueError(f"--height {height} does not match depth height {h}")
 
     frame_indices = data["frame_indices"].astype(np.int32) if "frame_indices" in data else np.arange(n, dtype=np.int32)
+    log("Loading optional camera JSONL...")
     camera_records = load_camera_jsonl_optional(camera_jsonl_path)
 
     base = sanitize_windows_filename_component(out_prefix.name)
@@ -613,6 +628,7 @@ def canonicalize(
                 raise RuntimeError(f"Output exists: {p}. Use --overwrite.")
         ensure_parent(p)
 
+    log("Building fixed intrinsic and exact fixed-K affine transforms...")
     K_fixed = make_fixed_intrinsic(K_orig, w, h, center_mode=cfg.fixed_center_mode)  # type: ignore[arg-type]
     inv_K_fixed = np.linalg.inv(K_fixed)
     H = np.stack([inv_K_fixed @ K_orig[i] for i in range(n)], axis=0)  # raw-K cam coord -> fixed-K cam coord
@@ -626,6 +642,8 @@ def canonicalize(
     R0 = np.repeat(np.eye(3, dtype=np.float64)[None, :, :], n, axis=0)
 
     for i in range(1, n):
+        if cfg.progress_every > 0 and (i == 1 or i == n - 1 or i % cfg.progress_every == 0):
+            log(f"Affine transform stage: pair {i}/{n-1}")
         R_i, t_i = relative_current_to_previous(E_abs[i], E_abs[i - 1])
         R_rel[i] = R_i
         t_rel[i] = t_i
@@ -633,16 +651,19 @@ def canonicalize(
         b_exact[i] = H[i - 1] @ t_i
         R0[i] = closest_rotation(A_exact[i])
 
+    log("Projecting exact affine matrices to closest rotations...")
     rvec0 = np.stack([rvec_from_R(R0[i]) for i in range(n)], axis=0)
     t0 = b_exact.copy()
 
     # Smooth/fit over the whole RAP. Keep poc0 identity/zero.
+    log(f"Smoothing camera trajectory: rot_degree={cfg.rot_fit_degree}, trans_degree={cfg.trans_fit_degree}")
     rvec_fit, rot_fit_meta = poly_smooth_sequence(rvec0, degree=cfg.rot_fit_degree, keep_first=True)
     t_fit, trans_fit_meta = poly_smooth_sequence(t0, degree=cfg.trans_fit_degree, keep_first=True)
     rvec_fit[0] = 0.0
     t_fit[0] = 0.0
     R_fit = np.stack([R_from_rvec(rvec_fit[i]) for i in range(n)], axis=0)
 
+    log("Creating fixed-K ray grid...")
     rays = make_rays(K_fixed, w, h, z_sign=cfg.z_sign)
 
     depth_target = depth.copy().astype(np.float32)
@@ -650,8 +671,11 @@ def canonicalize(
     depth_canon = depth.copy().astype(np.float32)
     depth_fit_stats: list[Any] = [{"poc": 0, "mode": "copy_first"}]
 
+    log(f"Depth target + fitting stage started: mode={cfg.depth_fit_mode}, frames={n-1}")
     # For each pair, generate exact target rays using A_exact/b_exact, then solve depth for chosen R_fit/t_fit.
     for i in range(1, n):
+        if cfg.progress_every > 0 and (i == 1 or i == n - 1 or i % cfg.progress_every == 0):
+            log(f"Depth target/fitting: frame {i}/{n-1}, mode={cfg.depth_fit_mode}")
         X_ref_exact = apply_affine_to_depth_rays(depth[i], rays, A_exact[i], b_exact[i])
         s_ref, valid_ref = normalized_ray_from_points(X_ref_exact, z_sign=cfg.z_sign)
         z_tgt, valid_z = solve_depth_for_target_ray(
@@ -712,13 +736,20 @@ def canonicalize(
             raise ValueError(cfg.depth_fit_mode)
 
     # Compute simple map EPE against exact affine target for reporting.
+    log(f"EPE reporting stage started: stride={cfg.epe_stride}")
     epe_stats = []
+    epe_stride = max(1, int(cfg.epe_stride))
+    rays_epe = rays[::epe_stride, ::epe_stride]
     for i in range(1, n):
-        X_ref_exact = apply_affine_to_depth_rays(depth[i], rays, A_exact[i], b_exact[i])
+        if cfg.progress_every > 0 and (i == 1 or i == n - 1 or i % cfg.progress_every == 0):
+            log(f"EPE report: frame {i}/{n-1}")
+        depth_i_epe = depth[i][::epe_stride, ::epe_stride]
+        depth_canon_i_epe = depth_canon[i][::epe_stride, ::epe_stride]
+        X_ref_exact = apply_affine_to_depth_rays(depth_i_epe, rays_epe, A_exact[i], b_exact[i])
         s_exact, valid_exact = normalized_ray_from_points(X_ref_exact, z_sign=cfg.z_sign)
         mx_exact, my_exact = map_from_normalized_ray(s_exact, K_fixed)
 
-        X_ref_new = apply_affine_to_depth_rays(depth_canon[i], rays, R_fit[i], t_fit[i])
+        X_ref_new = apply_affine_to_depth_rays(depth_canon_i_epe, rays_epe, R_fit[i], t_fit[i])
         s_new, valid_new = normalized_ray_from_points(X_ref_new, z_sign=cfg.z_sign)
         mx_new, my_new = map_from_normalized_ray(s_new, K_fixed)
         valid = valid_exact & valid_new & np.isfinite(mx_exact) & np.isfinite(mx_new) & np.isfinite(my_exact) & np.isfinite(my_new)
@@ -735,6 +766,7 @@ def canonicalize(
             "p95_epe": float(np.percentile(epe, 95)),
         })
 
+    log("Choosing depth scale and writing canonical depth YUV...")
     scale_meta = choose_depth_scale_fixed_point(
         depth_canon,
         percentile=cfg.depth_scale_percentile,
@@ -743,6 +775,7 @@ def canonicalize(
     )
     depth_yuv_meta = write_depth_yuv420p10le_linear(out_depth_yuv, depth_canon, scale_meta)
 
+    log("Estimating rough camera parameter bits...")
     bit_est = estimate_param_bits_zero_predictor(
         rvec_fit,
         t_fit / float(depth_yuv_meta["depth_scale_real"]),
@@ -750,6 +783,7 @@ def canonicalize(
         t_step=cfg.bit_est_t_step,
     )
 
+    log("Writing canonical camera JSONL...")
     # Save camera JSONL.
     with open(out_jsonl, "w", encoding="utf-8") as f:
         header = {
@@ -801,13 +835,10 @@ def canonicalize(
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     # Save NPZ.
-    np.savez_compressed(
-        out_npz,
+    log(f"Saving canonical NPZ... compressed={cfg.compressed_npz}, debug_arrays={cfg.save_debug_arrays}")
+    npz_payload = dict(
         frame_indices=frame_indices.astype(np.int32),
-        depth_original=depth.astype(np.float32),
         depth_canonical=depth_canon.astype(np.float32),
-        depth_target=depth_target.astype(np.float32),
-        depth_target_valid=depth_target_valid.astype(np.bool_),
         K_original=K_orig.astype(np.float32),
         K_fixed=K_fixed.astype(np.float32),
         extrinsic_original=E_abs.astype(np.float32),
@@ -822,6 +853,17 @@ def canonicalize(
         depth_fit_stats_json=np.asarray(json.dumps(depth_fit_stats, ensure_ascii=False), dtype=object),
         epe_stats_json=np.asarray(json.dumps(epe_stats, ensure_ascii=False), dtype=object),
     )
+    if cfg.save_debug_arrays:
+        npz_payload.update(
+            depth_original=depth.astype(np.float32),
+            depth_target=depth_target.astype(np.float32),
+            depth_target_valid=depth_target_valid.astype(np.bool_),
+        )
+    if cfg.compressed_npz:
+        np.savez_compressed(out_npz, **npz_payload)
+    else:
+        np.savez(out_npz, **npz_payload)
+    log("Canonical NPZ saved.")
 
     avg_epe = [x["mean_epe"] for x in epe_stats if x.get("mean_epe") is not None]
     p95_epe = [x["p95_epe"] for x in epe_stats if x.get("p95_epe") is not None]
@@ -916,6 +958,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bit-est-r-step", type=float, default=2.0 ** -12)
     p.add_argument("--bit-est-t-step", type=float, default=2.0 ** -10)
 
+    p.add_argument("--progress-every", type=int, default=1,
+                   help="Print progress every N frame pairs. Use 0 to disable per-frame progress.")
+    p.add_argument("--epe-stride", type=int, default=4,
+                   help="Downsample stride for EPE reporting. 1=full resolution, 4 is much faster.")
+    p.add_argument("--save-debug-arrays", action="store_true",
+                   help="Also save depth_original/depth_target/depth_target_valid in NPZ. Large and slow; off by default.")
+    p.add_argument("--compressed-npz", action="store_true",
+                   help="Use np.savez_compressed. Smaller but can be much slower; off by default.")
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -934,6 +984,10 @@ def main() -> None:
         depth_scale_percentile=float(args.depth_scale_percentile),
         bit_est_r_step=float(args.bit_est_r_step),
         bit_est_t_step=float(args.bit_est_t_step),
+        progress_every=int(args.progress_every),
+        save_debug_arrays=bool(args.save_debug_arrays),
+        compressed_npz=bool(args.compressed_npz),
+        epe_stride=int(args.epe_stride),
     )
     canonicalize(
         npz_path=Path(args.npz),
