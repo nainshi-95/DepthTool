@@ -874,21 +874,9 @@ if __name__ == "__main__":
 
 
 
-python -u optimize_fixedK_rt_vggt.py \
-  --npz out/test_rap0_vggt_omega_outputs.npz \
-  --camera-jsonl out/test_rap0_camera.jsonl \
-  --out-prefix out/test_rap0_fixedK_rtopt \
-  --width 1920 \
-  --height 1080 \
-  --opt-stride 8 \
-  --max-samples 60000 \
-  --loss soft_l1 \
-  --f-scale 1.0 \
-  --max-nfev 80 \
-  --epe-stride 4 \
-  --progress-every 1 \
-  --overwrite
-
+--opt-stride 4 \
+--max-samples 120000 \
+--max-nfev 120
 
 
 
