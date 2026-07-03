@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-optimize_fixedK_rt_depth_gop_stage3.py
+optimize_fixedK_rt_depth_nn_gop.py
 
-Stage-wise VGGT-Omega geometry canonicalization for codec input, with Stage-3 joint fine-tuning.
+Stage-wise VGGT-Omega geometry canonicalization for codec input.
 
-Goal
-----
-Remove per-frame intrinsic signaling by fixing one RAP-level K, then recover
-projection accuracy with:
+Recommended pipeline implemented here:
+  Stage 1: fix one RAP-level K, keep original VGGT depth, optimize absolute R|t
+           over codec-relevant adjacent + hierarchical/GOP anchor pairs.
+  Stage 2: keep Stage-1 R fixed, optimize t plus a constrained tiny-NN
+           multiplicative depth correction field.
+  Stage 3: small-LR joint fine-tune of R/t/NN depth correction with priors
+           toward the Stage-2 solution.
 
-  Stage 1: fixed K + original depth + optimized absolute R|t
-  Stage 2: fixed K + fixed R + optimized t + weak multiplicative depth correction
-  Stage 3: fixed K + weak joint fine-tuning of R/t/depth from Stage 2
-
-Unlike pair-only fitting, this script optimizes against codec-relevant GOP/hierarchical
-reference pairs directly, e.g. 16->0, 16->32, 8->0, 8->16, 4->0, 4->8, and their
-reverse directions if requested.
+Depth correction is not an unconstrained depth generator. It is:
+    depth'(x,y) = depth(x,y) * exp(g(x,y))
+where g is a low-resolution correction field produced by a tiny CNN and clamped by
+    g = max_log_scale * tanh(raw_g)
+The final decoder does NOT need the NN. The script writes the final corrected depth
+as YUV420p10le and writes fixed-K camera JSONL.
 
 Input NPZ is expected from the user's VGGT-Omega runner:
   depth_original      [N,H,W] float32
@@ -24,21 +26,7 @@ Input NPZ is expected from the user's VGGT-Omega runner:
   intrinsic_original  [N,3,3]
   frame_indices       optional [N]
 
-Outputs:
-  <prefix>_fixedK_gop_cam.jsonl
-  <prefix>_fixedK_gop_geometry.npz
-  <prefix>_fixedK_gop_depth_linear_yuv420p10le.yuv
-  <prefix>_fixedK_gop_manifest.json
-
-Stage 3 is intentionally conservative: it keeps frame-0 absolute pose fixed as the
-gauge anchor and regularizes R/t/depth log-scale toward the Stage-2 solution.
-
-Notes
------
 Pair direction is target -> reference. Backward projection uses target-frame depth.
-For codec-like hierarchical B, current frame 16 predicted from refs 0 and 32 is:
-  16:0 and 16:32
-If you also care about reverse propagation or symmetric consistency, use --bidirectional-gop.
 """
 
 from __future__ import annotations
@@ -58,6 +46,8 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ============================================================
@@ -189,8 +179,8 @@ def rodrigues_torch(rvec: torch.Tensor) -> torch.Tensor:
         torch.stack([zero, -z, y], dim=-1),
         torch.stack([z, zero, -x], dim=-1),
         torch.stack([-y, x, zero], dim=-1),
-    ], dim=-2)  # [N,3,3]
-    theta2 = torch.sum(rvec * rvec, dim=-1)  # [N]
+    ], dim=-2)
+    theta2 = torch.sum(rvec * rvec, dim=-1)
     theta = torch.sqrt(torch.clamp(theta2, min=1e-30))
     small = theta2 < 1e-12
     A = torch.where(small, 1.0 - theta2 / 6.0 + theta2 * theta2 / 120.0, torch.sin(theta) / theta)
@@ -198,6 +188,13 @@ def rodrigues_torch(rvec: torch.Tensor) -> torch.Tensor:
     I = torch.eye(3, dtype=dtype, device=device).expand(N, 3, 3)
     R = I + A[:, None, None] * K + B[:, None, None] * (K @ K)
     return R
+
+
+def robust_epe_loss(pred_xy: torch.Tensor, target_xy: torch.Tensor, f_scale: float) -> torch.Tensor:
+    diff = pred_xy - target_xy
+    e2 = torch.sum(diff * diff, dim=-1)
+    fs = float(f_scale)
+    return torch.mean(torch.sqrt(e2 + fs * fs) - fs)
 
 
 def project_samples_torch(
@@ -209,10 +206,9 @@ def project_samples_torch(
     z_sign: float,
     depth_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return predicted map xy [M,2] for sampled target rays/depth."""
     if depth_scale is not None:
         depth = depth * depth_scale
-    X_cur = depth[:, None] * rays  # [M,3]
+    X_cur = depth[:, None] * rays
     X_ref = X_cur @ R_rel.T + t_rel[None, :]
     Z = X_ref[:, 2]
     eps = torch.tensor(1e-8, dtype=X_ref.dtype, device=X_ref.device)
@@ -222,16 +218,8 @@ def project_samples_torch(
     return torch.stack([mx, my], dim=-1)
 
 
-def robust_epe_loss(pred_xy: torch.Tensor, target_xy: torch.Tensor, f_scale: float) -> torch.Tensor:
-    diff = pred_xy - target_xy
-    e2 = torch.sum(diff * diff, dim=-1)
-    fs = float(f_scale)
-    # Charbonnier/soft-L1-like EPE in pixels.
-    return torch.mean(torch.sqrt(e2 + fs * fs) - fs)
-
-
 # ============================================================
-# GOP pair generation and sampling
+# Pair generation and sampling
 # ============================================================
 
 @dataclass(frozen=True)
@@ -269,7 +257,7 @@ def generate_hierarchical_pairs(n: int, bidirectional: bool, weight: float) -> l
         add_pair_accum(acc, mid, a, w, f"gop_L{level}", n)
         add_pair_accum(acc, mid, b, w, f"gop_L{level}", n)
         if bidirectional:
-            # User-mentioned reverse/anchor-to-mid consistency.
+            # Reverse consistency, useful for tool propagation / symmetric reference use.
             add_pair_accum(acc, a, mid, w, f"gop_rev_L{level}", n)
             add_pair_accum(acc, b, mid, w, f"gop_rev_L{level}", n)
         rec(a, mid, level + 1)
@@ -283,7 +271,6 @@ def parse_extra_pairs(s: str | None, n: int) -> list[PairSpec]:
     if not s:
         return []
     out: list[PairSpec] = []
-    # Accepted: "0:16,32:16:2.0,16->8"
     for tok in re.split(r"[,;\s]+", s.strip()):
         if not tok:
             continue
@@ -321,19 +308,17 @@ def build_pair_list(
             add_pair_accum(acc, p.target, p.ref, p.weight, p.kind, n)
     for p in parse_extra_pairs(extra_pairs, n):
         add_pair_accum(acc, p.target, p.ref, p.weight, p.kind, n)
-    pairs = sorted(acc.values(), key=lambda p: (abs(p.target - p.ref), p.target, p.ref))
-    return pairs
+    return sorted(acc.values(), key=lambda p: (abs(p.target - p.ref), p.target, p.ref))
 
 
 @dataclass
 class PairCacheNP:
     spec: PairSpec
-    y: np.ndarray          # [M]
-    x: np.ndarray          # [M]
-    rays: np.ndarray       # [M,3]
-    depth: np.ndarray      # [M]
-    target_xy: np.ndarray  # [M,2]
-    block_idx: np.ndarray | None  # [M]
+    y: np.ndarray
+    x: np.ndarray
+    rays: np.ndarray
+    depth: np.ndarray
+    target_xy: np.ndarray
 
 
 @dataclass
@@ -344,7 +329,6 @@ class PairCacheTorch:
     rays: torch.Tensor
     depth: torch.Tensor
     target_xy: torch.Tensor
-    block_idx: torch.Tensor | None
 
 
 def create_pair_cache(
@@ -356,7 +340,6 @@ def create_pair_cache(
     rays_fixed_full: np.ndarray,
     sample_stride: int,
     max_samples_per_pair: int,
-    block_size: int,
     z_sign: float,
     seed: int,
 ) -> list[PairCacheNP]:
@@ -374,6 +357,7 @@ def create_pair_cache(
     for idx, p in enumerate(pairs):
         tar, ref = p.target, p.ref
         R_rel_raw, t_rel_raw = relative_current_to_ref(E_abs[tar], E_abs[ref])
+        # Exact target in fixed-K coordinates if affine cameras were allowed.
         A_exact = H[ref] @ R_rel_raw @ H_inv[tar]
         b_exact = H[ref] @ t_rel_raw
 
@@ -383,10 +367,7 @@ def create_pair_cache(
         X_cur = d[:, None] * rays
         X_ref = X_cur @ A_exact.T + b_exact.reshape(1, 3)
         mx, my, valid_z = project_points_np(X_ref, K_fixed, z_sign=z_sign)
-        valid = (
-            valid_depth & valid_z & np.isfinite(mx) & np.isfinite(my) &
-            (mx >= 0.0) & (mx <= w - 1) & (my >= 0.0) & (my <= h - 1)
-        )
+        valid = valid_depth & valid_z & np.isfinite(mx) & np.isfinite(my) & (mx >= 0.0) & (mx <= w - 1) & (my >= 0.0) & (my <= h - 1)
         ids = np.flatnonzero(valid)
         if ids.size == 0:
             log(f"WARNING: pair {tar}->{ref} has no valid samples; skipped")
@@ -396,12 +377,6 @@ def create_pair_cache(
             ids.sort()
         y_sel = yy[ids].astype(np.int64)
         x_sel = xx[ids].astype(np.int64)
-        block_idx = None
-        if block_size > 0:
-            gx = (x_sel // block_size).astype(np.int64)
-            gy = (y_sel // block_size).astype(np.int64)
-            Gx = int(math.ceil(w / block_size))
-            block_idx = gy * Gx + gx
         out.append(PairCacheNP(
             spec=p,
             y=y_sel,
@@ -409,7 +384,6 @@ def create_pair_cache(
             rays=rays[ids].astype(np.float32),
             depth=d[ids].astype(np.float32),
             target_xy=np.stack([mx[ids], my[ids]], axis=1).astype(np.float32),
-            block_idx=block_idx.astype(np.int64) if block_idx is not None else None,
         ))
         log(f"Cached pair {idx+1:03d}/{len(pairs):03d}: {tar}->{ref}, weight={p.weight:.3g}, samples={len(ids)}, kind={p.kind}")
     return out
@@ -425,13 +399,181 @@ def cache_to_torch(cache_np: list[PairCacheNP], device: torch.device, dtype: tor
             rays=torch.from_numpy(c.rays).to(device=device, dtype=dtype),
             depth=torch.from_numpy(c.depth).to(device=device, dtype=dtype),
             target_xy=torch.from_numpy(c.target_xy).to(device=device, dtype=dtype),
-            block_idx=torch.from_numpy(c.block_idx).to(device=device, dtype=torch.long) if c.block_idx is not None else None,
         ))
     return out
 
 
 # ============================================================
-# Optimization
+# NN depth correction
+# ============================================================
+
+class DepthCorrectionNet(nn.Module):
+    """
+    Tiny per-RAP low-res NN correction field.
+
+    Input to CNN is concat([fixed depth-derived features, learnable latent]).
+    Output raw_g is converted to bounded log-depth-scale by:
+        g = max_log_scale * tanh(raw_g)
+    """
+    def __init__(self, feature_ch: int, latent_ch: int = 2, hidden_ch: int = 24, layers: int = 3):
+        super().__init__()
+        self.latent_ch = int(latent_ch)
+        self.hidden_ch = int(hidden_ch)
+        in_ch = feature_ch + latent_ch
+        mods: list[nn.Module] = []
+        ch = in_ch
+        for _ in range(max(1, layers - 1)):
+            mods.append(nn.Conv2d(ch, hidden_ch, kernel_size=3, padding=1))
+            mods.append(nn.SiLU(inplace=True))
+            ch = hidden_ch
+        mods.append(nn.Conv2d(ch, 1, kernel_size=3, padding=1))
+        self.net = nn.Sequential(*mods)
+        # Start from identity depth correction.
+        last = self.net[-1]
+        if isinstance(last, nn.Conv2d):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, features: torch.Tensor, latent: torch.Tensor, max_log_scale: float) -> torch.Tensor:
+        raw = self.net(torch.cat([features, latent], dim=1))
+        return float(max_log_scale) * torch.tanh(raw)
+
+
+def build_depth_nn_features_np(depth: np.ndarray, grid_cell: int, include_xy: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return features [N,C,Gh,Gw], edge weights wx [N,1,Gh,Gw-1], wy [N,1,Gh-1,Gw]."""
+    n, h, w = depth.shape
+    gh = int(math.ceil(h / grid_cell))
+    gw = int(math.ceil(w / grid_cell))
+    logd = np.log(np.maximum(depth.astype(np.float32), 1e-12))
+    log_low = np.empty((n, gh, gw), dtype=np.float32)
+    for i in range(n):
+        # AREA is stable for downsampling; output size is (gw, gh).
+        log_low[i] = cv2.resize(logd[i], (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    mean = float(np.mean(log_low[np.isfinite(log_low)]))
+    std = float(np.std(log_low[np.isfinite(log_low)]))
+    std = max(std, 1e-6)
+    log_norm = (log_low - mean) / std
+
+    dx = np.zeros_like(log_norm)
+    dy = np.zeros_like(log_norm)
+    if gw > 1:
+        dx[:, :, 1:] = np.abs(log_low[:, :, 1:] - log_low[:, :, :-1])
+        dx[:, :, 0] = dx[:, :, 1]
+    if gh > 1:
+        dy[:, 1:, :] = np.abs(log_low[:, 1:, :] - log_low[:, :-1, :])
+        dy[:, 0, :] = dy[:, 1, :]
+    grad = np.sqrt(dx * dx + dy * dy)
+    gstd = float(np.std(grad[np.isfinite(grad)]))
+    gstd = max(gstd, 1e-6)
+    grad_norm = grad / gstd
+
+    feats = [log_norm[:, None, :, :].astype(np.float32), grad_norm[:, None, :, :].astype(np.float32)]
+    if include_xy:
+        xs = np.linspace(-1.0, 1.0, gw, dtype=np.float32)[None, None, None, :]
+        ys = np.linspace(-1.0, 1.0, gh, dtype=np.float32)[None, None, :, None]
+        xx = np.broadcast_to(xs, (n, 1, gh, gw)).copy()
+        yy = np.broadcast_to(ys, (n, 1, gh, gw)).copy()
+        feats += [xx, yy]
+    # frame index channel helps per-frame variation while preserving CNN structure.
+    if n > 1:
+        ts = np.linspace(-1.0, 1.0, n, dtype=np.float32)[:, None, None, None]
+    else:
+        ts = np.zeros((n, 1, 1, 1), dtype=np.float32)
+    tt = np.broadcast_to(ts, (n, 1, gh, gw)).copy()
+    feats.append(tt)
+    features = np.concatenate(feats, axis=1).astype(np.float32)
+
+    # Edge-aware smoothness weights from low-res log-depth discontinuities.
+    # Normalize by median nonzero diff for sequence robustness.
+    if gw > 1:
+        diffx = np.abs(log_low[:, :, 1:] - log_low[:, :, :-1])
+    else:
+        diffx = np.zeros((n, gh, 0), dtype=np.float32)
+    if gh > 1:
+        diffy = np.abs(log_low[:, 1:, :] - log_low[:, :-1, :])
+    else:
+        diffy = np.zeros((n, 0, gw), dtype=np.float32)
+    vals = np.concatenate([diffx.reshape(-1), diffy.reshape(-1)]) if (diffx.size + diffy.size) else np.zeros((1,), dtype=np.float32)
+    vals = vals[np.isfinite(vals)]
+    med = float(np.median(vals[vals > 0])) if np.any(vals > 0) else 1.0
+    med = max(med, 1e-6)
+    # Use a mild default scale here; CLI alpha multiplies this.
+    wx = np.exp(-diffx / med).astype(np.float32)[:, None, :, :] if diffx.size else np.zeros((n, 1, gh, 0), dtype=np.float32)
+    wy = np.exp(-diffy / med).astype(np.float32)[:, None, :, :] if diffy.size else np.zeros((n, 1, 0, gw), dtype=np.float32)
+    return features, wx, wy
+
+
+def sample_g_from_map(g_maps: torch.Tensor, target: int, x: torch.Tensor, y: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    # g_maps: [N,1,Gh,Gw]. grid_sample coords are normalized to [-1,1].
+    gx = 2.0 * x.to(dtype=g_maps.dtype) / max(width - 1, 1) - 1.0
+    gy = 2.0 * y.to(dtype=g_maps.dtype) / max(height - 1, 1) - 1.0
+    grid = torch.stack([gx, gy], dim=-1).view(1, -1, 1, 2)
+    vals = F.grid_sample(g_maps[target:target + 1], grid, mode="bilinear", padding_mode="border", align_corners=True)
+    return vals.view(-1)
+
+
+def depth_nn_regularization(
+    g_maps: torch.Tensor,
+    wx: torch.Tensor,
+    wy: torch.Tensor,
+    l2: float,
+    spatial: float,
+    temporal: float,
+    edge_alpha: float,
+) -> torch.Tensor:
+    reg = torch.zeros((), dtype=g_maps.dtype, device=g_maps.device)
+    if l2 > 0:
+        reg = reg + float(l2) * torch.mean(g_maps * g_maps)
+    if temporal > 0 and g_maps.shape[0] > 1:
+        reg = reg + float(temporal) * torch.mean((g_maps[1:] - g_maps[:-1]) ** 2)
+    if spatial > 0:
+        if g_maps.shape[-1] > 1:
+            dx = g_maps[:, :, :, 1:] - g_maps[:, :, :, :-1]
+            # wx is in [0,1]; edge_alpha sharpens/softens it.
+            wxx = torch.clamp(wx, min=1e-4, max=1.0) ** float(edge_alpha)
+            reg = reg + float(spatial) * torch.mean(wxx * dx * dx)
+        if g_maps.shape[-2] > 1:
+            dy = g_maps[:, :, 1:, :] - g_maps[:, :, :-1, :]
+            wyy = torch.clamp(wy, min=1e-4, max=1.0) ** float(edge_alpha)
+            reg = reg + float(spatial) * torch.mean(wyy * dy * dy)
+    return reg
+
+
+def upsample_g_maps_np(g_maps: np.ndarray, height: int, width: int) -> np.ndarray:
+    # g_maps [N,1,Gh,Gw] -> [N,H,W]
+    n = g_maps.shape[0]
+    out = np.empty((n, height, width), dtype=np.float32)
+    for i in range(n):
+        out[i] = cv2.resize(g_maps[i, 0].astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    return out
+
+
+def bilinear_sample_g_np(g_map: np.ndarray, x: np.ndarray, y: np.ndarray, width: int, height: int) -> np.ndarray:
+    # g_map is [Gh,Gw] and aligned to full image extent. Sample at full-res coords.
+    gh, gw = g_map.shape
+    if gw <= 1:
+        gx = np.zeros_like(x, dtype=np.float64)
+    else:
+        gx = np.clip(x.astype(np.float64) * (gw - 1) / max(width - 1, 1), 0, gw - 1)
+    if gh <= 1:
+        gy = np.zeros_like(y, dtype=np.float64)
+    else:
+        gy = np.clip(y.astype(np.float64) * (gh - 1) / max(height - 1, 1), 0, gh - 1)
+    x0 = np.floor(gx).astype(np.int64)
+    y0 = np.floor(gy).astype(np.int64)
+    x1 = np.minimum(x0 + 1, gw - 1)
+    y1 = np.minimum(y0 + 1, gh - 1)
+    wx = gx - x0
+    wy = gy - y0
+    v00 = g_map[y0, x0]
+    v10 = g_map[y0, x1]
+    v01 = g_map[y1, x0]
+    v11 = g_map[y1, x1]
+    return ((1 - wx) * (1 - wy) * v00 + wx * (1 - wy) * v10 + (1 - wx) * wy * v01 + wx * wy * v11).astype(np.float32)
+
+
+# ============================================================
+# Optimization config
 # ============================================================
 
 @dataclass
@@ -457,21 +599,24 @@ class OptimConfig:
     stage1_t_prior: float
     stage2_iters: int
     stage2_lr_t: float
-    stage2_lr_g: float
+    stage2_lr_nn: float
     stage2_t_prior: float
     stage3_iters: int
     stage3_lr_r: float
     stage3_lr_t: float
-    stage3_lr_g: float
+    stage3_lr_nn: float
     stage3_rot_prior: float
     stage3_t_prior: float
     stage3_depth_prior: float
-    depth_mode: str
-    depth_block_size: int
+    nn_grid_cell: int
+    nn_hidden_ch: int
+    nn_latent_ch: int
+    nn_layers: int
     depth_max_log_scale: float
     depth_l2: float
     depth_spatial_smooth: float
     depth_temporal_smooth: float
+    depth_edge_alpha: float
     f_scale: float
     print_every: int
     depth_scale_precision: int
@@ -512,12 +657,11 @@ def pair_loss_sum(
     R_all: torch.Tensor,
     t_all: torch.Tensor,
     K_fixed_t: torch.Tensor,
+    width: int,
+    height: int,
     z_sign: float,
     f_scale: float,
-    depth_u: torch.Tensor | None = None,
-    depth_mode: str = "none",
-    depth_max_log_scale: float = 0.0,
-    depth_block_count: int | None = None,
+    g_maps: torch.Tensor | None = None,
 ) -> torch.Tensor:
     total = torch.zeros((), dtype=K_fixed_t.dtype, device=K_fixed_t.device)
     wsum = 0.0
@@ -531,18 +675,9 @@ def pair_loss_sum(
         t_rel = t_ref - R_rel @ t_tar
 
         depth_scale = None
-        if depth_u is not None and depth_mode != "none":
-            if depth_mode == "frame":
-                g = depth_max_log_scale * torch.tanh(depth_u[tar, 0])
-                depth_scale = torch.exp(g).expand_as(c.depth)
-            elif depth_mode == "block":
-                if c.block_idx is None:
-                    raise RuntimeError("block_idx missing for block depth mode")
-                # depth_u: [N, B]
-                g = depth_max_log_scale * torch.tanh(depth_u[tar].reshape(-1)[c.block_idx])
-                depth_scale = torch.exp(g)
-            else:
-                raise ValueError(depth_mode)
+        if g_maps is not None:
+            g = sample_g_from_map(g_maps, tar, c.x, c.y, width, height)
+            depth_scale = torch.exp(g)
 
         pred = project_samples_torch(c.rays, c.depth, R_rel, t_rel, K_fixed_t, z_sign, depth_scale)
         loss = robust_epe_loss(pred, c.target_xy, f_scale=f_scale)
@@ -557,31 +692,29 @@ def optimize_stage1_rt(
     r_init_np: np.ndarray,
     t_init_np: np.ndarray,
     K_fixed: np.ndarray,
+    width: int,
+    height: int,
     cfg: OptimConfig,
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, float]]]:
     log("Stage 1: fixed K + original depth + optimize absolute R|t")
-    n = r_init_np.shape[0]
     r_init = torch.tensor(r_init_np, device=device, dtype=dtype)
     t_init = torch.tensor(t_init_np, device=device, dtype=dtype)
     K_fixed_t = torch.tensor(K_fixed, device=device, dtype=dtype)
-
     r0_fixed = r_init[0].detach()
     t0_fixed = t_init[0].detach()
     r_free = torch.nn.Parameter(r_init[1:].clone())
     t_free = torch.nn.Parameter(t_init[1:].clone())
-
     opt = torch.optim.Adam([
         {"params": [r_free], "lr": cfg.stage1_lr_r},
         {"params": [t_free], "lr": cfg.stage1_lr_t},
     ])
-
     hist: list[dict[str, float]] = []
     for it in range(1, cfg.stage1_iters + 1):
         opt.zero_grad(set_to_none=True)
         r_all, t_all, R_all = build_full_pose_tensors(r_free, t_free, r0_fixed, t0_fixed)
-        loss_pair = pair_loss_sum(pair_cache, R_all, t_all, K_fixed_t, cfg.z_sign, cfg.f_scale)
+        loss_pair = pair_loss_sum(pair_cache, R_all, t_all, K_fixed_t, width, height, cfg.z_sign, cfg.f_scale)
         loss = loss_pair
         if cfg.stage1_rot_prior > 0:
             loss = loss + cfg.stage1_rot_prior * torch.mean((r_all - r_init) ** 2)
@@ -593,51 +726,27 @@ def optimize_stage1_rt(
             rec = {"iter": it, "loss": float(loss.detach().cpu()), "pair_loss": float(loss_pair.detach().cpu())}
             hist.append(rec)
             log(f"Stage1 iter {it:04d}/{cfg.stage1_iters}: loss={rec['loss']:.6f}, pair={rec['pair_loss']:.6f}")
-
     with torch.no_grad():
         r_all, t_all, _ = build_full_pose_tensors(r_free, t_free, r0_fixed, t0_fixed)
     return r_all.detach().cpu().numpy(), t_all.detach().cpu().numpy(), hist
 
 
-def depth_regularization(
-    depth_u: torch.Tensor,
-    cfg: OptimConfig,
-    n: int,
-    gy: int,
-    gx: int,
-) -> torch.Tensor:
-    if cfg.depth_mode == "none" or depth_u is None:
-        return torch.zeros((), dtype=torch.float32, device=depth_u.device if depth_u is not None else "cpu")
-    dtype = depth_u.dtype
-    device = depth_u.device
-    reg = torch.zeros((), dtype=dtype, device=device)
-    g = cfg.depth_max_log_scale * torch.tanh(depth_u)
-    if cfg.depth_l2 > 0:
-        reg = reg + cfg.depth_l2 * torch.mean(g * g)
-    if cfg.depth_temporal_smooth > 0 and n > 1:
-        reg = reg + cfg.depth_temporal_smooth * torch.mean((g[1:] - g[:-1]) ** 2)
-    if cfg.depth_mode == "block" and cfg.depth_spatial_smooth > 0:
-        gb = g.reshape(n, gy, gx)
-        if gx > 1:
-            reg = reg + cfg.depth_spatial_smooth * torch.mean((gb[:, :, 1:] - gb[:, :, :-1]) ** 2)
-        if gy > 1:
-            reg = reg + cfg.depth_spatial_smooth * torch.mean((gb[:, 1:, :] - gb[:, :-1, :]) ** 2)
-    return reg
-
-
-def optimize_stage2_t_depth(
+def optimize_stage2_t_nn(
     pair_cache: list[PairCacheTorch],
     r_stage1_np: np.ndarray,
     t_stage1_np: np.ndarray,
     K_fixed: np.ndarray,
-    n: int,
-    height: int,
-    width: int,
+    features: torch.Tensor,
+    wx: torch.Tensor,
+    wy: torch.Tensor,
     cfg: OptimConfig,
+    width: int,
+    height: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[np.ndarray, np.ndarray | None, list[dict[str, float]], tuple[int, int]]:
-    log("Stage 2: fixed K + fixed R + optimize t and weak multiplicative depth correction")
+) -> tuple[np.ndarray, DepthCorrectionNet, torch.Tensor, np.ndarray, list[dict[str, float]]]:
+    log("Stage 2: fixed K + fixed R + optimize t and tiny-NN depth correction")
+    n, feature_ch, gh, gw = features.shape
     r_stage1 = torch.tensor(r_stage1_np, device=device, dtype=dtype)
     t_stage1 = torch.tensor(t_stage1_np, device=device, dtype=dtype)
     K_fixed_t = torch.tensor(K_fixed, device=device, dtype=dtype)
@@ -645,50 +754,23 @@ def optimize_stage2_t_depth(
 
     t0_fixed = t_stage1[0].detach()
     t_free = torch.nn.Parameter(t_stage1[1:].clone())
+    net = DepthCorrectionNet(feature_ch=feature_ch, latent_ch=cfg.nn_latent_ch, hidden_ch=cfg.nn_hidden_ch, layers=cfg.nn_layers).to(device=device, dtype=dtype)
+    latent = torch.nn.Parameter(torch.zeros((n, cfg.nn_latent_ch, gh, gw), dtype=dtype, device=device))
 
-    gy = int(math.ceil(height / cfg.depth_block_size)) if cfg.depth_block_size > 0 else 1
-    gx = int(math.ceil(width / cfg.depth_block_size)) if cfg.depth_block_size > 0 else 1
-    depth_u: torch.nn.Parameter | None
-    if cfg.depth_mode == "none":
-        depth_u = None
-        params = [{"params": [t_free], "lr": cfg.stage2_lr_t}]
-    elif cfg.depth_mode == "frame":
-        depth_u = torch.nn.Parameter(torch.zeros((n, 1), dtype=dtype, device=device))
-        params = [
-            {"params": [t_free], "lr": cfg.stage2_lr_t},
-            {"params": [depth_u], "lr": cfg.stage2_lr_g},
-        ]
-    elif cfg.depth_mode == "block":
-        depth_u = torch.nn.Parameter(torch.zeros((n, gy * gx), dtype=dtype, device=device))
-        params = [
-            {"params": [t_free], "lr": cfg.stage2_lr_t},
-            {"params": [depth_u], "lr": cfg.stage2_lr_g},
-        ]
-    else:
-        raise ValueError(cfg.depth_mode)
-
-    opt = torch.optim.Adam(params)
+    opt = torch.optim.Adam([
+        {"params": [t_free], "lr": cfg.stage2_lr_t},
+        {"params": list(net.parameters()) + [latent], "lr": cfg.stage2_lr_nn},
+    ])
     hist: list[dict[str, float]] = []
     for it in range(1, cfg.stage2_iters + 1):
         opt.zero_grad(set_to_none=True)
         t_all = torch.cat([t0_fixed[None, :], t_free], dim=0)
-        loss_pair = pair_loss_sum(
-            pair_cache,
-            R_fixed,
-            t_all,
-            K_fixed_t,
-            cfg.z_sign,
-            cfg.f_scale,
-            depth_u=depth_u,
-            depth_mode=cfg.depth_mode,
-            depth_max_log_scale=cfg.depth_max_log_scale,
-            depth_block_count=gy * gx,
-        )
+        g_maps = net(features, latent, cfg.depth_max_log_scale)
+        loss_pair = pair_loss_sum(pair_cache, R_fixed, t_all, K_fixed_t, width, height, cfg.z_sign, cfg.f_scale, g_maps=g_maps)
         loss_reg = torch.zeros_like(loss_pair)
         if cfg.stage2_t_prior > 0:
             loss_reg = loss_reg + cfg.stage2_t_prior * torch.mean((t_all - t_stage1) ** 2)
-        if depth_u is not None:
-            loss_reg = loss_reg + depth_regularization(depth_u, cfg, n=n, gy=gy, gx=gx)
+        loss_reg = loss_reg + depth_nn_regularization(g_maps, wx, wy, cfg.depth_l2, cfg.depth_spatial_smooth, cfg.depth_temporal_smooth, cfg.depth_edge_alpha)
         loss = loss_pair + loss_reg
         loss.backward()
         opt.step()
@@ -701,157 +783,64 @@ def optimize_stage2_t_depth(
             }
             hist.append(rec)
             log(f"Stage2 iter {it:04d}/{cfg.stage2_iters}: loss={rec['loss']:.6f}, pair={rec['pair_loss']:.6f}, reg={rec['reg_loss']:.6f}")
-
     with torch.no_grad():
         t_all = torch.cat([t0_fixed[None, :], t_free], dim=0)
-        if depth_u is not None:
-            g = cfg.depth_max_log_scale * torch.tanh(depth_u)
-            g_np = g.detach().cpu().numpy().astype(np.float32)
-        else:
-            g_np = None
-    return t_all.detach().cpu().numpy(), g_np, hist, (gy, gx)
-
-
-def _atanh_np(x: np.ndarray) -> np.ndarray:
-    x = np.clip(x.astype(np.float64), -0.999999, 0.999999)
-    return 0.5 * np.log((1.0 + x) / (1.0 - x))
-
-
-def init_depth_u_from_log_scale(
-    depth_g_np: np.ndarray | None,
-    depth_mode: str,
-    depth_max_log_scale: float,
-    n: int,
-    gy: int,
-    gx: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor | None:
-    """Return unconstrained u so that depth_max_log_scale*tanh(u) ~= depth_g_np."""
-    if depth_mode == "none":
-        return None
-    if depth_mode == "frame":
-        shape = (n, 1)
-    elif depth_mode == "block":
-        shape = (n, gy * gx)
-    else:
-        raise ValueError(depth_mode)
-
-    if depth_g_np is None:
-        u0 = np.zeros(shape, dtype=np.float64)
-    else:
-        g = np.asarray(depth_g_np, dtype=np.float64).reshape(shape)
-        if abs(depth_max_log_scale) < 1e-12:
-            u0 = np.zeros(shape, dtype=np.float64)
-        else:
-            u0 = _atanh_np(g / float(depth_max_log_scale))
-    return torch.tensor(u0, device=device, dtype=dtype)
-
-
-def depth_prior_to_base(
-    depth_u: torch.Tensor | None,
-    depth_g_base: torch.Tensor | None,
-    cfg: OptimConfig,
-) -> torch.Tensor:
-    if depth_u is None or depth_g_base is None or cfg.stage3_depth_prior <= 0:
-        if depth_u is not None:
-            return torch.zeros((), dtype=depth_u.dtype, device=depth_u.device)
-        if depth_g_base is not None:
-            return torch.zeros((), dtype=depth_g_base.dtype, device=depth_g_base.device)
-        return torch.tensor(0.0)
-    g = cfg.depth_max_log_scale * torch.tanh(depth_u)
-    return cfg.stage3_depth_prior * torch.mean((g - depth_g_base) ** 2)
+        g_maps = net(features, latent, cfg.depth_max_log_scale)
+        g_np = g_maps.detach().cpu().numpy().astype(np.float32)
+    return t_all.detach().cpu().numpy(), net, latent.detach().clone(), g_np, hist
 
 
 def optimize_stage3_joint(
     pair_cache: list[PairCacheTorch],
     r_stage2_np: np.ndarray,
     t_stage2_np: np.ndarray,
-    depth_g_stage2_np: np.ndarray | None,
+    net: DepthCorrectionNet,
+    latent_base: torch.Tensor,
+    g_base_np: np.ndarray,
     K_fixed: np.ndarray,
-    n: int,
-    height: int,
-    width: int,
+    features: torch.Tensor,
+    wx: torch.Tensor,
+    wy: torch.Tensor,
     cfg: OptimConfig,
+    width: int,
+    height: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, list[dict[str, float]], tuple[int, int]]:
-    """
-    Stage 3: conservative joint fine-tuning from Stage 2.
-
-    Variables:
-      - rvec[1:], t[1:] absolute canonical poses; frame 0 fixed as gauge anchor.
-      - depth log-scale field g if depth_mode is frame/block.
-
-    Priors keep the solution close to Stage 2 so this works as refinement rather than
-    another free global optimization.
-    """
-    log("Stage 3: small-LR joint fine-tuning of R, t, and depth correction")
+) -> tuple[np.ndarray, np.ndarray, DepthCorrectionNet, torch.Tensor, np.ndarray, list[dict[str, float]]]:
+    log("Stage 3: small-LR joint fine-tuning of R/t/NN depth correction")
     r_base = torch.tensor(r_stage2_np, device=device, dtype=dtype)
     t_base = torch.tensor(t_stage2_np, device=device, dtype=dtype)
+    g_base = torch.tensor(g_base_np, device=device, dtype=dtype)
     K_fixed_t = torch.tensor(K_fixed, device=device, dtype=dtype)
 
     r0_fixed = r_base[0].detach()
     t0_fixed = t_base[0].detach()
     r_free = torch.nn.Parameter(r_base[1:].clone())
     t_free = torch.nn.Parameter(t_base[1:].clone())
+    latent = torch.nn.Parameter(latent_base.clone().detach())
 
-    gy = int(math.ceil(height / cfg.depth_block_size)) if cfg.depth_block_size > 0 else 1
-    gx = int(math.ceil(width / cfg.depth_block_size)) if cfg.depth_block_size > 0 else 1
-    depth_u0 = init_depth_u_from_log_scale(
-        depth_g_stage2_np,
-        cfg.depth_mode,
-        cfg.depth_max_log_scale,
-        n=n,
-        gy=gy,
-        gx=gx,
-        device=device,
-        dtype=dtype,
-    )
-    depth_g_base_t: torch.Tensor | None = None
-    if depth_g_stage2_np is not None and cfg.depth_mode != "none":
-        depth_g_base_t = torch.tensor(depth_g_stage2_np, device=device, dtype=dtype)
-
-    params: list[dict[str, Any]] = [
+    opt = torch.optim.Adam([
         {"params": [r_free], "lr": cfg.stage3_lr_r},
         {"params": [t_free], "lr": cfg.stage3_lr_t},
-    ]
-    depth_u: torch.nn.Parameter | None
-    if depth_u0 is not None:
-        depth_u = torch.nn.Parameter(depth_u0.clone())
-        params.append({"params": [depth_u], "lr": cfg.stage3_lr_g})
-    else:
-        depth_u = None
-
-    opt = torch.optim.Adam(params)
+        {"params": list(net.parameters()) + [latent], "lr": cfg.stage3_lr_nn},
+    ])
     hist: list[dict[str, float]] = []
     for it in range(1, cfg.stage3_iters + 1):
         opt.zero_grad(set_to_none=True)
         r_all, t_all, R_all = build_full_pose_tensors(r_free, t_free, r0_fixed, t0_fixed)
-        loss_pair = pair_loss_sum(
-            pair_cache,
-            R_all,
-            t_all,
-            K_fixed_t,
-            cfg.z_sign,
-            cfg.f_scale,
-            depth_u=depth_u,
-            depth_mode=cfg.depth_mode,
-            depth_max_log_scale=cfg.depth_max_log_scale,
-            depth_block_count=gy * gx,
-        )
+        g_maps = net(features, latent, cfg.depth_max_log_scale)
+        loss_pair = pair_loss_sum(pair_cache, R_all, t_all, K_fixed_t, width, height, cfg.z_sign, cfg.f_scale, g_maps=g_maps)
         loss_reg = torch.zeros_like(loss_pair)
         if cfg.stage3_rot_prior > 0:
             loss_reg = loss_reg + cfg.stage3_rot_prior * torch.mean((r_all - r_base) ** 2)
         if cfg.stage3_t_prior > 0:
             loss_reg = loss_reg + cfg.stage3_t_prior * torch.mean((t_all - t_base) ** 2)
-        if depth_u is not None:
-            loss_reg = loss_reg + depth_regularization(depth_u, cfg, n=n, gy=gy, gx=gx)
-            loss_reg = loss_reg + depth_prior_to_base(depth_u, depth_g_base_t, cfg)
+        loss_reg = loss_reg + depth_nn_regularization(g_maps, wx, wy, cfg.depth_l2, cfg.depth_spatial_smooth, cfg.depth_temporal_smooth, cfg.depth_edge_alpha)
+        if cfg.stage3_depth_prior > 0:
+            loss_reg = loss_reg + cfg.stage3_depth_prior * torch.mean((g_maps - g_base) ** 2)
         loss = loss_pair + loss_reg
         loss.backward()
         opt.step()
-
         if it == 1 or it == cfg.stage3_iters or (cfg.print_every > 0 and it % cfg.print_every == 0):
             rec = {
                 "iter": it,
@@ -861,15 +850,11 @@ def optimize_stage3_joint(
             }
             hist.append(rec)
             log(f"Stage3 iter {it:04d}/{cfg.stage3_iters}: loss={rec['loss']:.6f}, pair={rec['pair_loss']:.6f}, reg={rec['reg_loss']:.6f}")
-
     with torch.no_grad():
         r_all, t_all, _ = build_full_pose_tensors(r_free, t_free, r0_fixed, t0_fixed)
-        if depth_u is not None:
-            g = cfg.depth_max_log_scale * torch.tanh(depth_u)
-            depth_g_np = g.detach().cpu().numpy().astype(np.float32)
-        else:
-            depth_g_np = None
-    return r_all.detach().cpu().numpy(), t_all.detach().cpu().numpy(), depth_g_np, hist, (gy, gx)
+        g_maps = net(features, latent, cfg.depth_max_log_scale)
+        g_np = g_maps.detach().cpu().numpy().astype(np.float32)
+    return r_all.detach().cpu().numpy(), t_all.detach().cpu().numpy(), net, latent.detach().clone(), g_np, hist
 
 
 # ============================================================
@@ -882,10 +867,10 @@ def evaluate_on_cache(
     r_np: np.ndarray,
     t_np: np.ndarray,
     K_fixed: np.ndarray,
+    width: int,
+    height: int,
     z_sign: float,
-    depth_g: np.ndarray | None,
-    depth_mode: str,
-    depth_block_size: int,
+    g_maps: np.ndarray | None,
 ) -> dict[str, Any]:
     R_all = np.stack([R_from_rvec_np(r_np[i]) for i in range(len(r_np))], axis=0)
     fx, fy, cx, cy = float(K_fixed[0, 0]), float(K_fixed[1, 1]), float(K_fixed[0, 2]), float(K_fixed[1, 2])
@@ -897,15 +882,9 @@ def evaluate_on_cache(
         R_rel = R_all[ref] @ R_all[tar].T
         t_rel = t_np[ref] - R_rel @ t_np[tar]
         d = c.depth.astype(np.float64).copy()
-        if depth_g is not None and depth_mode != "none":
-            if depth_mode == "frame":
-                scale = math.exp(float(depth_g[tar, 0]))
-                d *= scale
-            elif depth_mode == "block":
-                if c.block_idx is None:
-                    raise RuntimeError("missing block_idx")
-                g_flat = depth_g[tar].reshape(-1)
-                d *= np.exp(g_flat[c.block_idx].astype(np.float64))
+        if g_maps is not None:
+            g = bilinear_sample_g_np(g_maps[tar, 0], c.x, c.y, width, height)
+            d *= np.exp(g.astype(np.float64))
         X = d[:, None] * c.rays.astype(np.float64)
         Xr = X @ R_rel.T + t_rel.reshape(1, 3)
         Z = Xr[:, 2]
@@ -941,27 +920,11 @@ def evaluate_on_cache(
     }
 
 
-def apply_depth_correction_full(depth: np.ndarray, depth_g: np.ndarray | None, depth_mode: str, block_size: int) -> np.ndarray:
-    if depth_g is None or depth_mode == "none":
+def apply_depth_correction_full(depth: np.ndarray, g_maps: np.ndarray | None, height: int, width: int) -> np.ndarray:
+    if g_maps is None:
         return depth.astype(np.float32).copy()
-    n, h, w = depth.shape
-    out = depth.astype(np.float32).copy()
-    if depth_mode == "frame":
-        for i in range(n):
-            out[i] *= np.float32(math.exp(float(depth_g[i, 0])))
-        return out
-    if depth_mode == "block":
-        gy = int(math.ceil(h / block_size))
-        gx = int(math.ceil(w / block_size))
-        for i in range(n):
-            g = depth_g[i].reshape(gy, gx)
-            for by in range(gy):
-                y0, y1 = by * block_size, min((by + 1) * block_size, h)
-                for bx in range(gx):
-                    x0, x1 = bx * block_size, min((bx + 1) * block_size, w)
-                    out[i, y0:y1, x0:x1] *= np.float32(math.exp(float(g[by, bx])))
-        return out
-    raise ValueError(depth_mode)
+    g_full = upsample_g_maps_np(g_maps, height, width)
+    return (depth.astype(np.float32) * np.exp(g_full).astype(np.float32)).astype(np.float32)
 
 
 def choose_depth_scale_fixed_point(depth: np.ndarray, percentile: float, precision: int, bit_depth: int) -> dict[str, Any]:
@@ -1032,7 +995,7 @@ def write_camera_jsonl(
     with open(path, "w", encoding="utf-8") as f:
         header = {
             "type": "header",
-            "format": "fixedK_gop_abs_pose_v1",
+            "format": "fixedK_gop_abs_pose_nn_depth_v1",
             "source_npz": os.path.abspath(source_npz),
             "source_camera_jsonl": os.path.abspath(source_camera_jsonl) if source_camera_jsonl else None,
             "frame_count": int(len(frame_indices)),
@@ -1054,7 +1017,7 @@ def write_camera_jsonl(
             },
             "depth_output": depth_yuv_meta,
             "optimization": {
-                "summary": "Stage1 optimizes absolute R|t with fixed K/original depth over GOP pair losses; Stage2 fixes R and optimizes t plus weak multiplicative depth correction.",
+                "summary": "Stage1 fixed-K R|t; Stage2 fixed-R t+tiny-NN multiplicative depth; Stage3 small-LR joint R/t/NN fine-tuning.",
                 "config": asdict(cfg),
                 "pair_count": len(pair_list),
                 "pairs": [asdict(p) for p in pair_list],
@@ -1096,10 +1059,10 @@ def run(args: argparse.Namespace) -> None:
     out_prefix = Path(args.out_prefix)
     out_prefix = out_prefix.with_name(sanitize_windows_filename_component(out_prefix.name))
 
-    out_npz = out_prefix.with_name(out_prefix.name + "_fixedK_gop_geometry.npz")
-    out_jsonl = out_prefix.with_name(out_prefix.name + "_fixedK_gop_cam.jsonl")
-    out_yuv = out_prefix.with_name(out_prefix.name + "_fixedK_gop_depth_linear_yuv420p10le.yuv")
-    out_manifest = out_prefix.with_name(out_prefix.name + "_fixedK_gop_manifest.json")
+    out_npz = out_prefix.with_name(out_prefix.name + "_fixedK_gop_nn_geometry.npz")
+    out_jsonl = out_prefix.with_name(out_prefix.name + "_fixedK_gop_nn_cam.jsonl")
+    out_yuv = out_prefix.with_name(out_prefix.name + "_fixedK_gop_nn_depth_linear_yuv420p10le.yuv")
+    out_manifest = out_prefix.with_name(out_prefix.name + "_fixedK_gop_nn_manifest.json")
     for p in [out_npz, out_jsonl, out_yuv, out_manifest]:
         if p.exists():
             if args.overwrite:
@@ -1150,21 +1113,24 @@ def run(args: argparse.Namespace) -> None:
         stage1_t_prior=args.stage1_t_prior,
         stage2_iters=args.stage2_iters,
         stage2_lr_t=args.stage2_lr_t,
-        stage2_lr_g=args.stage2_lr_g,
+        stage2_lr_nn=args.stage2_lr_nn,
         stage2_t_prior=args.stage2_t_prior,
         stage3_iters=args.stage3_iters,
         stage3_lr_r=args.stage3_lr_r,
         stage3_lr_t=args.stage3_lr_t,
-        stage3_lr_g=args.stage3_lr_g,
+        stage3_lr_nn=args.stage3_lr_nn,
         stage3_rot_prior=args.stage3_rot_prior,
         stage3_t_prior=args.stage3_t_prior,
         stage3_depth_prior=args.stage3_depth_prior,
-        depth_mode=args.depth_mode,
-        depth_block_size=args.depth_block_size,
+        nn_grid_cell=args.nn_grid_cell,
+        nn_hidden_ch=args.nn_hidden_ch,
+        nn_latent_ch=args.nn_latent_ch,
+        nn_layers=args.nn_layers,
         depth_max_log_scale=args.depth_max_log_scale,
         depth_l2=args.depth_l2,
         depth_spatial_smooth=args.depth_spatial_smooth,
         depth_temporal_smooth=args.depth_temporal_smooth,
+        depth_edge_alpha=args.depth_edge_alpha,
         f_scale=args.f_scale,
         print_every=args.print_every,
         depth_scale_precision=args.depth_scale_precision,
@@ -1192,10 +1158,10 @@ def run(args: argparse.Namespace) -> None:
     if not pair_list:
         raise RuntimeError("No training pairs. Enable GOP/adjacent or pass --extra-pairs.")
     log(f"Pair count: {len(pair_list)}")
-    for p in pair_list[:50]:
+    for p in pair_list[:60]:
         log(f"  pair {p.target}->{p.ref}, weight={p.weight:.3g}, kind={p.kind}")
-    if len(pair_list) > 50:
-        log(f"  ... {len(pair_list)-50} more pairs")
+    if len(pair_list) > 60:
+        log(f"  ... {len(pair_list)-60} more pairs")
 
     log("Creating fixed-K ray grid and exact VGGT target samples")
     rays_fixed = make_rays_np(K_fixed, w, h, z_sign=cfg.z_sign)
@@ -1208,7 +1174,6 @@ def run(args: argparse.Namespace) -> None:
         rays_fixed,
         sample_stride=cfg.sample_stride,
         max_samples_per_pair=cfg.max_samples_per_pair,
-        block_size=cfg.depth_block_size if cfg.depth_mode == "block" else 0,
         z_sign=cfg.z_sign,
         seed=cfg.seed,
     )
@@ -1216,63 +1181,53 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("All pairs had zero valid samples.")
     pair_cache_t = cache_to_torch(pair_cache_np, device=device, dtype=dtype)
 
+    log("Building low-res NN depth features")
+    feat_np, wx_np, wy_np = build_depth_nn_features_np(depth, grid_cell=cfg.nn_grid_cell, include_xy=True)
+    log(f"NN feature grid: features={feat_np.shape}, wx={wx_np.shape}, wy={wy_np.shape}")
+    features = torch.from_numpy(feat_np).to(device=device, dtype=dtype)
+    wx_t = torch.from_numpy(wx_np).to(device=device, dtype=dtype)
+    wy_t = torch.from_numpy(wy_np).to(device=device, dtype=dtype)
+
     log("Evaluating initial fixed-K affine-to-rigid approximation")
-    init_eval = evaluate_on_cache("init", pair_cache_np, r_init, t_init, K_fixed, cfg.z_sign, None, "none", cfg.depth_block_size)
+    init_eval = evaluate_on_cache("init", pair_cache_np, r_init, t_init, K_fixed, w, h, cfg.z_sign, None)
     log(f"Initial EPE: mean={init_eval['mean_of_mean_epe']:.6f}, p95={init_eval['mean_of_p95_epe']:.6f}")
 
-    r_stage1, t_stage1, stage1_hist = optimize_stage1_rt(pair_cache_t, r_init, t_init, K_fixed, cfg, device, dtype)
-    stage1_eval = evaluate_on_cache("stage1_rt", pair_cache_np, r_stage1, t_stage1, K_fixed, cfg.z_sign, None, "none", cfg.depth_block_size)
+    r_stage1, t_stage1, stage1_hist = optimize_stage1_rt(pair_cache_t, r_init, t_init, K_fixed, w, h, cfg, device, dtype)
+    stage1_eval = evaluate_on_cache("stage1_rt", pair_cache_np, r_stage1, t_stage1, K_fixed, w, h, cfg.z_sign, None)
     log(f"Stage1 EPE: mean={stage1_eval['mean_of_mean_epe']:.6f}, p95={stage1_eval['mean_of_p95_epe']:.6f}")
 
     if cfg.stage2_iters > 0:
-        t_stage2, depth_g, stage2_hist, depth_grid_shape = optimize_stage2_t_depth(
-            pair_cache_t,
-            r_stage1,
-            t_stage1,
-            K_fixed,
-            n=n,
-            height=h,
-            width=w,
-            cfg=cfg,
-            device=device,
-            dtype=dtype,
+        t_stage2, net, latent_stage2, g_stage2, stage2_hist = optimize_stage2_t_nn(
+            pair_cache_t, r_stage1, t_stage1, K_fixed, features, wx_t, wy_t, cfg, w, h, device, dtype
         )
     else:
         log("Stage 2 skipped because --stage2-iters 0")
         t_stage2 = t_stage1.copy()
-        depth_g = None
+        net = DepthCorrectionNet(feature_ch=features.shape[1], latent_ch=cfg.nn_latent_ch, hidden_ch=cfg.nn_hidden_ch, layers=cfg.nn_layers).to(device=device, dtype=dtype)
+        latent_stage2 = torch.zeros((n, cfg.nn_latent_ch, features.shape[2], features.shape[3]), device=device, dtype=dtype)
+        g_stage2 = np.zeros((n, 1, features.shape[2], features.shape[3]), dtype=np.float32)
         stage2_hist = []
-        depth_grid_shape = (int(math.ceil(h / cfg.depth_block_size)), int(math.ceil(w / cfg.depth_block_size)))
 
-    stage2_eval = evaluate_on_cache("stage2_t_depth", pair_cache_np, r_stage1, t_stage2, K_fixed, cfg.z_sign, depth_g, cfg.depth_mode, cfg.depth_block_size)
+    stage2_eval = evaluate_on_cache("stage2_t_nn_depth", pair_cache_np, r_stage1, t_stage2, K_fixed, w, h, cfg.z_sign, g_stage2)
     log(f"Stage2 EPE: mean={stage2_eval['mean_of_mean_epe']:.6f}, p95={stage2_eval['mean_of_p95_epe']:.6f}")
 
     if cfg.stage3_iters > 0:
-        r_stage3, t_stage3, depth_g_stage3, stage3_hist, depth_grid_shape = optimize_stage3_joint(
-            pair_cache_t,
-            r_stage1,
-            t_stage2,
-            depth_g,
-            K_fixed,
-            n=n,
-            height=h,
-            width=w,
-            cfg=cfg,
-            device=device,
-            dtype=dtype,
+        r_stage3, t_stage3, net, latent_stage3, g_stage3, stage3_hist = optimize_stage3_joint(
+            pair_cache_t, r_stage1, t_stage2, net, latent_stage2, g_stage2, K_fixed, features, wx_t, wy_t, cfg, w, h, device, dtype
         )
     else:
         log("Stage 3 skipped because --stage3-iters 0")
         r_stage3 = r_stage1.copy()
         t_stage3 = t_stage2.copy()
-        depth_g_stage3 = depth_g.copy() if depth_g is not None else None
+        latent_stage3 = latent_stage2
+        g_stage3 = g_stage2
         stage3_hist = []
 
-    stage3_eval = evaluate_on_cache("stage3_joint", pair_cache_np, r_stage3, t_stage3, K_fixed, cfg.z_sign, depth_g_stage3, cfg.depth_mode, cfg.depth_block_size)
+    stage3_eval = evaluate_on_cache("stage3_joint", pair_cache_np, r_stage3, t_stage3, K_fixed, w, h, cfg.z_sign, g_stage3)
     log(f"Stage3 EPE: mean={stage3_eval['mean_of_mean_epe']:.6f}, p95={stage3_eval['mean_of_p95_epe']:.6f}")
 
-    log("Applying final depth correction and writing depth YUV")
-    depth_canonical = apply_depth_correction_full(depth, depth_g_stage3, cfg.depth_mode, cfg.depth_block_size)
+    log("Applying final NN depth correction and writing depth YUV")
+    depth_canonical = apply_depth_correction_full(depth, g_stage3, h, w)
     depth_scale_meta = choose_depth_scale_fixed_point(depth_canonical, cfg.depth_scale_percentile, cfg.depth_scale_precision, 10)
     depth_yuv_meta = write_depth_yuv420p10le_linear(out_yuv, depth_canonical, depth_scale_meta)
 
@@ -1287,13 +1242,14 @@ def run(args: argparse.Namespace) -> None:
         "tvec_abs_init": t_init.astype(np.float32),
         "rvec_abs_stage1_rt": r_stage1.astype(np.float32),
         "tvec_abs_stage1_rt": t_stage1.astype(np.float32),
-        "rvec_abs_stage2_t_depth": r_stage1.astype(np.float32),
-        "tvec_abs_stage2_t_depth": t_stage2.astype(np.float32),
+        "rvec_abs_stage2_t_nn": r_stage1.astype(np.float32),
+        "tvec_abs_stage2_t_nn": t_stage2.astype(np.float32),
         "rvec_abs_final": r_stage3.astype(np.float32),
         "tvec_abs_final": t_stage3.astype(np.float32),
         "depth_canonical": depth_canonical.astype(np.float32),
-        "depth_mode": np.asarray(cfg.depth_mode, dtype=object),
-        "depth_grid_shape": np.asarray(depth_grid_shape, dtype=np.int32),
+        "depth_log_scale_grid_stage2": g_stage2.astype(np.float32),
+        "depth_log_scale_grid_final": g_stage3.astype(np.float32),
+        "depth_log_scale_grid_shape": np.asarray(g_stage3.shape, dtype=np.int32),
         "config_json": np.asarray(json.dumps(asdict(cfg), ensure_ascii=False), dtype=object),
         "pairs_json": np.asarray(json.dumps([asdict(p) for p in pair_list], ensure_ascii=False), dtype=object),
         "init_eval_json": np.asarray(json.dumps(init_eval, ensure_ascii=False), dtype=object),
@@ -1303,12 +1259,20 @@ def run(args: argparse.Namespace) -> None:
         "stage1_history_json": np.asarray(json.dumps(stage1_hist, ensure_ascii=False), dtype=object),
         "stage2_history_json": np.asarray(json.dumps(stage2_hist, ensure_ascii=False), dtype=object),
         "stage3_history_json": np.asarray(json.dumps(stage3_hist, ensure_ascii=False), dtype=object),
+        "nn_feature_grid": feat_np.astype(np.float32),
+        "nn_edge_weight_x": wx_np.astype(np.float32),
+        "nn_edge_weight_y": wy_np.astype(np.float32),
     }
-    if depth_g is not None:
-        payload["depth_log_scale_stage2"] = depth_g.astype(np.float32)
-    if depth_g_stage3 is not None:
-        payload["depth_log_scale"] = depth_g_stage3.astype(np.float32)
-        payload["depth_log_scale_final"] = depth_g_stage3.astype(np.float32)
+    if args.save_nn_state:
+        # torch state_dict cannot be stored directly in a portable npz; save separate .pt.
+        out_pt = out_prefix.with_name(out_prefix.name + "_fixedK_gop_nn_state.pt")
+        torch.save({
+            "net_state_dict": net.state_dict(),
+            "latent": latent_stage3.detach().cpu(),
+            "K_fixed": torch.from_numpy(K_fixed.astype(np.float32)),
+            "config": asdict(cfg),
+        }, out_pt)
+        payload["nn_state_pt"] = np.asarray(str(out_pt), dtype=object)
     if args.save_original_debug:
         payload["depth_original"] = depth.astype(np.float32)
         payload["intrinsic_original"] = K_orig.astype(np.float32)
@@ -1336,15 +1300,15 @@ def run(args: argparse.Namespace) -> None:
         "eval": {
             "init": init_eval,
             "stage1_rt": stage1_eval,
-            "stage2_t_depth": stage2_eval,
+            "stage2_t_nn_depth": stage2_eval,
             "stage3_joint": stage3_eval,
         },
         "depth_yuv": depth_yuv_meta,
         "notes": [
             "Pair direction is target->reference; backward projection uses target-frame depth.",
             "GOP/hierarchical anchor pairs are included directly in the optimization loss.",
-            "Stage2 fixes rotations from Stage1, then optimizes translations and weak multiplicative depth correction.",
-            "Stage3 starts from Stage2 and jointly fine-tunes R/t/depth with small LR and priors toward Stage2.",
+            "Depth correction is produced by a tiny low-res NN during encoder-side optimization only.",
+            "Decoder does not need the NN; it only receives the final corrected depth YUV and fixed-K camera JSONL.",
             "Intrinsic is fixed once per RAP; no per-frame intrinsic delta is written.",
         ],
     }
@@ -1352,14 +1316,14 @@ def run(args: argparse.Namespace) -> None:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     print("============================================================")
-    print("Fixed-K GOP optimization done")
+    print("Fixed-K GOP NN-depth optimization done")
     print("============================================================")
     print(f"input npz       : {npz_path}")
     print(f"frames          : {n}")
     print(f"size            : {w}x{h}")
     print(f"K fixed         : fx={K_fixed[0,0]:.6f}, fy={K_fixed[1,1]:.6f}, cx={K_fixed[0,2]:.6f}, cy={K_fixed[1,2]:.6f}")
     print(f"pairs           : {len(pair_list)}")
-    print(f"depth mode      : {cfg.depth_mode}")
+    print(f"NN grid         : {g_stage3.shape[2]}x{g_stage3.shape[3]}  cell~{cfg.nn_grid_cell}")
     print("------------------------------------------------------------")
     print(f"init    mean/p95: {init_eval['mean_of_mean_epe']:.6f} / {init_eval['mean_of_p95_epe']:.6f} px")
     print(f"stage1  mean/p95: {stage1_eval['mean_of_mean_epe']:.6f} / {stage1_eval['mean_of_p95_epe']:.6f} px")
@@ -1374,7 +1338,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fixed-K R|t + weak depth correction optimized over codec GOP pairs")
+    p = argparse.ArgumentParser(description="Fixed-K R|t + constrained tiny-NN depth correction optimized over codec GOP pairs")
     p.add_argument("--npz", required=True, help="VGGT-Omega output NPZ")
     p.add_argument("--camera-jsonl", default=None, help="Optional source camera JSONL")
     p.add_argument("--out-prefix", required=True)
@@ -1394,10 +1358,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adjacent-bidirectional", action="store_true", help="Also include i-1->i adjacent reverse pairs")
     p.add_argument("--adjacent-weight", type=float, default=0.5)
     p.add_argument("--no-gop", action="store_true", help="Disable recursively generated GOP/hierarchical pairs")
-    p.add_argument("--bidirectional-gop", action="store_true", default=True, help="Include both current->anchor and anchor->current for hierarchical pairs")
+    p.add_argument("--bidirectional-gop", action="store_true", default=True, help="Include both current->anchor and anchor->current hierarchical pairs")
     p.add_argument("--no-bidirectional-gop", dest="bidirectional_gop", action="store_false")
     p.add_argument("--gop-weight", type=float, default=1.0)
-    p.add_argument("--extra-pairs", default=None, help="Additional target:ref[:weight] pairs, comma separated. Example: '0:16:2,32:16:2,16:8'")
+    p.add_argument("--extra-pairs", default=None, help="Additional target:ref[:weight] pairs. Example: '0:16:2,32:16:2,16:8'")
 
     # Sampling.
     p.add_argument("--sample-stride", type=int, default=8)
@@ -1413,25 +1377,28 @@ def parse_args() -> argparse.Namespace:
     # Stage 2.
     p.add_argument("--stage2-iters", type=int, default=300)
     p.add_argument("--stage2-lr-t", type=float, default=5e-4)
-    p.add_argument("--stage2-lr-g", type=float, default=5e-2)
+    p.add_argument("--stage2-lr-nn", type=float, default=2e-3)
     p.add_argument("--stage2-t-prior", type=float, default=1e-4)
 
     # Stage 3: conservative joint fine-tuning from Stage 2.
     p.add_argument("--stage3-iters", type=int, default=150)
     p.add_argument("--stage3-lr-r", type=float, default=3e-5)
     p.add_argument("--stage3-lr-t", type=float, default=3e-5)
-    p.add_argument("--stage3-lr-g", type=float, default=1e-4)
+    p.add_argument("--stage3-lr-nn", type=float, default=3e-4)
     p.add_argument("--stage3-rot-prior", type=float, default=1e-3)
     p.add_argument("--stage3-t-prior", type=float, default=1e-3)
-    p.add_argument("--stage3-depth-prior", type=float, default=0.5,
-                   help="Regularize final depth log-scale toward Stage2 log-scale.")
+    p.add_argument("--stage3-depth-prior", type=float, default=0.5, help="Regularize Stage3 g map toward Stage2 g map")
 
-    p.add_argument("--depth-mode", choices=["none", "frame", "block"], default="block")
-    p.add_argument("--depth-block-size", type=int, default=128)
-    p.add_argument("--depth-max-log-scale", type=float, default=0.15, help="g is clipped by g=max*tanh(u); exp(g) is multiplicative depth scale")
+    # NN depth correction.
+    p.add_argument("--nn-grid-cell", type=int, default=64, help="Low-res correction grid cell size in source pixels. 64 -> ~17x30 at 1080p")
+    p.add_argument("--nn-hidden-ch", type=int, default=24)
+    p.add_argument("--nn-latent-ch", type=int, default=2)
+    p.add_argument("--nn-layers", type=int, default=3)
+    p.add_argument("--depth-max-log-scale", type=float, default=0.15, help="g=max*tanh(raw); exp(g) is multiplicative depth scale")
     p.add_argument("--depth-l2", type=float, default=0.1)
     p.add_argument("--depth-spatial-smooth", type=float, default=0.5)
     p.add_argument("--depth-temporal-smooth", type=float, default=0.05)
+    p.add_argument("--depth-edge-alpha", type=float, default=1.0, help="Higher value weakens smoothing more strongly at VGGT depth edges")
 
     # Loss / output.
     p.add_argument("--f-scale", type=float, default=1.0, help="Charbonnier soft scale in pixels")
@@ -1440,6 +1407,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--depth-scale-percentile", type=float, default=99.9)
     p.add_argument("--compressed-npz", action="store_true")
     p.add_argument("--save-original-debug", action="store_true")
+    p.add_argument("--save-nn-state", action="store_true")
     return p.parse_args()
 
 
@@ -1447,8 +1415,8 @@ def main() -> None:
     args = parse_args()
     if args.sample_stride <= 0:
         raise ValueError("--sample-stride must be positive")
-    if args.depth_block_size <= 0:
-        raise ValueError("--depth-block-size must be positive")
+    if args.nn_grid_cell <= 0:
+        raise ValueError("--nn-grid-cell must be positive")
     run(args)
 
 
