@@ -1002,3 +1002,38 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+python -u canonicalize_vggt_geometry_progress.py \
+  --npz out/test_rap0_vggt_omega_outputs.npz \
+  --camera-jsonl out/test_rap0_camera.jsonl \
+  --out-prefix out/test_rap0_canon_target \
+  --width 1920 \
+  --height 1080 \
+  --depth-fit-mode target \
+  --rot-fit-degree 0 \
+  --trans-fit-degree 3 \
+  --epe-stride 4 \
+  --progress-every 1 \
+  --overwrite
