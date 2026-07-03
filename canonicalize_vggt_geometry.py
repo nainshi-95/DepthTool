@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-optimize_fixedK_rt_depth_gop.py
+optimize_fixedK_rt_depth_gop_stage3.py
 
-Stage-wise VGGT-Omega geometry canonicalization for codec input.
+Stage-wise VGGT-Omega geometry canonicalization for codec input, with Stage-3 joint fine-tuning.
 
 Goal
 ----
@@ -12,6 +12,7 @@ projection accuracy with:
 
   Stage 1: fixed K + original depth + optimized absolute R|t
   Stage 2: fixed K + fixed R + optimized t + weak multiplicative depth correction
+  Stage 3: fixed K + weak joint fine-tuning of R/t/depth from Stage 2
 
 Unlike pair-only fitting, this script optimizes against codec-relevant GOP/hierarchical
 reference pairs directly, e.g. 16->0, 16->32, 8->0, 8->16, 4->0, 4->8, and their
@@ -28,6 +29,9 @@ Outputs:
   <prefix>_fixedK_gop_geometry.npz
   <prefix>_fixedK_gop_depth_linear_yuv420p10le.yuv
   <prefix>_fixedK_gop_manifest.json
+
+Stage 3 is intentionally conservative: it keeps frame-0 absolute pose fixed as the
+gauge anchor and regularizes R/t/depth log-scale toward the Stage-2 solution.
 
 Notes
 -----
@@ -455,6 +459,13 @@ class OptimConfig:
     stage2_lr_t: float
     stage2_lr_g: float
     stage2_t_prior: float
+    stage3_iters: int
+    stage3_lr_r: float
+    stage3_lr_t: float
+    stage3_lr_g: float
+    stage3_rot_prior: float
+    stage3_t_prior: float
+    stage3_depth_prior: float
     depth_mode: str
     depth_block_size: int
     depth_max_log_scale: float
@@ -699,6 +710,166 @@ def optimize_stage2_t_depth(
         else:
             g_np = None
     return t_all.detach().cpu().numpy(), g_np, hist, (gy, gx)
+
+
+def _atanh_np(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x.astype(np.float64), -0.999999, 0.999999)
+    return 0.5 * np.log((1.0 + x) / (1.0 - x))
+
+
+def init_depth_u_from_log_scale(
+    depth_g_np: np.ndarray | None,
+    depth_mode: str,
+    depth_max_log_scale: float,
+    n: int,
+    gy: int,
+    gx: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Return unconstrained u so that depth_max_log_scale*tanh(u) ~= depth_g_np."""
+    if depth_mode == "none":
+        return None
+    if depth_mode == "frame":
+        shape = (n, 1)
+    elif depth_mode == "block":
+        shape = (n, gy * gx)
+    else:
+        raise ValueError(depth_mode)
+
+    if depth_g_np is None:
+        u0 = np.zeros(shape, dtype=np.float64)
+    else:
+        g = np.asarray(depth_g_np, dtype=np.float64).reshape(shape)
+        if abs(depth_max_log_scale) < 1e-12:
+            u0 = np.zeros(shape, dtype=np.float64)
+        else:
+            u0 = _atanh_np(g / float(depth_max_log_scale))
+    return torch.tensor(u0, device=device, dtype=dtype)
+
+
+def depth_prior_to_base(
+    depth_u: torch.Tensor | None,
+    depth_g_base: torch.Tensor | None,
+    cfg: OptimConfig,
+) -> torch.Tensor:
+    if depth_u is None or depth_g_base is None or cfg.stage3_depth_prior <= 0:
+        if depth_u is not None:
+            return torch.zeros((), dtype=depth_u.dtype, device=depth_u.device)
+        if depth_g_base is not None:
+            return torch.zeros((), dtype=depth_g_base.dtype, device=depth_g_base.device)
+        return torch.tensor(0.0)
+    g = cfg.depth_max_log_scale * torch.tanh(depth_u)
+    return cfg.stage3_depth_prior * torch.mean((g - depth_g_base) ** 2)
+
+
+def optimize_stage3_joint(
+    pair_cache: list[PairCacheTorch],
+    r_stage2_np: np.ndarray,
+    t_stage2_np: np.ndarray,
+    depth_g_stage2_np: np.ndarray | None,
+    K_fixed: np.ndarray,
+    n: int,
+    height: int,
+    width: int,
+    cfg: OptimConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, list[dict[str, float]], tuple[int, int]]:
+    """
+    Stage 3: conservative joint fine-tuning from Stage 2.
+
+    Variables:
+      - rvec[1:], t[1:] absolute canonical poses; frame 0 fixed as gauge anchor.
+      - depth log-scale field g if depth_mode is frame/block.
+
+    Priors keep the solution close to Stage 2 so this works as refinement rather than
+    another free global optimization.
+    """
+    log("Stage 3: small-LR joint fine-tuning of R, t, and depth correction")
+    r_base = torch.tensor(r_stage2_np, device=device, dtype=dtype)
+    t_base = torch.tensor(t_stage2_np, device=device, dtype=dtype)
+    K_fixed_t = torch.tensor(K_fixed, device=device, dtype=dtype)
+
+    r0_fixed = r_base[0].detach()
+    t0_fixed = t_base[0].detach()
+    r_free = torch.nn.Parameter(r_base[1:].clone())
+    t_free = torch.nn.Parameter(t_base[1:].clone())
+
+    gy = int(math.ceil(height / cfg.depth_block_size)) if cfg.depth_block_size > 0 else 1
+    gx = int(math.ceil(width / cfg.depth_block_size)) if cfg.depth_block_size > 0 else 1
+    depth_u0 = init_depth_u_from_log_scale(
+        depth_g_stage2_np,
+        cfg.depth_mode,
+        cfg.depth_max_log_scale,
+        n=n,
+        gy=gy,
+        gx=gx,
+        device=device,
+        dtype=dtype,
+    )
+    depth_g_base_t: torch.Tensor | None = None
+    if depth_g_stage2_np is not None and cfg.depth_mode != "none":
+        depth_g_base_t = torch.tensor(depth_g_stage2_np, device=device, dtype=dtype)
+
+    params: list[dict[str, Any]] = [
+        {"params": [r_free], "lr": cfg.stage3_lr_r},
+        {"params": [t_free], "lr": cfg.stage3_lr_t},
+    ]
+    depth_u: torch.nn.Parameter | None
+    if depth_u0 is not None:
+        depth_u = torch.nn.Parameter(depth_u0.clone())
+        params.append({"params": [depth_u], "lr": cfg.stage3_lr_g})
+    else:
+        depth_u = None
+
+    opt = torch.optim.Adam(params)
+    hist: list[dict[str, float]] = []
+    for it in range(1, cfg.stage3_iters + 1):
+        opt.zero_grad(set_to_none=True)
+        r_all, t_all, R_all = build_full_pose_tensors(r_free, t_free, r0_fixed, t0_fixed)
+        loss_pair = pair_loss_sum(
+            pair_cache,
+            R_all,
+            t_all,
+            K_fixed_t,
+            cfg.z_sign,
+            cfg.f_scale,
+            depth_u=depth_u,
+            depth_mode=cfg.depth_mode,
+            depth_max_log_scale=cfg.depth_max_log_scale,
+            depth_block_count=gy * gx,
+        )
+        loss_reg = torch.zeros_like(loss_pair)
+        if cfg.stage3_rot_prior > 0:
+            loss_reg = loss_reg + cfg.stage3_rot_prior * torch.mean((r_all - r_base) ** 2)
+        if cfg.stage3_t_prior > 0:
+            loss_reg = loss_reg + cfg.stage3_t_prior * torch.mean((t_all - t_base) ** 2)
+        if depth_u is not None:
+            loss_reg = loss_reg + depth_regularization(depth_u, cfg, n=n, gy=gy, gx=gx)
+            loss_reg = loss_reg + depth_prior_to_base(depth_u, depth_g_base_t, cfg)
+        loss = loss_pair + loss_reg
+        loss.backward()
+        opt.step()
+
+        if it == 1 or it == cfg.stage3_iters or (cfg.print_every > 0 and it % cfg.print_every == 0):
+            rec = {
+                "iter": it,
+                "loss": float(loss.detach().cpu()),
+                "pair_loss": float(loss_pair.detach().cpu()),
+                "reg_loss": float(loss_reg.detach().cpu()),
+            }
+            hist.append(rec)
+            log(f"Stage3 iter {it:04d}/{cfg.stage3_iters}: loss={rec['loss']:.6f}, pair={rec['pair_loss']:.6f}, reg={rec['reg_loss']:.6f}")
+
+    with torch.no_grad():
+        r_all, t_all, _ = build_full_pose_tensors(r_free, t_free, r0_fixed, t0_fixed)
+        if depth_u is not None:
+            g = cfg.depth_max_log_scale * torch.tanh(depth_u)
+            depth_g_np = g.detach().cpu().numpy().astype(np.float32)
+        else:
+            depth_g_np = None
+    return r_all.detach().cpu().numpy(), t_all.detach().cpu().numpy(), depth_g_np, hist, (gy, gx)
 
 
 # ============================================================
@@ -981,6 +1152,13 @@ def run(args: argparse.Namespace) -> None:
         stage2_lr_t=args.stage2_lr_t,
         stage2_lr_g=args.stage2_lr_g,
         stage2_t_prior=args.stage2_t_prior,
+        stage3_iters=args.stage3_iters,
+        stage3_lr_r=args.stage3_lr_r,
+        stage3_lr_t=args.stage3_lr_t,
+        stage3_lr_g=args.stage3_lr_g,
+        stage3_rot_prior=args.stage3_rot_prior,
+        stage3_t_prior=args.stage3_t_prior,
+        stage3_depth_prior=args.stage3_depth_prior,
         depth_mode=args.depth_mode,
         depth_block_size=args.depth_block_size,
         depth_max_log_scale=args.depth_max_log_scale,
@@ -1069,13 +1247,37 @@ def run(args: argparse.Namespace) -> None:
     stage2_eval = evaluate_on_cache("stage2_t_depth", pair_cache_np, r_stage1, t_stage2, K_fixed, cfg.z_sign, depth_g, cfg.depth_mode, cfg.depth_block_size)
     log(f"Stage2 EPE: mean={stage2_eval['mean_of_mean_epe']:.6f}, p95={stage2_eval['mean_of_p95_epe']:.6f}")
 
+    if cfg.stage3_iters > 0:
+        r_stage3, t_stage3, depth_g_stage3, stage3_hist, depth_grid_shape = optimize_stage3_joint(
+            pair_cache_t,
+            r_stage1,
+            t_stage2,
+            depth_g,
+            K_fixed,
+            n=n,
+            height=h,
+            width=w,
+            cfg=cfg,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        log("Stage 3 skipped because --stage3-iters 0")
+        r_stage3 = r_stage1.copy()
+        t_stage3 = t_stage2.copy()
+        depth_g_stage3 = depth_g.copy() if depth_g is not None else None
+        stage3_hist = []
+
+    stage3_eval = evaluate_on_cache("stage3_joint", pair_cache_np, r_stage3, t_stage3, K_fixed, cfg.z_sign, depth_g_stage3, cfg.depth_mode, cfg.depth_block_size)
+    log(f"Stage3 EPE: mean={stage3_eval['mean_of_mean_epe']:.6f}, p95={stage3_eval['mean_of_p95_epe']:.6f}")
+
     log("Applying final depth correction and writing depth YUV")
-    depth_canonical = apply_depth_correction_full(depth, depth_g, cfg.depth_mode, cfg.depth_block_size)
+    depth_canonical = apply_depth_correction_full(depth, depth_g_stage3, cfg.depth_mode, cfg.depth_block_size)
     depth_scale_meta = choose_depth_scale_fixed_point(depth_canonical, cfg.depth_scale_percentile, cfg.depth_scale_precision, 10)
     depth_yuv_meta = write_depth_yuv420p10le_linear(out_yuv, depth_canonical, depth_scale_meta)
 
     log("Writing camera JSONL")
-    write_camera_jsonl(out_jsonl, npz_path, camera_jsonl_path, frame_indices, K_fixed, r_stage1, t_stage2, depth_yuv_meta, cfg, pair_list)
+    write_camera_jsonl(out_jsonl, npz_path, camera_jsonl_path, frame_indices, K_fixed, r_stage3, t_stage3, depth_yuv_meta, cfg, pair_list)
 
     log("Saving NPZ")
     payload: dict[str, Any] = {
@@ -1085,8 +1287,10 @@ def run(args: argparse.Namespace) -> None:
         "tvec_abs_init": t_init.astype(np.float32),
         "rvec_abs_stage1_rt": r_stage1.astype(np.float32),
         "tvec_abs_stage1_rt": t_stage1.astype(np.float32),
-        "rvec_abs_final": r_stage1.astype(np.float32),
-        "tvec_abs_final": t_stage2.astype(np.float32),
+        "rvec_abs_stage2_t_depth": r_stage1.astype(np.float32),
+        "tvec_abs_stage2_t_depth": t_stage2.astype(np.float32),
+        "rvec_abs_final": r_stage3.astype(np.float32),
+        "tvec_abs_final": t_stage3.astype(np.float32),
         "depth_canonical": depth_canonical.astype(np.float32),
         "depth_mode": np.asarray(cfg.depth_mode, dtype=object),
         "depth_grid_shape": np.asarray(depth_grid_shape, dtype=np.int32),
@@ -1095,11 +1299,16 @@ def run(args: argparse.Namespace) -> None:
         "init_eval_json": np.asarray(json.dumps(init_eval, ensure_ascii=False), dtype=object),
         "stage1_eval_json": np.asarray(json.dumps(stage1_eval, ensure_ascii=False), dtype=object),
         "stage2_eval_json": np.asarray(json.dumps(stage2_eval, ensure_ascii=False), dtype=object),
+        "stage3_eval_json": np.asarray(json.dumps(stage3_eval, ensure_ascii=False), dtype=object),
         "stage1_history_json": np.asarray(json.dumps(stage1_hist, ensure_ascii=False), dtype=object),
         "stage2_history_json": np.asarray(json.dumps(stage2_hist, ensure_ascii=False), dtype=object),
+        "stage3_history_json": np.asarray(json.dumps(stage3_hist, ensure_ascii=False), dtype=object),
     }
     if depth_g is not None:
-        payload["depth_log_scale"] = depth_g.astype(np.float32)
+        payload["depth_log_scale_stage2"] = depth_g.astype(np.float32)
+    if depth_g_stage3 is not None:
+        payload["depth_log_scale"] = depth_g_stage3.astype(np.float32)
+        payload["depth_log_scale_final"] = depth_g_stage3.astype(np.float32)
     if args.save_original_debug:
         payload["depth_original"] = depth.astype(np.float32)
         payload["intrinsic_original"] = K_orig.astype(np.float32)
@@ -1128,12 +1337,14 @@ def run(args: argparse.Namespace) -> None:
             "init": init_eval,
             "stage1_rt": stage1_eval,
             "stage2_t_depth": stage2_eval,
+            "stage3_joint": stage3_eval,
         },
         "depth_yuv": depth_yuv_meta,
         "notes": [
             "Pair direction is target->reference; backward projection uses target-frame depth.",
             "GOP/hierarchical anchor pairs are included directly in the optimization loss.",
             "Stage2 fixes rotations from Stage1, then optimizes translations and weak multiplicative depth correction.",
+            "Stage3 starts from Stage2 and jointly fine-tunes R/t/depth with small LR and priors toward Stage2.",
             "Intrinsic is fixed once per RAP; no per-frame intrinsic delta is written.",
         ],
     }
@@ -1153,6 +1364,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"init    mean/p95: {init_eval['mean_of_mean_epe']:.6f} / {init_eval['mean_of_p95_epe']:.6f} px")
     print(f"stage1  mean/p95: {stage1_eval['mean_of_mean_epe']:.6f} / {stage1_eval['mean_of_p95_epe']:.6f} px")
     print(f"stage2  mean/p95: {stage2_eval['mean_of_mean_epe']:.6f} / {stage2_eval['mean_of_p95_epe']:.6f} px")
+    print(f"stage3  mean/p95: {stage3_eval['mean_of_mean_epe']:.6f} / {stage3_eval['mean_of_p95_epe']:.6f} px")
     print("------------------------------------------------------------")
     print(f"geometry npz    : {out_npz}")
     print(f"camera jsonl    : {out_jsonl}")
@@ -1203,6 +1415,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage2-lr-t", type=float, default=5e-4)
     p.add_argument("--stage2-lr-g", type=float, default=5e-2)
     p.add_argument("--stage2-t-prior", type=float, default=1e-4)
+
+    # Stage 3: conservative joint fine-tuning from Stage 2.
+    p.add_argument("--stage3-iters", type=int, default=150)
+    p.add_argument("--stage3-lr-r", type=float, default=3e-5)
+    p.add_argument("--stage3-lr-t", type=float, default=3e-5)
+    p.add_argument("--stage3-lr-g", type=float, default=1e-4)
+    p.add_argument("--stage3-rot-prior", type=float, default=1e-3)
+    p.add_argument("--stage3-t-prior", type=float, default=1e-3)
+    p.add_argument("--stage3-depth-prior", type=float, default=0.5,
+                   help="Regularize final depth log-scale toward Stage2 log-scale.")
+
     p.add_argument("--depth-mode", choices=["none", "frame", "block"], default="block")
     p.add_argument("--depth-block-size", type=int, default=128)
     p.add_argument("--depth-max-log-scale", type=float, default=0.15, help="g is clipped by g=max*tanh(u); exp(g) is multiplicative depth scale")
