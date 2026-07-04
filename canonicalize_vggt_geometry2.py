@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-optimize_fixedK_rt_depth_nn_gop.py
+optimize_fixedK_rt_depth_nn_gop_smooth_predloss.py
 
 Stage-wise VGGT-Omega geometry canonicalization for codec input.
 
@@ -247,6 +247,195 @@ def trajectory_smoothness_loss(
             omega_acc = omega[1:] - omega[:-1]
             loss = loss + float(rot_acc_weight) * torch.mean(omega_acc * omega_acc)
     return loss
+
+
+
+def _poly_predict_weights_np(m: int, pred_degree: int) -> np.ndarray:
+    """Weights w such that pred_next = sum_j w[j] * hist[j], matching predict_from_history."""
+    if m <= 0:
+        raise ValueError("m must be positive")
+    if m == 1:
+        return np.array([1.0], dtype=np.float64)
+    deg = min(int(pred_degree), m - 1)
+    x = np.arange(m, dtype=np.float64)
+    x_next = np.array([m], dtype=np.float64)
+    A = np.vander(x, N=deg + 1, increasing=True)
+    b = np.vander(x_next, N=deg + 1, increasing=True)
+    w = (b @ np.linalg.pinv(A)).reshape(m)
+    return w.astype(np.float64)
+
+
+def history_poly_predict_param6_torch(param6: torch.Tensor, pred_n: int, pred_degree: int) -> torch.Tensor:
+    """Differentiable teacher-forced equivalent of the coding script's predict_from_history()."""
+    n = param6.shape[0]
+    preds: list[torch.Tensor] = []
+    zero = torch.zeros_like(param6[0])
+    for i in range(n):
+        if i == 0:
+            preds.append(zero)
+            continue
+        m = min(i, int(pred_n))
+        hist = param6[i - m:i]
+        w_np = _poly_predict_weights_np(m, int(pred_degree))
+        w = torch.tensor(w_np, dtype=param6.dtype, device=param6.device).view(m, 1)
+        preds.append(torch.sum(hist * w, dim=0))
+    return torch.stack(preds, dim=0)
+
+
+def current_to_previous_param6_torch(R_all: torch.Tensor, t_all: torch.Tensor, depth_scale_real: float) -> torch.Tensor:
+    """param6[poc] = [rvec_current_to_previous, tvec_current_to_previous/depth_scale_real]."""
+    n = R_all.shape[0]
+    out = torch.zeros((n, 6), dtype=t_all.dtype, device=t_all.device)
+    if n <= 1:
+        return out
+    R_rel = R_all[:-1] @ R_all[1:].transpose(-1, -2)
+    t_rel = t_all[:-1] - (R_rel @ t_all[1:, :, None]).squeeze(-1)
+    r_rel = so3_log_torch(R_rel)
+    out[1:, :3] = r_rel
+    out[1:, 3:] = t_rel / float(depth_scale_real)
+    return out
+
+
+def actual_predictor_residual_surrogate_loss(
+    R_all: torch.Tensor,
+    t_all: torch.Tensor,
+    depth_scale_real: float,
+    pred_n: int,
+    pred_degree: int,
+    r_step: float,
+    t_step_norm: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    Smooth surrogate for the real residual coding path:
+      p_gt=[rvec,tvec/depth_scale_real], p_pred=history polynomial, residual=p_gt-p_pred.
+    It optimizes a log-like approximation of signed Exp-Golomb bit growth without rounding.
+    """
+    param6 = current_to_previous_param6_torch(R_all, t_all, depth_scale_real)
+    pred = history_poly_predict_param6_torch(param6, pred_n=pred_n, pred_degree=pred_degree)
+    residual = param6 - pred
+    if residual.shape[0] <= 1:
+        z = torch.zeros((), dtype=param6.dtype, device=param6.device)
+        return z, {"pred_loss_r": 0.0, "pred_loss_t": 0.0, "pred_loss_total": 0.0}
+    body = residual[1:]
+    q_r_abs = torch.abs(body[:, :3] / float(r_step))
+    q_t_abs = torch.abs(body[:, 3:] / float(t_step_norm))
+    log2 = math.log(2.0)
+    loss_r = torch.mean(torch.log1p(2.0 * q_r_abs) / log2)
+    loss_t = torch.mean(torch.log1p(2.0 * q_t_abs) / log2)
+    loss = loss_r + loss_t
+    stats = {
+        "pred_loss_r": float(loss_r.detach().cpu()),
+        "pred_loss_t": float(loss_t.detach().cpu()),
+        "pred_loss_total": float(loss.detach().cpu()),
+    }
+    return loss, stats
+
+
+def _signed_to_code_num_np(x: int) -> int:
+    x = int(x)
+    if x == 0:
+        return 0
+    return 2 * x - 1 if x > 0 else -2 * x
+
+
+def _ue_exp_golomb_bits_np(code_num: int) -> int:
+    k = (int(code_num) + 1).bit_length() - 1
+    return 2 * k + 1
+
+
+def _signed_trunc_exp_golomb_bits_np(x: int, q_abs_max: int) -> int:
+    x = int(np.clip(int(x), -q_abs_max, q_abs_max))
+    return _ue_exp_golomb_bits_np(_signed_to_code_num_np(x))
+
+
+def _predict_from_history_np(decoded_hist: list[np.ndarray], pred_n: int, pred_degree: int) -> np.ndarray:
+    if not decoded_hist:
+        return np.zeros(6, dtype=np.float64)
+    m = min(len(decoded_hist), int(pred_n))
+    y = np.stack(decoded_hist[-m:], axis=0).astype(np.float64)
+    if m == 1:
+        return y[-1].copy()
+    w = _poly_predict_weights_np(m, int(pred_degree)).reshape(1, m)
+    return (w @ y).reshape(6).astype(np.float64)
+
+
+def current_to_previous_param6_np(r_np: np.ndarray, t_np: np.ndarray, depth_scale_real: float) -> np.ndarray:
+    n = len(r_np)
+    R_all = np.stack([R_from_rvec_np(r_np[i]) for i in range(n)], axis=0)
+    out = np.zeros((n, 6), dtype=np.float64)
+    for i in range(1, n):
+        R_rel = R_all[i - 1] @ R_all[i].T
+        t_rel = t_np[i - 1] - R_rel @ t_np[i]
+        out[i, :3] = rvec_from_R(R_rel)
+        out[i, 3:] = t_rel / float(depth_scale_real)
+    return out
+
+
+def estimate_actual_history_pred_bits_np(
+    r_np: np.ndarray,
+    t_np: np.ndarray,
+    depth_scale_real: float,
+    pred_n: int,
+    pred_degree: int,
+    r_step: float,
+    t_step_norm: float,
+    ext_bits: int,
+) -> dict[str, Any]:
+    """Exact non-differentiable estimate matching the attached coding script's decoded-history loop."""
+    param6 = current_to_previous_param6_np(r_np, t_np, depth_scale_real)
+    q_abs_max = (1 << (int(ext_bits) - 1)) - 1
+    decoded_hist: list[np.ndarray] = []
+    total = total_r = total_t = 0
+    each = np.zeros(6, dtype=np.int64)
+    clipped_frames = 0
+    frames = 0
+    per_frame: list[dict[str, Any]] = []
+    for poc in range(param6.shape[0]):
+        if poc == 0:
+            p_dec = np.zeros(6, dtype=np.float64)
+            decoded_hist.append(p_dec)
+            per_frame.append({"poc": 0, "bits": 0, "bits_each": [0, 0, 0, 0, 0, 0], "clipped": False})
+            continue
+        p_gt = param6[poc]
+        p_pred = _predict_from_history_np(decoded_hist, pred_n, pred_degree)
+        residual = p_gt - p_pred
+        q_r = np.round(residual[:3] / float(r_step))
+        q_t = np.round(residual[3:] / float(t_step_norm))
+        clip = bool(np.any(q_r < -q_abs_max) or np.any(q_r > q_abs_max) or np.any(q_t < -q_abs_max) or np.any(q_t > q_abs_max))
+        q_r = np.clip(q_r, -q_abs_max, q_abs_max).astype(np.int64)
+        q_t = np.clip(q_t, -q_abs_max, q_abs_max).astype(np.int64)
+        q = np.concatenate([q_r, q_t])
+        bits_each = [_signed_trunc_exp_golomb_bits_np(int(v), q_abs_max) for v in q]
+        bits = int(sum(bits_each))
+        total += bits
+        total_r += int(sum(bits_each[:3]))
+        total_t += int(sum(bits_each[3:]))
+        each += np.array(bits_each, dtype=np.int64)
+        frames += 1
+        if clip:
+            clipped_frames += 1
+        p_dec = p_pred.copy()
+        p_dec[:3] += q_r.astype(np.float64) * float(r_step)
+        p_dec[3:] += q_t.astype(np.float64) * float(t_step_norm)
+        decoded_hist.append(p_dec)
+        per_frame.append({"poc": int(poc), "bits": bits, "bits_each": [int(x) for x in bits_each], "clipped": clip})
+    denom = max(frames, 1)
+    return {
+        "pred_n": int(pred_n),
+        "pred_degree": int(pred_degree),
+        "r_step": float(r_step),
+        "t_step_norm": float(t_step_norm),
+        "depth_scale_real": float(depth_scale_real),
+        "ext_bits": int(ext_bits),
+        "coded_frames": int(frames),
+        "clipped_frames": int(clipped_frames),
+        "total_bits": int(total),
+        "avg_bits_per_frame": float(total / denom),
+        "avg_r_bits_per_frame": float(total_r / denom),
+        "avg_t_bits_per_frame": float(total_t / denom),
+        "avg_bits_each": (each.astype(np.float64) / denom).tolist(),
+        "per_frame": per_frame,
+    }
 
 def robust_epe_loss(pred_xy: torch.Tensor, target_xy: torch.Tensor, f_scale: float) -> torch.Tensor:
     diff = pred_xy - target_xy
@@ -677,6 +866,13 @@ class OptimConfig:
     stage4_rot_vel: float
     stage4_pose_prior: float
     stage4_depth_prior: float
+    stage4_pred_weight: float
+    stage4_pred_n: int
+    stage4_pred_degree: int
+    stage4_pred_r_step: float
+    stage4_pred_t_step_norm: float
+    stage4_pred_ext_bits: int
+    stage4_pred_depth_scale_real: float
     nn_grid_cell: int
     nn_hidden_ch: int
     nn_latent_ch: int
@@ -866,6 +1062,7 @@ def optimize_stage3_joint(
     net: DepthCorrectionNet,
     latent_base: torch.Tensor,
     g_base_np: np.ndarray,
+    pred_depth_scale_real: float,
     K_fixed: np.ndarray,
     features: torch.Tensor,
     wx: torch.Tensor,
@@ -956,7 +1153,7 @@ def optimize_stage4_trajectory_smooth(
     Final output remains rvec_abs_final/tvec_abs_final/depth_canonical, so downstream
     converters remain compatible.
     """
-    log("Stage 4: constrained trajectory smoothing in camera-center / SO(3) space")
+    log("Stage 4: constrained trajectory smoothing plus actual predictor residual regularization + actual history-predictor residual loss")
     r_base = torch.tensor(r_stage3_np, device=device, dtype=dtype)
     t_base = torch.tensor(t_stage3_np, device=device, dtype=dtype)
     g_base = torch.tensor(g_base_np, device=device, dtype=dtype)
@@ -1011,6 +1208,19 @@ def optimize_stage4_trajectory_smooth(
             rot_acc_weight=cfg.stage4_rot_acc,
             rot_vel_weight=cfg.stage4_rot_vel,
         )
+        if cfg.stage4_pred_weight > 0:
+            loss_pred, pred_stats = actual_predictor_residual_surrogate_loss(
+                R_all,
+                t_all,
+                depth_scale_real=pred_depth_scale_real,
+                pred_n=cfg.stage4_pred_n,
+                pred_degree=cfg.stage4_pred_degree,
+                r_step=cfg.stage4_pred_r_step,
+                t_step_norm=cfg.stage4_pred_t_step_norm,
+            )
+        else:
+            loss_pred = torch.zeros_like(loss_pair)
+            pred_stats = {"pred_loss_r": 0.0, "pred_loss_t": 0.0, "pred_loss_total": 0.0}
         loss_reg = torch.zeros_like(loss_pair)
         if cfg.stage4_pose_prior > 0:
             loss_reg = loss_reg + float(cfg.stage4_pose_prior) * (
@@ -1021,7 +1231,7 @@ def optimize_stage4_trajectory_smooth(
             if cfg.stage4_depth_prior > 0:
                 loss_reg = loss_reg + float(cfg.stage4_depth_prior) * torch.mean((g_maps - g_base) ** 2)
 
-        loss = float(cfg.stage4_pair_weight) * loss_pair + loss_smooth + loss_reg
+        loss = float(cfg.stage4_pair_weight) * loss_pair + loss_smooth + float(cfg.stage4_pred_weight) * loss_pred + loss_reg
         loss.backward()
         opt.step()
 
@@ -1031,13 +1241,17 @@ def optimize_stage4_trajectory_smooth(
                 "loss": float(loss.detach().cpu()),
                 "pair_loss": float(loss_pair.detach().cpu()),
                 "smooth_loss": float(loss_smooth.detach().cpu()),
+                "pred_loss": float(loss_pred.detach().cpu()),
+                "pred_loss_r": float(pred_stats["pred_loss_r"]),
+                "pred_loss_t": float(pred_stats["pred_loss_t"]),
                 "reg_loss": float(loss_reg.detach().cpu()),
             }
             hist.append(rec)
             log(
                 f"Stage4 iter {it:04d}/{cfg.stage4_iters}: "
                 f"loss={rec['loss']:.6f}, pair={rec['pair_loss']:.6f}, "
-                f"smooth={rec['smooth_loss']:.6f}, reg={rec['reg_loss']:.6f}"
+                f"smooth={rec['smooth_loss']:.6f}, pred={rec['pred_loss']:.6f}, "
+                f"reg={rec['reg_loss']:.6f}"
             )
 
     with torch.no_grad():
@@ -1329,6 +1543,13 @@ def run(args: argparse.Namespace) -> None:
         stage4_rot_vel=args.stage4_rot_vel,
         stage4_pose_prior=args.stage4_pose_prior,
         stage4_depth_prior=args.stage4_depth_prior,
+        stage4_pred_weight=args.stage4_pred_weight,
+        stage4_pred_n=args.stage4_pred_n,
+        stage4_pred_degree=args.stage4_pred_degree,
+        stage4_pred_r_step=args.stage4_pred_r_step,
+        stage4_pred_t_step_norm=args.stage4_pred_t_step_norm,
+        stage4_pred_ext_bits=args.stage4_pred_ext_bits,
+        stage4_pred_depth_scale_real=args.stage4_pred_depth_scale_real,
         nn_grid_cell=args.nn_grid_cell,
         nn_hidden_ch=args.nn_hidden_ch,
         nn_latent_ch=args.nn_latent_ch,
@@ -1433,9 +1654,29 @@ def run(args: argparse.Namespace) -> None:
     stage3_eval = evaluate_on_cache("stage3_joint", pair_cache_np, r_stage3, t_stage3, K_fixed, w, h, cfg.z_sign, g_stage3)
     log(f"Stage3 EPE: mean={stage3_eval['mean_of_mean_epe']:.6f}, p95={stage3_eval['mean_of_p95_epe']:.6f}")
 
+    # Match the actual downstream coding script: t is normalized by depth_scale_real before residual coding.
+    # If not explicitly provided, estimate the same fixed-point depth scale from the Stage-3 corrected depth.
+    if cfg.stage4_pred_depth_scale_real > 0:
+        pred_depth_scale_real = float(cfg.stage4_pred_depth_scale_real)
+    else:
+        depth_stage3_for_scale = apply_depth_correction_full(depth, g_stage3, h, w)
+        pred_depth_scale_real = float(choose_depth_scale_fixed_point(
+            depth_stage3_for_scale, cfg.depth_scale_percentile, cfg.depth_scale_precision, 10
+        )["depth_scale_real"])
+    log(f"Stage4 predictor-loss depth_scale_real={pred_depth_scale_real:.9g}")
+
+    stage3_pred_bits = estimate_actual_history_pred_bits_np(
+        r_stage3, t_stage3, pred_depth_scale_real,
+        pred_n=cfg.stage4_pred_n, pred_degree=cfg.stage4_pred_degree,
+        r_step=cfg.stage4_pred_r_step, t_step_norm=cfg.stage4_pred_t_step_norm,
+        ext_bits=cfg.stage4_pred_ext_bits,
+    )
+    log(f"Stage3 actual-predictor bits: avg={stage3_pred_bits['avg_bits_per_frame']:.3f}, "
+        f"r={stage3_pred_bits['avg_r_bits_per_frame']:.3f}, t={stage3_pred_bits['avg_t_bits_per_frame']:.3f}")
+
     if cfg.stage4_iters > 0:
         r_stage4, t_stage4, latent_stage4, g_stage4, stage4_hist = optimize_stage4_trajectory_smooth(
-            pair_cache_t, r_stage3, t_stage3, net, latent_stage3, g_stage3, K_fixed,
+            pair_cache_t, r_stage3, t_stage3, net, latent_stage3, g_stage3, pred_depth_scale_real, K_fixed,
             features, wx_t, wy_t, cfg, w, h, device, dtype
         )
     else:
@@ -1446,8 +1687,17 @@ def run(args: argparse.Namespace) -> None:
         g_stage4 = g_stage3
         stage4_hist = []
 
-    stage4_eval = evaluate_on_cache("stage4_trajectory_smooth", pair_cache_np, r_stage4, t_stage4, K_fixed, w, h, cfg.z_sign, g_stage4)
+    stage4_eval = evaluate_on_cache("stage4_trajectory_smooth_predloss", pair_cache_np, r_stage4, t_stage4, K_fixed, w, h, cfg.z_sign, g_stage4)
     log(f"Stage4 EPE: mean={stage4_eval['mean_of_mean_epe']:.6f}, p95={stage4_eval['mean_of_p95_epe']:.6f}")
+
+    stage4_pred_bits = estimate_actual_history_pred_bits_np(
+        r_stage4, t_stage4, pred_depth_scale_real,
+        pred_n=cfg.stage4_pred_n, pred_degree=cfg.stage4_pred_degree,
+        r_step=cfg.stage4_pred_r_step, t_step_norm=cfg.stage4_pred_t_step_norm,
+        ext_bits=cfg.stage4_pred_ext_bits,
+    )
+    log(f"Stage4 actual-predictor bits: avg={stage4_pred_bits['avg_bits_per_frame']:.3f}, "
+        f"r={stage4_pred_bits['avg_r_bits_per_frame']:.3f}, t={stage4_pred_bits['avg_t_bits_per_frame']:.3f}")
 
     log("Applying final NN depth correction and writing depth YUV")
     depth_canonical = apply_depth_correction_full(depth, g_stage4, h, w)
@@ -1486,6 +1736,9 @@ def run(args: argparse.Namespace) -> None:
         "stage2_eval_json": np.asarray(json.dumps(stage2_eval, ensure_ascii=False), dtype=object),
         "stage3_eval_json": np.asarray(json.dumps(stage3_eval, ensure_ascii=False), dtype=object),
         "stage4_eval_json": np.asarray(json.dumps(stage4_eval, ensure_ascii=False), dtype=object),
+        "stage3_actual_pred_bits_json": np.asarray(json.dumps(stage3_pred_bits, ensure_ascii=False), dtype=object),
+        "stage4_actual_pred_bits_json": np.asarray(json.dumps(stage4_pred_bits, ensure_ascii=False), dtype=object),
+        "stage4_pred_depth_scale_real": np.asarray(pred_depth_scale_real, dtype=np.float32),
         "stage1_history_json": np.asarray(json.dumps(stage1_hist, ensure_ascii=False), dtype=object),
         "stage2_history_json": np.asarray(json.dumps(stage2_hist, ensure_ascii=False), dtype=object),
         "stage3_history_json": np.asarray(json.dumps(stage3_hist, ensure_ascii=False), dtype=object),
@@ -1533,7 +1786,11 @@ def run(args: argparse.Namespace) -> None:
             "stage1_rt": stage1_eval,
             "stage2_t_nn_depth": stage2_eval,
             "stage3_joint": stage3_eval,
-            "stage4_trajectory_smooth": stage4_eval,
+            "stage4_trajectory_smooth_predloss": stage4_eval,
+        },
+        "actual_predictor_bit_estimate": {
+            "stage3": stage3_pred_bits,
+            "stage4": stage4_pred_bits,
         },
         "depth_yuv": depth_yuv_meta,
         "notes": [
@@ -1542,6 +1799,7 @@ def run(args: argparse.Namespace) -> None:
             "Depth correction is produced by a tiny low-res NN during encoder-side optimization only.",
             "Decoder does not need the NN; it only receives the final corrected depth YUV and fixed-K camera JSONL.",
             "Stage4 smooths camera center C=-R^T t and SO(3) angular velocity while keeping the same final output keys.",
+            "Stage4 also penalizes the actual current_to_previous param6 history-predictor residual used by the downstream coding script.",
             "Intrinsic is fixed once per RAP; no per-frame intrinsic delta is written.",
         ],
     }
@@ -1563,6 +1821,11 @@ def run(args: argparse.Namespace) -> None:
     print(f"stage2  mean/p95: {stage2_eval['mean_of_mean_epe']:.6f} / {stage2_eval['mean_of_p95_epe']:.6f} px")
     print(f"stage3  mean/p95: {stage3_eval['mean_of_mean_epe']:.6f} / {stage3_eval['mean_of_p95_epe']:.6f} px")
     print(f"stage4  mean/p95: {stage4_eval['mean_of_mean_epe']:.6f} / {stage4_eval['mean_of_p95_epe']:.6f} px")
+    print("------------------------------------------------------------")
+    print(f"stage3 actual pred bits/frame: {stage3_pred_bits['avg_bits_per_frame']:.3f} "
+          f"(R={stage3_pred_bits['avg_r_bits_per_frame']:.3f}, T={stage3_pred_bits['avg_t_bits_per_frame']:.3f})")
+    print(f"stage4 actual pred bits/frame: {stage4_pred_bits['avg_bits_per_frame']:.3f} "
+          f"(R={stage4_pred_bits['avg_r_bits_per_frame']:.3f}, T={stage4_pred_bits['avg_t_bits_per_frame']:.3f})")
     print("------------------------------------------------------------")
     print(f"geometry npz    : {out_npz}")
     print(f"camera jsonl    : {out_jsonl}")
@@ -1635,6 +1898,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage4-rot-vel", type=float, default=0.0, help="Optional angular velocity damping")
     p.add_argument("--stage4-pose-prior", type=float, default=1e-2, help="Prior toward Stage3 r/C to prevent projection drift")
     p.add_argument("--stage4-depth-prior", type=float, default=1.0, help="If latent is tuned, regularize Stage4 g map toward Stage3 g map")
+    p.add_argument("--stage4-pred-weight", type=float, default=0.05, help="Weight for actual history-predictor residual surrogate on current_to_previous param6")
+    p.add_argument("--stage4-pred-n", type=int, default=3, help="Match downstream coding script --pred-n")
+    p.add_argument("--stage4-pred-degree", type=int, default=2, help="Match downstream coding script --pred-degree")
+    p.add_argument("--stage4-pred-r-step", type=float, default=1.0/16.0, help="Match downstream coding script --r-step")
+    p.add_argument("--stage4-pred-t-step-norm", type=float, default=1.0/4.0, help="Match downstream coding script --t-step-norm")
+    p.add_argument("--stage4-pred-ext-bits", type=int, default=16, help="Match downstream coding script --ext-bits for exact final bit estimate")
+    p.add_argument("--stage4-pred-depth-scale-real", type=float, default=0.0, help="If >0, use this depth_scale_real for t/depth_scale predictor loss; otherwise auto-estimate from Stage3 depth")
 
     # NN depth correction.
     p.add_argument("--nn-grid-cell", type=int, default=64, help="Low-res correction grid cell size in source pixels. 64 -> ~17x30 at 1080p")
@@ -1666,6 +1936,16 @@ def main() -> None:
         raise ValueError("--nn-grid-cell must be positive")
     if args.stage4_iters < 0:
         raise ValueError("--stage4-iters must be non-negative")
+    if args.stage4_pred_n <= 0:
+        raise ValueError("--stage4-pred-n must be positive")
+    if args.stage4_pred_degree < 0:
+        raise ValueError("--stage4-pred-degree must be non-negative")
+    if args.stage4_pred_r_step <= 0:
+        raise ValueError("--stage4-pred-r-step must be positive")
+    if args.stage4_pred_t_step_norm <= 0:
+        raise ValueError("--stage4-pred-t-step-norm must be positive")
+    if args.stage4_pred_ext_bits < 2:
+        raise ValueError("--stage4-pred-ext-bits must be >= 2")
     run(args)
 
 
