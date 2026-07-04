@@ -305,6 +305,9 @@ def actual_predictor_residual_surrogate_loss(
     pred_degree: int,
     r_step: float,
     t_step_norm: float,
+    loss_mode: str = "q_l1",
+    r_weight: float = 1.0,
+    t_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Smooth surrogate for the real residual coding path:
@@ -320,14 +323,42 @@ def actual_predictor_residual_surrogate_loss(
     body = residual[1:]
     q_r_abs = torch.abs(body[:, :3] / float(r_step))
     q_t_abs = torch.abs(body[:, 3:] / float(t_step_norm))
+
+    mode = str(loss_mode).lower()
     log2 = math.log(2.0)
-    loss_r = torch.mean(torch.log1p(2.0 * q_r_abs) / log2)
-    loss_t = torch.mean(torch.log1p(2.0 * q_t_abs) / log2)
-    loss = loss_r + loss_t
+
+    # eg_log approximates Exp-Golomb bit growth, but its gradient becomes very weak
+    # for large residuals. q_l1/q_l2 are intentionally more aggressive and are better
+    # for driving residuals across quantization-bin boundaries with fine steps.
+    if mode in ("eg_log", "log", "bit_log"):
+        loss_r = torch.mean(torch.log1p(2.0 * q_r_abs) / log2)
+        loss_t = torch.mean(torch.log1p(2.0 * q_t_abs) / log2)
+    elif mode in ("q_l1", "l1", "abs"):
+        loss_r = torch.mean(q_r_abs)
+        loss_t = torch.mean(q_t_abs)
+    elif mode in ("q_sqrt", "sqrt"):
+        loss_r = torch.mean(torch.sqrt(q_r_abs + 1e-12))
+        loss_t = torch.mean(torch.sqrt(q_t_abs + 1e-12))
+    elif mode in ("q_huber", "huber"):
+        # Huber in quant units. Near zero it behaves like L2; outside 1 q-step like L1.
+        loss_r = torch.mean(torch.nn.functional.huber_loss(q_r_abs, torch.zeros_like(q_r_abs), delta=1.0, reduction="none"))
+        loss_t = torch.mean(torch.nn.functional.huber_loss(q_t_abs, torch.zeros_like(q_t_abs), delta=1.0, reduction="none"))
+    elif mode in ("q_l2", "l2", "mse"):
+        loss_r = torch.mean(q_r_abs * q_r_abs)
+        loss_t = torch.mean(q_t_abs * q_t_abs)
+    else:
+        raise ValueError(f"Unknown stage4_pred_loss_mode: {loss_mode}")
+
+    loss = float(r_weight) * loss_r + float(t_weight) * loss_t
     stats = {
+        "pred_loss_mode": mode,
         "pred_loss_r": float(loss_r.detach().cpu()),
         "pred_loss_t": float(loss_t.detach().cpu()),
         "pred_loss_total": float(loss.detach().cpu()),
+        "mean_abs_q_r": float(torch.mean(q_r_abs).detach().cpu()),
+        "mean_abs_q_t": float(torch.mean(q_t_abs).detach().cpu()),
+        "p95_abs_q_r": float(torch.quantile(q_r_abs.reshape(-1), 0.95).detach().cpu()),
+        "p95_abs_q_t": float(torch.quantile(q_t_abs.reshape(-1), 0.95).detach().cpu()),
     }
     return loss, stats
 
@@ -868,6 +899,9 @@ class OptimConfig:
     stage4_pose_prior: float
     stage4_depth_prior: float
     stage4_pred_weight: float
+    stage4_pred_loss_mode: str
+    stage4_pred_r_weight: float
+    stage4_pred_t_weight: float
     stage4_pred_n: int
     stage4_pred_degree: int
     stage4_pred_r_step: float
@@ -1218,6 +1252,9 @@ def optimize_stage4_trajectory_smooth(
                 pred_degree=cfg.stage4_pred_degree,
                 r_step=cfg.stage4_pred_r_step,
                 t_step_norm=cfg.stage4_pred_t_step_norm,
+                loss_mode=cfg.stage4_pred_loss_mode,
+                r_weight=cfg.stage4_pred_r_weight,
+                t_weight=cfg.stage4_pred_t_weight,
             )
         else:
             loss_pred = torch.zeros_like(loss_pair)
@@ -1545,6 +1582,9 @@ def run(args: argparse.Namespace) -> None:
         stage4_pose_prior=args.stage4_pose_prior,
         stage4_depth_prior=args.stage4_depth_prior,
         stage4_pred_weight=args.stage4_pred_weight,
+        stage4_pred_loss_mode=args.stage4_pred_loss_mode,
+        stage4_pred_r_weight=args.stage4_pred_r_weight,
+        stage4_pred_t_weight=args.stage4_pred_t_weight,
         stage4_pred_n=args.stage4_pred_n,
         stage4_pred_degree=args.stage4_pred_degree,
         stage4_pred_r_step=args.stage4_pred_r_step,
@@ -1924,6 +1964,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage4-pose-prior", type=float, default=1e-2, help="Prior toward Stage3 r/C to prevent projection drift")
     p.add_argument("--stage4-depth-prior", type=float, default=1.0, help="If latent is tuned, regularize Stage4 g map toward Stage3 g map")
     p.add_argument("--stage4-pred-weight", type=float, default=0.05, help="Weight for actual history-predictor residual surrogate on current_to_previous param6")
+    p.add_argument("--stage4-pred-loss-mode", choices=["eg_log", "q_l1", "q_huber", "q_l2", "q_sqrt"], default="q_l1", help="Surrogate mode. q_l1/q_huber are stronger than eg_log for fine quant steps.")
+    p.add_argument("--stage4-pred-r-weight", type=float, default=1.0, help="Relative weight for rotation residual term in pred loss")
+    p.add_argument("--stage4-pred-t-weight", type=float, default=1.0, help="Relative weight for translation residual term in pred loss")
     p.add_argument("--stage4-pred-n", type=int, default=3, help="Match downstream coding script --pred-n")
     p.add_argument("--stage4-pred-degree", type=int, default=2, help="Match downstream coding script --pred-degree")
     p.add_argument("--stage4-pred-r-step", type=float, default=1.0/16.0, help="Match downstream coding script --r-step")
