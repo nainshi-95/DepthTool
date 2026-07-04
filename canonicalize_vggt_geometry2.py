@@ -37,6 +37,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 import unicodedata
 from dataclasses import asdict, dataclass
@@ -1834,6 +1835,30 @@ def run(args: argparse.Namespace) -> None:
     print("============================================================")
 
 
+def _normalize_legacy_cli_args(argv: list[str]) -> list[str]:
+    """Accept common accidental forms such as `dtype float32` or `dtype=float32`.
+
+    argparse normally requires `--dtype float32`.  This keeps the normal form,
+    but also rewrites legacy/mistyped dtype tokens so older command lines do not fail.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "dtype":
+            out.append("--dtype")
+        elif tok.startswith("dtype="):
+            out.append("--dtype=" + tok.split("=", 1)[1])
+        elif tok == "device":
+            out.append("--device")
+        elif tok.startswith("device="):
+            out.append("--device=" + tok.split("=", 1)[1])
+        else:
+            out.append(tok)
+        i += 1
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fixed-K R|t + constrained tiny-NN depth correction + Stage4 trajectory smoothing")
     p.add_argument("--npz", required=True, help="VGGT-Omega output NPZ")
@@ -1925,7 +1950,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compressed-npz", action="store_true")
     p.add_argument("--save-original-debug", action="store_true")
     p.add_argument("--save-nn-state", action="store_true")
-    return p.parse_args()
+    return p.parse_args(_normalize_legacy_cli_args(sys.argv[1:]))
 
 
 def main() -> None:
