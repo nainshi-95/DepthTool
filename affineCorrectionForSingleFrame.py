@@ -6,6 +6,11 @@ Single-frame ref->target camera-projection warp test using OpenCV ECC.
 This script is for testing arbitrary ref/target pairs, e.g. ref=0 -> tar=16.
 It optionally applies a global residual transform estimated by cv2.findTransformECC().
 
+Recommended geometry-oriented mode:
+  Use Scharr structure images instead of raw Y for ECC, and estimate the global
+  transform only from valid active strong-structure pixels. This favors pillars,
+  window frames, wall boundaries, and other geometric edges over raw PSNR.
+
 CP modes:
   --affine-cp-num 2: ECC affine estimation, code CP0/CP1, constrained 4-param affine decode.
   --affine-cp-num 3: ECC affine estimation, code CP0/CP1/CP2, full affine decode.
@@ -650,6 +655,172 @@ def normalize_for_ecc(img, bit_depth):
     return np.clip(x / maxv, 0.0, 1.0).astype(np.float32)
 
 
+def make_structure_image(
+    img,
+    bit_depth,
+    mode="scharr_mag",
+    log_gain=20.0,
+    pre_blur=0,
+):
+    """Build a geometry-oriented image for ECC.
+
+    The output is float32 [0,1]. It intentionally emphasizes structural
+    boundaries such as pillars, windows, and wall/floor edges rather than raw
+    photometric similarity.
+    """
+    y = normalize_for_ecc(img, bit_depth)
+
+    if int(pre_blur) > 0:
+        k = 2 * int(pre_blur) + 1
+        y = cv2.GaussianBlur(y, (k, k), 0)
+
+    gx = cv2.Scharr(y, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(y, cv2.CV_32F, 0, 1)
+
+    mode = str(mode)
+    if mode == "scharr_mag":
+        s = np.sqrt(gx * gx + gy * gy)
+    elif mode == "scharr_l1":
+        s = np.abs(gx) + np.abs(gy)
+    elif mode == "scharr_x":
+        s = np.abs(gx)
+    elif mode == "scharr_y":
+        s = np.abs(gy)
+    elif mode == "scharr_x_weighted":
+        # Buildings/indoor scenes often need vertical-line alignment strongly.
+        s = 0.75 * np.abs(gx) + 0.25 * np.abs(gy)
+    else:
+        raise ValueError(f"Unsupported structure mode: {mode}")
+
+    # Compress very strong edges so one high-contrast edge does not dominate.
+    if float(log_gain) > 0.0:
+        s = np.log1p(float(log_gain) * s)
+
+    m = float(np.max(s))
+    if m > 1e-8:
+        s = s / m
+
+    return np.clip(s, 0.0, 1.0).astype(np.float32)
+
+
+def make_structure_mask_u8(
+    structure,
+    base_mask_u8,
+    keep_percent=35.0,
+    dilate=1,
+):
+    """Keep only strong-structure pixels inside the base projection mask."""
+    base = base_mask_u8 > 0
+    valid_vals = structure[base]
+
+    stats = {
+        "base_count": int(np.count_nonzero(base)),
+        "keep_percent": float(keep_percent),
+        "threshold": None,
+        "structure_count": 0,
+        "final_count": 0,
+        "final_ratio_vs_base": 0.0,
+    }
+
+    if valid_vals.size < 100:
+        return base_mask_u8.copy(), stats
+
+    keep_percent = float(keep_percent)
+    if keep_percent >= 99.999:
+        mask = base.copy()
+        thr = float(np.min(valid_vals))
+    else:
+        keep_percent = max(0.1, min(100.0, keep_percent))
+        percentile = 100.0 - keep_percent
+        thr = float(np.percentile(valid_vals, percentile))
+        mask = base & (structure >= thr)
+
+    stats["threshold"] = thr
+    stats["structure_count"] = int(np.count_nonzero(mask))
+
+    mask_u8 = (mask.astype(np.uint8) * 255)
+
+    if int(dilate) > 0:
+        k = 2 * int(dilate) + 1
+        kernel = np.ones((k, k), dtype=np.uint8)
+        mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+        mask_u8 = np.where(base, mask_u8, 0).astype(np.uint8)
+
+    stats["final_count"] = int(np.count_nonzero(mask_u8))
+    if stats["base_count"] > 0:
+        stats["final_ratio_vs_base"] = float(stats["final_count"] / stats["base_count"])
+
+    return mask_u8, stats
+
+
+def prepare_ecc_input_images_and_mask(
+    cur_y,
+    cam_warp_y,
+    valid_mask_u8,
+    bit_depth,
+    ecc_input="structure",
+    structure_mode="scharr_mag",
+    structure_keep_percent=35.0,
+    structure_mask_dilate=1,
+    structure_log_gain=20.0,
+    structure_pre_blur=0,
+):
+    """Prepare images/mask for OpenCV ECC.
+
+    ecc_input='luma' reproduces ordinary Y-ECC.
+    ecc_input='structure' uses Scharr-based structure images and a strong-edge mask.
+    """
+    ecc_input = str(ecc_input)
+    stats = {
+        "ecc_input": ecc_input,
+        "mask_count_valid": int(np.count_nonzero(valid_mask_u8)),
+        "mask_count_used": int(np.count_nonzero(valid_mask_u8)),
+    }
+
+    if ecc_input == "luma":
+        template = normalize_for_ecc(cur_y, bit_depth)
+        inp = normalize_for_ecc(cam_warp_y, bit_depth)
+        mask = valid_mask_u8.copy()
+        return template, inp, mask, stats
+
+    if ecc_input != "structure":
+        raise ValueError(f"Unsupported --affine-ecc-input: {ecc_input}")
+
+    template = make_structure_image(
+        cur_y,
+        bit_depth,
+        mode=structure_mode,
+        log_gain=structure_log_gain,
+        pre_blur=structure_pre_blur,
+    )
+    inp = make_structure_image(
+        cam_warp_y,
+        bit_depth,
+        mode=structure_mode,
+        log_gain=structure_log_gain,
+        pre_blur=structure_pre_blur,
+    )
+
+    mask, mask_stats = make_structure_mask_u8(
+        template,
+        valid_mask_u8,
+        keep_percent=structure_keep_percent,
+        dilate=structure_mask_dilate,
+    )
+
+    stats.update({
+        "structure_mode": str(structure_mode),
+        "structure_keep_percent": float(structure_keep_percent),
+        "structure_mask_dilate": int(structure_mask_dilate),
+        "structure_log_gain": float(structure_log_gain),
+        "structure_pre_blur": int(structure_pre_blur),
+        "structure_mask": mask_stats,
+        "mask_count_used": int(np.count_nonzero(mask)),
+    })
+
+    return template, inp, mask, stats
+
+
 def make_valid_u8_mask(map_x, map_y, w, h, erode=0, active_region=None):
     valid = (
         np.isfinite(map_x)
@@ -691,6 +862,12 @@ def estimate_global_transform_bias_ecc(
     max_iters=50,
     eps=1e-4,
     gauss_filt_size=5,
+    ecc_input="structure",
+    structure_mode="scharr_mag",
+    structure_keep_percent=35.0,
+    structure_mask_dilate=1,
+    structure_log_gain=20.0,
+    structure_pre_blur=0,
 ):
     """
     Estimate one global coordinate-domain residual transform by OpenCV ECC.
@@ -714,11 +891,21 @@ def estimate_global_transform_bias_ecc(
     if cp_num not in (2, 3, 4):
         raise ValueError(f"cp_num must be 2, 3, or 4, got {cp_num}")
 
-    if np.count_nonzero(valid_mask_u8) < 100:
-        return identity_transform_matrix(cp_num), False, None
+    template, inp, ecc_mask_u8, ecc_stats = prepare_ecc_input_images_and_mask(
+        cur_y=cur_y,
+        cam_warp_y=cam_warp_y,
+        valid_mask_u8=valid_mask_u8,
+        bit_depth=bit_depth,
+        ecc_input=ecc_input,
+        structure_mode=structure_mode,
+        structure_keep_percent=structure_keep_percent,
+        structure_mask_dilate=structure_mask_dilate,
+        structure_log_gain=structure_log_gain,
+        structure_pre_blur=structure_pre_blur,
+    )
 
-    template = normalize_for_ecc(cur_y, bit_depth)
-    inp = normalize_for_ecc(cam_warp_y, bit_depth)
+    if np.count_nonzero(ecc_mask_u8) < 100:
+        return identity_transform_matrix(cp_num), False, None, ecc_stats, ecc_mask_u8
 
     if cp_num == 4:
         motion_type = cv2.MOTION_HOMOGRAPHY
@@ -740,12 +927,12 @@ def estimate_global_transform_bias_ecc(
             warpMatrix=warp,
             motionType=motion_type,
             criteria=criteria,
-            inputMask=valid_mask_u8,
+            inputMask=ecc_mask_u8,
             gaussFiltSize=int(gauss_filt_size),
         )
-        return warp.astype(np.float32), True, float(cc)
+        return warp.astype(np.float32), True, float(cc), ecc_stats, ecc_mask_u8
     except cv2.error:
-        return identity_transform_matrix(cp_num), False, None
+        return identity_transform_matrix(cp_num), False, None, ecc_stats, ecc_mask_u8
 
 
 def transform_cp_points(w, h, cp_num):
@@ -1342,7 +1529,7 @@ def main():
     ap.add_argument("--out-json", required=True, help="Single-frame warp stats JSON")
     ap.add_argument("--out-cam-yuv", default=None, help="Optional cam-proj-only warped YUV")
     ap.add_argument("--out-target-yuv", default=None, help="Optional padded target frame YUV")
-    ap.add_argument("--out-mask-yuv", default=None, help="Optional valid mask YUV")
+    ap.add_argument("--out-mask-yuv", default=None, help="Optional ECC mask YUV. In structure mode this is valid+strong-structure mask.")
 
     ap.add_argument(
         "--warp-filter",
@@ -1361,6 +1548,33 @@ def main():
     ap.add_argument("--affine-ecc-eps", type=float, default=1e-4)
     ap.add_argument("--affine-ecc-gauss", type=int, default=5)
 
+    # Geometry-oriented ECC input. Recommended for MV/merge quality.
+    ap.add_argument(
+        "--affine-ecc-input",
+        choices=["structure", "luma"],
+        default="structure",
+        help="structure: Scharr edge/geometry ECC, luma: raw Y ECC.",
+    )
+    ap.add_argument(
+        "--structure-mode",
+        choices=["scharr_mag", "scharr_l1", "scharr_x", "scharr_y", "scharr_x_weighted"],
+        default="scharr_mag",
+    )
+    ap.add_argument(
+        "--structure-keep-percent",
+        type=float,
+        default=35.0,
+        help="Keep top-N percent strongest target structure pixels inside valid active mask.",
+    )
+    ap.add_argument(
+        "--structure-mask-dilate",
+        type=int,
+        default=1,
+        help="Dilate strong-structure mask by this radius, then clamp to valid mask.",
+    )
+    ap.add_argument("--structure-log-gain", type=float, default=20.0)
+    ap.add_argument("--structure-pre-blur", type=int, default=0)
+
     ap.add_argument("--overwrite", action="store_true")
 
     args = ap.parse_args()
@@ -1375,6 +1589,12 @@ def main():
         raise ValueError("--affine-cp-bits must be >= 2")
     if args.affine_ecc_gauss <= 0 or args.affine_ecc_gauss % 2 == 0:
         raise ValueError("--affine-ecc-gauss must be a positive odd integer")
+    if args.structure_keep_percent <= 0 or args.structure_keep_percent > 100:
+        raise ValueError("--structure-keep-percent must be in (0, 100]")
+    if args.structure_mask_dilate < 0:
+        raise ValueError("--structure-mask-dilate must be non-negative")
+    if args.structure_pre_blur < 0:
+        raise ValueError("--structure-pre-blur must be non-negative")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -1467,9 +1687,6 @@ def main():
         active_region=(ys_active, xs_active),
     )
 
-    if args.out_mask_yuv is not None:
-        write_mask_yuv420(Path(args.out_mask_yuv), valid_mask_u8, bit_depth)
-
     if args.warp_filter == "bilinear":
         wy_cam, wu_cam, wv_cam = backward_warp_yuv420_bilinear(
             ref_y_pad, ref_u_pad, ref_v_pad, map_x, map_y, bit_depth
@@ -1501,12 +1718,24 @@ def main():
     affine_cp_clipped = False
     affine_matrix_est = identity_transform_matrix(args.affine_cp_num)
     affine_matrix_dec = identity_transform_matrix(args.affine_cp_num)
+    affine_ecc_stats = {
+        "ecc_input": str(args.affine_ecc_input),
+        "mask_count_valid": int(np.count_nonzero(valid_mask_u8)),
+        "mask_count_used": int(np.count_nonzero(valid_mask_u8)),
+    }
+    ecc_mask_u8 = valid_mask_u8.copy()
     map_x_final = map_x
     map_y_final = map_y
 
     if affine_enabled:
         affine_flag_bits = 1
-        affine_matrix_est, affine_success, affine_score = estimate_global_transform_bias_ecc(
+        (
+            affine_matrix_est,
+            affine_success,
+            affine_score,
+            affine_ecc_stats,
+            ecc_mask_u8,
+        ) = estimate_global_transform_bias_ecc(
             cur_y=tar_y_pad,
             cam_warp_y=wy_cam,
             valid_mask_u8=valid_mask_u8,
@@ -1515,6 +1744,12 @@ def main():
             max_iters=args.affine_ecc_iters,
             eps=args.affine_ecc_eps,
             gauss_filt_size=args.affine_ecc_gauss,
+            ecc_input=args.affine_ecc_input,
+            structure_mode=args.structure_mode,
+            structure_keep_percent=args.structure_keep_percent,
+            structure_mask_dilate=args.structure_mask_dilate,
+            structure_log_gain=args.structure_log_gain,
+            structure_pre_blur=args.structure_pre_blur,
         )
 
         if affine_success:
@@ -1553,6 +1788,10 @@ def main():
                 affine_matrix_dec,
             )
 
+    if args.out_mask_yuv is not None:
+        # In structure mode this is the actual ECC mask, not just projection validity.
+        write_mask_yuv420(Path(args.out_mask_yuv), ecc_mask_u8, bit_depth)
+
     if args.warp_filter == "bilinear":
         wy_final, wu_final, wv_final = backward_warp_yuv420_bilinear(
             ref_y_pad, ref_u_pad, ref_v_pad, map_x_final, map_y_final, bit_depth
@@ -1574,6 +1813,8 @@ def main():
 
     valid_ratio_active = float(np.count_nonzero(valid_mask_u8[ys_active, xs_active]) / max(src_w * src_h, 1))
     valid_ratio_coded = float(np.count_nonzero(valid_mask_u8) / max(coded_w * coded_h, 1))
+    ecc_mask_ratio_active = float(np.count_nonzero(ecc_mask_u8[ys_active, xs_active]) / max(src_w * src_h, 1))
+    ecc_mask_ratio_coded = float(np.count_nonzero(ecc_mask_u8) / max(coded_w * coded_h, 1))
 
     result = {
         "ref_idx": int(args.ref_idx),
@@ -1594,6 +1835,8 @@ def main():
         "projection_mode": "target depth backward projection, ref->target warp",
         "valid_ratio_active": valid_ratio_active,
         "valid_ratio_coded": valid_ratio_coded,
+        "ecc_mask_ratio_active": ecc_mask_ratio_active,
+        "ecc_mask_ratio_coded": ecc_mask_ratio_coded,
         "warp_filter": args.warp_filter,
         "cam_proj_only": {
             "psnr_y_active": json_safe_float(psnr_y_active_cam_only),
@@ -1626,6 +1869,8 @@ def main():
                 "iters": int(args.affine_ecc_iters),
                 "eps": float(args.affine_ecc_eps),
                 "gauss_filt_size": int(args.affine_ecc_gauss),
+                "input": str(args.affine_ecc_input),
+                "stats": affine_ecc_stats,
             },
         },
         "final": {
@@ -1656,6 +1901,7 @@ def main():
     print(f"source size            : {src_w}x{src_h}")
     print(f"coded size             : {coded_w}x{coded_h}")
     print(f"valid ratio active     : {valid_ratio_active:.4f}")
+    print(f"ECC mask ratio active  : {ecc_mask_ratio_active:.4f}")
     print(f"warp filter            : {args.warp_filter}")
     print("------------------------------------------------------------")
     print(f"cam-only PSNR active   : {psnr_y_active_cam_only:.3f} dB")
@@ -1668,6 +1914,10 @@ def main():
     print(f"affine success         : {affine_success}")
     print(f"affine cp num          : {args.affine_cp_num}")
     print(f"affine cp step         : {args.affine_cp_step}")
+    print(f"affine ECC input       : {args.affine_ecc_input}")
+    if args.affine_ecc_input == "structure":
+        print(f"structure mode         : {args.structure_mode}")
+        print(f"structure keep percent : {args.structure_keep_percent}")
     print(f"affine cp q            : {affine_cp_q.astype(int).tolist()}")
     print(f"affine cp dec          : {affine_cp_dec.astype(float).tolist()}")
     print(f"affine bits            : {affine_flag_bits + affine_cp_bits_total}")
