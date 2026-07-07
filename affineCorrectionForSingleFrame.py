@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Single-frame ref->target camera-projection warp test.
+Single-frame ref->target camera-projection warp test using OpenCV ECC.
 
 This script is for testing arbitrary ref/target pairs, e.g. ref=0 -> tar=16.
-It optionally applies the same non-ECC vectorized LK/SSD global affine bias
-used in the sequence simulation. No cv2.findTransformECC() is used.
+It optionally applies a global residual transform estimated by cv2.findTransformECC().
+
+CP modes:
+  --affine-cp-num 2: ECC affine estimation, code CP0/CP1, constrained 4-param affine decode.
+  --affine-cp-num 3: ECC affine estimation, code CP0/CP1/CP2, full affine decode.
+  --affine-cp-num 4: ECC homography estimation, code 4 corner CPs, homography decode.
 
 Flow:
   1) Read ref frame, target frame, target depth, and camera parameters.
   2) Build target->reference projection map.
-  3) Warp reference frame to target frame.
-  4) Optional: estimate global affine bias from cam-warped Y to target Y
+  3) Warp reference frame to target frame by cam-proj only.
+  4) Optional: estimate global affine/homography bias from cam-warped Y to target Y
      using valid active-region pixels only.
-  5) Quantize/decode affine CP bias, apply it to the map, and warp again.
+  5) Quantize/decode CP bias, apply it to the map, and warp again.
 """
 
 import argparse
@@ -637,7 +641,7 @@ def backward_warp_yuv420_bilinear(prev_y, prev_u, prev_v, map_x, map_y, bit_dept
 
 
 # ============================================================
-# Global affine bias over cam-proj flow
+# Global transform bias over cam-proj flow: OpenCV ECC
 # ============================================================
 
 def normalize_for_ecc(img, bit_depth):
@@ -672,807 +676,144 @@ def make_valid_u8_mask(map_x, map_y, w, h, erode=0, active_region=None):
     return mask
 
 
-def bilinear_sample_vectorized(img, xs, ys):
-    """Vectorized bilinear sampling for float32 grayscale images."""
-    h, w = img.shape
-
-    xs = np.asarray(xs, dtype=np.float32)
-    ys = np.asarray(ys, dtype=np.float32)
-
-    valid = (
-        np.isfinite(xs)
-        & np.isfinite(ys)
-        & (xs >= 0.0)
-        & (xs <= w - 1)
-        & (ys >= 0.0)
-        & (ys <= h - 1)
-    )
-
-    xs_safe = np.clip(xs, 0.0, float(w - 1))
-    ys_safe = np.clip(ys, 0.0, float(h - 1))
-
-    x0 = np.floor(xs_safe).astype(np.int32)
-    y0 = np.floor(ys_safe).astype(np.int32)
-    x1 = np.minimum(x0 + 1, w - 1)
-    y1 = np.minimum(y0 + 1, h - 1)
-
-    fx = xs_safe - x0.astype(np.float32)
-    fy = ys_safe - y0.astype(np.float32)
-
-    p00 = img[y0, x0]
-    p01 = img[y0, x1]
-    p10 = img[y1, x0]
-    p11 = img[y1, x1]
-
-    a = p00 * (1.0 - fx) + p01 * fx
-    b = p10 * (1.0 - fx) + p11 * fx
-    out = a * (1.0 - fy) + b * fy
-
-    out = out.astype(np.float32)
-    out[~valid] = 0.0
-
-    return out, valid
+def identity_transform_matrix(cp_num):
+    if int(cp_num) == 4:
+        return np.eye(3, dtype=np.float32)
+    return np.eye(2, 3, dtype=np.float32)
 
 
-def params_to_affine_matrix_lk(p, w, h):
-    """
-    LK parameterization:
-      x' = x + p0 + p1*xn + p2*yn
-      y' = y + p3 + p4*xn + p5*yn
-      xn = (x-cx)/w, yn = (y-cy)/h
-
-    Return 2x3 matrix A such that [x',y'] = A*[x,y,1].
-    """
-    p = np.asarray(p, dtype=np.float64).reshape(6)
-    cx = 0.5 * float(w)
-    cy = 0.5 * float(h)
-    ww = max(float(w), 1e-12)
-    hh = max(float(h), 1e-12)
-
-    return np.array(
-        [
-            [1.0 + p[1] / ww, p[2] / hh, p[0] - p[1] * cx / ww - p[2] * cy / hh],
-            [p[4] / ww, 1.0 + p[5] / hh, p[3] - p[4] * cx / ww - p[5] * cy / hh],
-        ],
-        dtype=np.float32,
-    )
-
-
-def estimate_global_affine_bias_lk(
+def estimate_global_transform_bias_ecc(
     cur_y,
     cam_warp_y,
     valid_mask_u8,
     bit_depth,
-    max_iters=30,
+    cp_num=3,
+    max_iters=50,
     eps=1e-4,
-    sample_step=4,
-    normalize="zero_mean",
-    damping=1e-6,
-    max_update=4.0,
-    robust_iters=0,
-    outlier_percent=0.0,
-    min_samples=128,
-    min_keep_ratio=0.25,
+    gauss_filt_size=5,
 ):
     """
-    Fast non-ECC affine estimator with optional robust outlier rejection.
+    Estimate one global coordinate-domain residual transform by OpenCV ECC.
 
-    Objective:
-      align cam-proj-only warped Y to current Y using a vectorized
-      forward-additive Lucas-Kanade / SSD affine fitting loop.
+    cp_num=2/3:
+      Estimate affine transform with cv2.MOTION_AFFINE.
+      cp_num=2 later codes only CP0/CP1 and reconstructs a constrained
+      4-param similarity-like affine.
+      cp_num=3 codes full 3CP affine.
 
-    Robust loop:
-      1) fit affine with current inlier set
-      2) compute per-sample residual under fitted affine
-      3) remove the largest residual samples by percentile
-      4) repeat fitting
+    cp_num=4:
+      Estimate homography/projective transform with cv2.MOTION_HOMOGRAPHY.
+      Four corner CP biases are quantized and decoded, then a homography is
+      reconstructed with cv2.getPerspectiveTransform().
 
-    This is useful for large POC distance where occlusion, object motion,
-    depth error, and projection holes produce unstable samples.
-
-    Returns:
-      A, success, score, stats
-    where score is negative RMSE after fitting, so larger is better.
+    Returned transform M maps current-picture coordinates to coordinates in
+    the cam-proj-only warped image domain.  It is applied as residual bias:
+      final_map(x,y) = cam_proj_map(x,y) + ( M(x,y) - (x,y) )
     """
-    if sample_step <= 0:
-        raise ValueError("sample_step must be positive")
-    if min_samples <= 0:
-        raise ValueError("min_samples must be positive")
-    if min_keep_ratio <= 0.0 or min_keep_ratio > 1.0:
-        raise ValueError("min_keep_ratio must be in (0,1]")
+    cp_num = int(cp_num)
+    if cp_num not in (2, 3, 4):
+        raise ValueError(f"cp_num must be 2, 3, or 4, got {cp_num}")
 
-    mask = valid_mask_u8 > 0
-    if sample_step > 1:
-        sample_mask = np.zeros_like(mask, dtype=bool)
-        sample_mask[::sample_step, ::sample_step] = True
-        mask &= sample_mask
+    if np.count_nonzero(valid_mask_u8) < 100:
+        return identity_transform_matrix(cp_num), False, None
 
-    ys_i, xs_i = np.nonzero(mask)
-    total_initial = int(xs_i.size)
-    if total_initial < int(min_samples):
-        stats = {
-            "num_samples_initial": total_initial,
-            "num_samples_final": 0,
-            "robust_iters_requested": int(robust_iters),
-            "robust_iters_done": 0,
-            "reason": "too_few_initial_samples",
-        }
-        return np.eye(2, 3, dtype=np.float32), False, None, stats
+    template = normalize_for_ecc(cur_y, bit_depth)
+    inp = normalize_for_ecc(cam_warp_y, bit_depth)
 
-    maxv = float((1 << bit_depth) - 1)
-    T_img = np.clip(cur_y.astype(np.float32) / maxv, 0.0, 1.0)
-    I_img = np.clip(cam_warp_y.astype(np.float32) / maxv, 0.0, 1.0)
+    if cp_num == 4:
+        motion_type = cv2.MOTION_HOMOGRAPHY
+        warp = np.eye(3, dtype=np.float32)
+    else:
+        motion_type = cv2.MOTION_AFFINE
+        warp = np.eye(2, 3, dtype=np.float32)
 
-    # Central-difference gradients of input image. This maps cleanly to C++.
-    gy, gx = np.gradient(I_img)
-    gx = gx.astype(np.float32)
-    gy = gy.astype(np.float32)
-
-    xs = xs_i.astype(np.float32)
-    ys = ys_i.astype(np.float32)
-    T_all = T_img[ys_i, xs_i].astype(np.float32)
-
-    h, w = cur_y.shape
-    cx = 0.5 * float(w)
-    cy = 0.5 * float(h)
-    xn = ((xs - cx) / max(float(w), 1e-12)).astype(np.float32)
-    yn = ((ys - cy) / max(float(h), 1e-12)).astype(np.float32)
-
-    def sample_with_params(p):
-        xw = xs + float(p[0]) + float(p[1]) * xn + float(p[2]) * yn
-        yw = ys + float(p[3]) + float(p[4]) * xn + float(p[5]) * yn
-        I, valid_i = bilinear_sample_vectorized(I_img, xw, yw)
-        Ix, valid_x = bilinear_sample_vectorized(gx, xw, yw)
-        Iy, valid_y = bilinear_sample_vectorized(gy, xw, yw)
-        valid = valid_i & valid_x & valid_y
-        return I, Ix, Iy, valid
-
-    def make_residual(Tv, Iv):
-        if normalize == "none":
-            e = Tv - Iv
-            scale = 1.0
-        elif normalize == "zero_mean":
-            e = (Tv - np.mean(Tv)) - (Iv - np.mean(Iv))
-            scale = 1.0
-        elif normalize == "zncc_approx":
-            Tv0 = Tv - np.mean(Tv)
-            Iv0 = Iv - np.mean(Iv)
-            std_t = float(np.std(Tv0)) + 1e-6
-            std_i = float(np.std(Iv0)) + 1e-6
-            e = Tv0 / std_t - Iv0 / std_i
-            scale = 1.0 / std_i
-        else:
-            raise ValueError(f"Unknown LK normalize mode: {normalize}")
-        return e.astype(np.float32), float(scale)
-
-    def compute_errors(p, keep_mask):
-        I, _, _, valid_warp = sample_with_params(p)
-        valid = keep_mask & valid_warp
-        if np.count_nonzero(valid) < int(min_samples):
-            return None, valid
-        e, _scale = make_residual(T_all[valid], I[valid])
-        err = np.full(xs.shape[0], np.inf, dtype=np.float32)
-        err[valid] = np.abs(e).astype(np.float32)
-        return err, valid
-
-    def fit_once(p_init, keep_mask):
-        p_cur = np.asarray(p_init, dtype=np.float64).reshape(6).copy()
-        final_rmse = None
-        iters_done = 0
-        num_valid_last = 0
-
-        for it in range(int(max_iters)):
-            I, Ix, Iy, valid_warp = sample_with_params(p_cur)
-            valid = keep_mask & valid_warp
-            num_valid = int(np.count_nonzero(valid))
-            num_valid_last = num_valid
-            if num_valid < int(min_samples):
-                break
-
-            Tv = T_all[valid]
-            Iv = I[valid]
-            Ixv = Ix[valid]
-            Iyv = Iy[valid]
-            xnv = xn[valid]
-            ynv = yn[valid]
-
-            e, scale = make_residual(Tv, Iv)
-
-            # J is dI/dp. Linearized residual: e_new = e - J*dp.
-            J = np.empty((e.size, 6), dtype=np.float32)
-            J[:, 0] = Ixv * scale
-            J[:, 1] = Ixv * xnv * scale
-            J[:, 2] = Ixv * ynv * scale
-            J[:, 3] = Iyv * scale
-            J[:, 4] = Iyv * xnv * scale
-            J[:, 5] = Iyv * ynv * scale
-
-            H = (J.T @ J).astype(np.float64)
-            b = (J.T @ e.astype(np.float32)).astype(np.float64)
-            H += np.eye(6, dtype=np.float64) * float(damping)
-
-            try:
-                dp = np.linalg.solve(H, b)
-            except np.linalg.LinAlgError:
-                break
-
-            dp_norm = float(np.linalg.norm(dp))
-            if not np.isfinite(dp_norm):
-                break
-
-            if max_update is not None and max_update > 0 and dp_norm > float(max_update):
-                dp *= float(max_update) / dp_norm
-                dp_norm = float(max_update)
-
-            p_cur += dp
-            final_rmse = float(np.sqrt(np.mean(e.astype(np.float64) ** 2)))
-            iters_done = it + 1
-
-            if dp_norm < float(eps):
-                break
-
-        return p_cur, final_rmse, iters_done, num_valid_last
-
-    p = np.zeros(6, dtype=np.float64)
-    keep = np.ones(xs.shape[0], dtype=bool)
-
-    robust_iters = max(0, int(robust_iters))
-    outlier_percent = float(outlier_percent)
-    outlier_percent = max(0.0, min(outlier_percent, 95.0))
-
-    history = []
-    final_rmse = None
-    final_lk_iters = 0
-    final_valid = 0
-
-    # Number of robust rounds.  robust_iters=0 means one normal LK fit only.
-    num_rounds = robust_iters + 1
-    for r in range(num_rounds):
-        p, final_rmse, lk_iters, num_valid = fit_once(p, keep)
-        final_lk_iters += int(lk_iters)
-        final_valid = int(num_valid)
-
-        err, valid_for_err = compute_errors(p, keep)
-        if err is None:
-            history.append({
-                "round": int(r),
-                "num_keep_before": int(np.count_nonzero(keep)),
-                "num_valid": int(np.count_nonzero(valid_for_err)),
-                "rmse": json_safe_float(final_rmse),
-                "reason": "too_few_valid_for_error",
-            })
-            break
-
-        finite_err = err[np.isfinite(err)]
-        mean_abs = float(np.mean(finite_err)) if finite_err.size else None
-        median_abs = float(np.median(finite_err)) if finite_err.size else None
-        p90_abs = float(np.percentile(finite_err, 90.0)) if finite_err.size else None
-
-        history.append({
-            "round": int(r),
-            "num_keep_before": int(np.count_nonzero(keep)),
-            "num_valid": int(finite_err.size),
-            "rmse": json_safe_float(final_rmse),
-            "mean_abs_residual": json_safe_float(mean_abs),
-            "median_abs_residual": json_safe_float(median_abs),
-            "p90_abs_residual": json_safe_float(p90_abs),
-        })
-
-        # Last round: do not remove more outliers.
-        if r >= robust_iters or outlier_percent <= 0.0:
-            break
-
-        valid_idx = np.flatnonzero(np.isfinite(err))
-        if valid_idx.size < int(min_samples):
-            break
-
-        keep_ratio = max(float(min_keep_ratio), 1.0 - outlier_percent / 100.0)
-        num_keep_target = int(round(float(valid_idx.size) * keep_ratio))
-        num_keep_target = max(int(min_samples), min(num_keep_target, int(valid_idx.size)))
-
-        # Keep lowest residual samples. Deterministic and C++-friendly.
-        order = np.argsort(err[valid_idx], kind="stable")
-        selected = valid_idx[order[:num_keep_target]]
-        new_keep = np.zeros_like(keep, dtype=bool)
-        new_keep[selected] = True
-
-        if np.array_equal(new_keep, keep):
-            break
-        keep = new_keep
-
-    A = params_to_affine_matrix_lk(p, w, h)
-
-    if final_rmse is None or not np.isfinite(final_rmse) or final_valid < int(min_samples):
-        stats = {
-            "num_samples_initial": total_initial,
-            "num_samples_final": int(np.count_nonzero(keep)),
-            "num_valid_final": int(final_valid),
-            "robust_iters_requested": int(robust_iters),
-            "robust_iters_done": max(0, len(history) - 1),
-            "lk_iters_total": int(final_lk_iters),
-            "history": history,
-            "reason": "fit_failed_or_too_few_final_samples",
-        }
-        return np.eye(2, 3, dtype=np.float32), False, None, stats
-
-    score = -float(final_rmse)
-    stats = {
-        "num_samples_initial": total_initial,
-        "num_samples_final": int(np.count_nonzero(keep)),
-        "num_valid_final": int(final_valid),
-        "robust_iters_requested": int(robust_iters),
-        "robust_iters_done": max(0, len(history) - 1),
-        "outlier_percent": float(outlier_percent),
-        "min_keep_ratio": float(min_keep_ratio),
-        "min_samples": int(min_samples),
-        "lk_iters_total": int(final_lk_iters),
-        "final_rmse": float(final_rmse),
-        "history": history,
-    }
-    return A.astype(np.float32), True, float(score), stats
-
-
-def affine_local_matrix_to_global(A_local, x0, y0):
-    """Convert an affine matrix estimated on a cropped block coordinate system
-    into the full-picture coordinate system.
-
-    local:  [xl', yl'] = A_local * [xl, yl, 1]
-    global: x = xl + x0, y = yl + y0
-    """
-    A = np.asarray(A_local, dtype=np.float64).reshape(2, 3)
-    x0 = float(x0)
-    y0 = float(y0)
-
-    A_global = np.empty((2, 3), dtype=np.float32)
-    A_global[0, 0] = A[0, 0]
-    A_global[0, 1] = A[0, 1]
-    A_global[0, 2] = x0 + A[0, 2] - A[0, 0] * x0 - A[0, 1] * y0
-    A_global[1, 0] = A[1, 0]
-    A_global[1, 1] = A[1, 1]
-    A_global[1, 2] = y0 + A[1, 2] - A[1, 0] * x0 - A[1, 1] * y0
-    return A_global.astype(np.float32)
-
-
-def affine_bias_at_points(A, pts):
-    """Return residual bias [x'-x, y'-y] at arbitrary global points."""
-    A = np.asarray(A, dtype=np.float64).reshape(2, 3)
-    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
-    ones = np.ones((pts.shape[0], 1), dtype=np.float64)
-    src = np.concatenate([pts, ones], axis=1)
-    dst = src @ A.T
-    return (dst - pts).astype(np.float64)
-
-
-def block_affine_sample_points(x0, y0, x1, y1):
-    """Five representative points for comparing/fitting block affine models.
-
-    x1/y1 are exclusive block boundaries, so using them is consistent with
-    picture-level CP convention CP1=(w,0), CP2=(0,h).
-    """
-    x0 = float(x0)
-    y0 = float(y0)
-    x1 = float(x1)
-    y1 = float(y1)
-    return np.array(
-        [
-            [x0, y0],
-            [x1, y0],
-            [x0, y1],
-            [x1, y1],
-            [0.5 * (x0 + x1), 0.5 * (y0 + y1)],
-        ],
-        dtype=np.float64,
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        int(max_iters),
+        float(eps),
     )
-
-
-def fit_global_affine_from_block_models(blocks, keep_mask, w, h, weight_mode="equal"):
-    """Fit one global affine residual bias to local block affine models.
-
-    Each local block affine contributes bias samples at block corners and center.
-    The fitted model is the same normalized 6-parameter residual model used by LK:
-      dx = p0 + p1*xn + p2*yn
-      dy = p3 + p4*xn + p5*yn
-    """
-    keep_mask = np.asarray(keep_mask, dtype=bool)
-    if len(blocks) == 0 or np.count_nonzero(keep_mask) < 3:
-        return np.eye(2, 3, dtype=np.float32), None
-
-    cx = 0.5 * float(w)
-    cy = 0.5 * float(h)
-    ww = max(float(w), 1e-12)
-    hh = max(float(h), 1e-12)
-
-    rows = []
-    dxs = []
-    dys = []
-    weights = []
-
-    for bi, b in enumerate(blocks):
-        if not keep_mask[bi]:
-            continue
-
-        pts = b["fit_points"]
-        bias = b["fit_bias"]
-
-        xn = (pts[:, 0] - cx) / ww
-        yn = (pts[:, 1] - cy) / hh
-        basis = np.stack([np.ones_like(xn), xn, yn], axis=1)
-
-        if weight_mode == "equal":
-            # Equal block weight regardless of block valid-sample count.
-            wt = np.full(pts.shape[0], 1.0 / max(pts.shape[0], 1), dtype=np.float64)
-        elif weight_mode == "valid_count":
-            # More valid/reliable blocks receive higher weight, but avoid extreme dominance.
-            wt_block = np.sqrt(max(float(b.get("num_valid", 1)), 1.0))
-            wt = np.full(pts.shape[0], wt_block / max(pts.shape[0], 1), dtype=np.float64)
-        else:
-            raise ValueError(f"Unknown affine block weight mode: {weight_mode}")
-
-        rows.append(basis)
-        dxs.append(bias[:, 0])
-        dys.append(bias[:, 1])
-        weights.append(wt)
-
-    if not rows:
-        return np.eye(2, 3, dtype=np.float32), None
-
-    X = np.concatenate(rows, axis=0).astype(np.float64)
-    dx = np.concatenate(dxs, axis=0).astype(np.float64)
-    dy = np.concatenate(dys, axis=0).astype(np.float64)
-    wt = np.concatenate(weights, axis=0).astype(np.float64)
-    sw = np.sqrt(np.maximum(wt, 1e-12))
-
-    Xw = X * sw[:, None]
-    dxw = dx * sw
-    dyw = dy * sw
 
     try:
-        coef_x, _, _, _ = np.linalg.lstsq(Xw, dxw, rcond=None)
-        coef_y, _, _, _ = np.linalg.lstsq(Xw, dyw, rcond=None)
-    except np.linalg.LinAlgError:
-        return np.eye(2, 3, dtype=np.float32), None
-
-    p = np.array(
-        [coef_x[0], coef_x[1], coef_x[2], coef_y[0], coef_y[1], coef_y[2]],
-        dtype=np.float64,
-    )
-    A = params_to_affine_matrix_lk(p, w, h)
-    return A.astype(np.float32), p
-
-
-def compute_block_model_errors(blocks, keep_mask, A_global):
-    keep_mask = np.asarray(keep_mask, dtype=bool)
-    errors = np.full(len(blocks), np.inf, dtype=np.float64)
-
-    for bi, b in enumerate(blocks):
-        if not keep_mask[bi]:
-            continue
-        pts = b["fit_points"]
-        local_bias = b["fit_bias"]
-        global_bias = affine_bias_at_points(A_global, pts)
-        diff = global_bias - local_bias
-        l2 = np.sqrt(np.sum(diff * diff, axis=1))
-        errors[bi] = float(np.sqrt(np.mean(l2 * l2)))
-
-    return errors
-
-
-def estimate_blockwise_global_affine_bias_lk(
-    cur_y,
-    cam_warp_y,
-    valid_mask_u8,
-    bit_depth,
-    block_size=128,
-    block_sample_step=8,
-    block_lk_iters=20,
-    block_lk_eps=1e-4,
-    normalize="zero_mean",
-    damping=1e-6,
-    max_update=4.0,
-    min_block_samples=64,
-    min_block_valid_ratio=0.05,
-    robust_iters=3,
-    outlier_percent=20.0,
-    remove_worst_count=0,
-    min_keep_blocks=8,
-    weight_mode="equal",
-):
-    """Estimate one global affine using block-wise local affine candidates.
-
-    Procedure:
-      1) Split valid active region into non-overlapping block_size x block_size blocks.
-      2) Estimate a local LK affine for each block independently.
-      3) Fit a single global affine that best covers all local block affine models.
-      4) Remove block-affine outliers with the largest model disagreement.
-      5) Refit the global affine.
-
-    This is intended for large ref->target POC distance where a direct global LK
-    fit can be destabilized by occlusion/object motion/depth errors.
-    """
-    if block_size <= 0:
-        raise ValueError("block_size must be positive")
-    if block_sample_step <= 0:
-        raise ValueError("block_sample_step must be positive")
-    if min_block_samples <= 0:
-        raise ValueError("min_block_samples must be positive")
-    if min_keep_blocks <= 0:
-        raise ValueError("min_keep_blocks must be positive")
-
-    h, w = cur_y.shape
-    valid_bool = valid_mask_u8 > 0
-    blocks = []
-    total_blocks = 0
-    skipped_too_few = 0
-    skipped_failed = 0
-
-    for y0 in range(0, h, int(block_size)):
-        y1 = min(y0 + int(block_size), h)
-        for x0 in range(0, w, int(block_size)):
-            x1 = min(x0 + int(block_size), w)
-            total_blocks += 1
-
-            block_valid = valid_bool[y0:y1, x0:x1]
-            valid_count = int(np.count_nonzero(block_valid))
-            area = max((x1 - x0) * (y1 - y0), 1)
-            valid_ratio = float(valid_count) / float(area)
-            if valid_count < int(min_block_samples) or valid_ratio < float(min_block_valid_ratio):
-                skipped_too_few += 1
-                continue
-
-            A_local, ok, score, st = estimate_global_affine_bias_lk(
-                cur_y=cur_y[y0:y1, x0:x1],
-                cam_warp_y=cam_warp_y[y0:y1, x0:x1],
-                valid_mask_u8=valid_mask_u8[y0:y1, x0:x1],
-                bit_depth=bit_depth,
-                max_iters=block_lk_iters,
-                eps=block_lk_eps,
-                sample_step=block_sample_step,
-                normalize=normalize,
-                damping=damping,
-                max_update=max_update,
-                robust_iters=0,
-                outlier_percent=0.0,
-                min_samples=min_block_samples,
-                min_keep_ratio=1.0,
-            )
-
-            if not ok:
-                skipped_failed += 1
-                continue
-
-            A_global_local = affine_local_matrix_to_global(A_local, x0, y0)
-            pts = block_affine_sample_points(x0, y0, x1, y1)
-            bias = affine_bias_at_points(A_global_local, pts)
-
-            blocks.append({
-                "block_index": int(len(blocks)),
-                "x0": int(x0),
-                "y0": int(y0),
-                "x1": int(x1),
-                "y1": int(y1),
-                "num_valid": int(valid_count),
-                "valid_ratio": float(valid_ratio),
-                "local_score_negative_rmse": json_safe_float(score),
-                "local_stats": {
-                    "num_samples_initial": st.get("num_samples_initial"),
-                    "num_samples_final": st.get("num_samples_final"),
-                    "num_valid_final": st.get("num_valid_final"),
-                    "final_rmse": st.get("final_rmse"),
-                    "lk_iters_total": st.get("lk_iters_total"),
-                },
-                "A_local_global_coords": A_global_local.astype(float).tolist(),
-                "fit_points": pts,
-                "fit_bias": bias,
-            })
-
-    n = len(blocks)
-    if n < int(min_keep_blocks):
-        stats = {
-            "mode": "block_lk",
-            "total_blocks": int(total_blocks),
-            "local_success_blocks": int(n),
-            "skipped_too_few": int(skipped_too_few),
-            "skipped_failed": int(skipped_failed),
-            "reason": "too_few_successful_blocks",
-        }
-        return np.eye(2, 3, dtype=np.float32), False, None, stats
-
-    keep = np.ones(n, dtype=bool)
-    robust_iters = max(0, int(robust_iters))
-    outlier_percent = max(0.0, min(float(outlier_percent), 95.0))
-    remove_worst_count = max(0, int(remove_worst_count))
-
-    history = []
-    A_global = np.eye(2, 3, dtype=np.float32)
-    errors = np.full(n, np.inf, dtype=np.float64)
-
-    for r in range(robust_iters + 1):
-        A_global, p_global = fit_global_affine_from_block_models(
-            blocks,
-            keep,
-            w,
-            h,
-            weight_mode=weight_mode,
+        cc, warp = cv2.findTransformECC(
+            templateImage=template,
+            inputImage=inp,
+            warpMatrix=warp,
+            motionType=motion_type,
+            criteria=criteria,
+            inputMask=valid_mask_u8,
+            gaussFiltSize=int(gauss_filt_size),
         )
-        if p_global is None:
-            break
+        return warp.astype(np.float32), True, float(cc)
+    except cv2.error:
+        return identity_transform_matrix(cp_num), False, None
 
-        errors = compute_block_model_errors(blocks, keep, A_global)
-        finite = errors[np.isfinite(errors)]
-        kept_before = int(np.count_nonzero(keep))
-        if finite.size == 0:
-            break
 
-        hist = {
-            "round": int(r),
-            "kept_blocks_before": int(kept_before),
-            "mean_block_model_error": float(np.mean(finite)),
-            "median_block_model_error": float(np.median(finite)),
-            "p90_block_model_error": float(np.percentile(finite, 90.0)),
-            "max_block_model_error": float(np.max(finite)),
-        }
+def transform_cp_points(w, h, cp_num):
+    """Return coded CP coordinates.
 
-        worst_order = np.argsort(errors)[::-1]
-        top = []
-        for bi in worst_order[:min(8, worst_order.size)]:
-            if not np.isfinite(errors[bi]):
-                continue
-            b = blocks[int(bi)]
-            top.append({
-                "block_index": int(bi),
-                "x0": int(b["x0"]),
-                "y0": int(b["y0"]),
-                "x1": int(b["x1"]),
-                "y1": int(b["y1"]),
-                "error": float(errors[bi]),
-            })
-        hist["worst_blocks"] = top
-        history.append(hist)
+    cp_num=2:
+      CP0=(0,0), CP1=(w,0). Decoder reconstructs constrained 4-param affine.
 
-        if r >= robust_iters:
-            break
+    cp_num=3:
+      CP0=(0,0), CP1=(w,0), CP2=(0,h). Full affine.
 
-        valid_idx = np.flatnonzero(keep & np.isfinite(errors))
-        if valid_idx.size <= int(min_keep_blocks):
-            break
-
-        if remove_worst_count > 0:
-            remove_count = min(remove_worst_count, max(0, valid_idx.size - int(min_keep_blocks)))
-        else:
-            remove_count = int(np.ceil(valid_idx.size * outlier_percent / 100.0))
-            remove_count = max(1 if outlier_percent > 0.0 else 0, remove_count)
-            remove_count = min(remove_count, max(0, valid_idx.size - int(min_keep_blocks)))
-
-        if remove_count <= 0:
-            break
-
-        order = valid_idx[np.argsort(errors[valid_idx])[::-1]]
-        remove_idx = order[:remove_count]
-        keep[remove_idx] = False
-        history[-1]["removed_blocks"] = [int(x) for x in remove_idx.tolist()]
-
-    kept_final = int(np.count_nonzero(keep))
-    if kept_final < int(min_keep_blocks):
-        stats = {
-            "mode": "block_lk",
-            "total_blocks": int(total_blocks),
-            "local_success_blocks": int(n),
-            "kept_final": int(kept_final),
-            "history": history,
-            "reason": "too_few_final_blocks",
-        }
-        return np.eye(2, 3, dtype=np.float32), False, None, stats
-
-    final_errors = compute_block_model_errors(blocks, keep, A_global)
-    finite_final = final_errors[np.isfinite(final_errors)]
-    final_rmse = float(np.sqrt(np.mean(finite_final * finite_final))) if finite_final.size else None
-    score = -final_rmse if final_rmse is not None else None
-
-    # Keep detailed block model list compact enough for JSON by omitting raw fit_points/fit_bias.
-    block_summaries = []
-    for bi, b in enumerate(blocks):
-        block_summaries.append({
-            "block_index": int(bi),
-            "x0": int(b["x0"]),
-            "y0": int(b["y0"]),
-            "x1": int(b["x1"]),
-            "y1": int(b["y1"]),
-            "num_valid": int(b["num_valid"]),
-            "valid_ratio": float(b["valid_ratio"]),
-            "kept_final": bool(keep[bi]),
-            "final_model_error": json_safe_float(final_errors[bi]),
-            "local_score_negative_rmse": b.get("local_score_negative_rmse"),
-        })
-
-    stats = {
-        "mode": "block_lk",
-        "block_size": int(block_size),
-        "block_sample_step": int(block_sample_step),
-        "block_lk_iters": int(block_lk_iters),
-        "block_lk_eps": float(block_lk_eps),
-        "min_block_samples": int(min_block_samples),
-        "min_block_valid_ratio": float(min_block_valid_ratio),
-        "weight_mode": weight_mode,
-        "total_blocks": int(total_blocks),
-        "local_success_blocks": int(n),
-        "skipped_too_few": int(skipped_too_few),
-        "skipped_failed": int(skipped_failed),
-        "robust_iters_requested": int(robust_iters),
-        "outlier_percent": float(outlier_percent),
-        "remove_worst_count": int(remove_worst_count),
-        "min_keep_blocks": int(min_keep_blocks),
-        "kept_final": int(kept_final),
-        "final_block_rmse": json_safe_float(final_rmse),
-        "history": history,
-        "blocks": block_summaries,
-    }
-
-    return A_global.astype(np.float32), True, json_safe_float(score), stats
-
-def affine_cp_points(w, h, cp_num):
-    """Return CP coordinates used for coding.
-
-    cp_num=2 follows a 4-parameter affine/similarity-style convention:
-      CP0=(0,0), CP1=(w,0), CP2 is derived.
-
-    cp_num=3 follows full 6-parameter affine:
-      CP0=(0,0), CP1=(w,0), CP2=(0,h).
+    cp_num=4:
+      CP0=(0,0), CP1=(w,0), CP2=(0,h), CP3=(w,h). Homography.
     """
+    cp_num = int(cp_num)
     if cp_num == 2:
-        return np.array(
-            [
-                [0.0, 0.0],
-                [float(w), 0.0],
-            ],
-            dtype=np.float32,
-        )
-    if cp_num == 3:
-        return np.array(
-            [
-                [0.0, 0.0],
-                [float(w), 0.0],
-                [0.0, float(h)],
-            ],
-            dtype=np.float32,
-        )
-    raise ValueError(f"cp_num must be 2 or 3, got {cp_num}")
+        pts = [[0.0, 0.0], [float(w), 0.0]]
+    elif cp_num == 3:
+        pts = [[0.0, 0.0], [float(w), 0.0], [0.0, float(h)]]
+    elif cp_num == 4:
+        pts = [[0.0, 0.0], [float(w), 0.0], [0.0, float(h)], [float(w), float(h)]]
+    else:
+        raise ValueError(f"cp_num must be 2, 3, or 4, got {cp_num}")
+    return np.asarray(pts, dtype=np.float32)
 
 
-def affine_matrix_to_cp_bias(A, w, h, cp_num=3):
-    """Convert affine coordinate warp to coded CP bias.
+def apply_transform_to_points(M, pts):
+    M = np.asarray(M, dtype=np.float32)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
 
-    For cp_num=3, all three CP biases are extracted from the estimated affine.
-    For cp_num=2, only CP0/CP1 are extracted.  The decoder reconstructs a
-    constrained 4-parameter affine from those two CPs.
+    if M.shape == (2, 3):
+        ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+        homo = np.concatenate([pts, ones], axis=1)
+        return (homo @ M.T).astype(np.float32)
 
-    bias = warped_cp - original_cp
-    """
-    src = affine_cp_points(w, h, cp_num)
-    ones = np.ones((src.shape[0], 1), dtype=np.float32)
-    src_homo = np.concatenate([src, ones], axis=1)
+    if M.shape == (3, 3):
+        ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+        homo = np.concatenate([pts, ones], axis=1)
+        q = homo @ M.T
+        den = q[:, 2:3]
+        den = np.where(np.abs(den) < 1e-8, 1e-8, den)
+        return (q[:, :2] / den).astype(np.float32)
 
-    dst = src_homo @ np.asarray(A, dtype=np.float32).T
+    raise ValueError(f"Unsupported transform matrix shape: {M.shape}")
+
+
+def transform_matrix_to_cp_bias(M, w, h, cp_num=3):
+    """Convert affine/homography residual transform to coded CP biases."""
+    src = transform_cp_points(w, h, cp_num)
+    dst = apply_transform_to_points(M, src)
     bias = dst - src
-
     return bias.astype(np.float32)
 
 
-def cp_bias_to_affine_matrix(cp_bias, w, h, cp_num=3):
-    """Reconstruct affine matrix from decoded CP bias.
+def cp_bias_to_transform_matrix(cp_bias, w, h, cp_num=3):
+    """Reconstruct transform matrix from decoded CP bias.
 
-    cp_num=3: full affine from CP0/CP1/CP2.
-    cp_num=2: constrained 4-parameter model from CP0/CP1:
-      x' = a*x - b*y + tx
-      y' = b*x + a*y + ty
-    where CP0 gives tx/ty and CP1 gives a/b.
+    cp_num=2:
+      constrained 4-param affine from CP0/CP1.
+    cp_num=3:
+      full affine from three CPs.
+    cp_num=4:
+      homography from four CPs.
     """
+    cp_num = int(cp_num)
     cp_bias = np.asarray(cp_bias, dtype=np.float32).reshape(cp_num, 2)
-
-    if cp_num == 3:
-        src = affine_cp_points(w, h, 3)
-        dst = src + cp_bias
-        A = cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32))
-        return A.astype(np.float32)
+    src = transform_cp_points(w, h, cp_num)
+    dst = src + cp_bias
 
     if cp_num == 2:
         dx0, dy0 = float(cp_bias[0, 0]), float(cp_bias[0, 1])
@@ -1482,28 +823,32 @@ def cp_bias_to_affine_matrix(cp_bias, w, h, cp_num=3):
         tx = dx0
         ty = dy0
 
-        # CP0 original=(0,0), warped=(dx0,dy0)
-        # CP1 original=(w,0), warped=(w+dx1,dy1)
-        # For x'=a*x-b*y+tx, y'=b*x+a*y+ty:
+        # x'=a*x-b*y+tx, y'=b*x+a*y+ty
         a = (float(w) + dx1 - tx) / ww
         b = (dy1 - ty) / ww
 
         return np.array(
-            [
-                [a, -b, tx],
-                [b,  a, ty],
-            ],
+            [[a, -b, tx], [b, a, ty]],
             dtype=np.float32,
         )
 
-    raise ValueError(f"cp_num must be 2 or 3, got {cp_num}")
+    if cp_num == 3:
+        return cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32)).astype(np.float32)
+
+    if cp_num == 4:
+        return cv2.getPerspectiveTransform(src.astype(np.float32), dst.astype(np.float32)).astype(np.float32)
+
+    raise ValueError(f"cp_num must be 2, 3, or 4, got {cp_num}")
 
 
-def apply_affine_bias_to_map(map_x, map_y, A):
+def apply_affine_bias_to_map(map_x, map_y, M):
     """
-    final_map = cam_proj_map + affine_bias(x,y)
+    Apply affine or homography residual bias to cam-proj map.
 
-    affine_bias is generated in current-picture coordinate domain.
+      final_map = cam_proj_map + bias(x,y)
+      bias(x,y) = M(x,y) - (x,y)
+
+    M can be 2x3 affine or 3x3 homography.
     """
     h, w = map_x.shape
 
@@ -1513,8 +858,10 @@ def apply_affine_bias_to_map(map_x, map_y, A):
         indexing="ij",
     )
 
-    x2 = A[0, 0] * xx + A[0, 1] * yy + A[0, 2]
-    y2 = A[1, 0] * xx + A[1, 1] * yy + A[1, 2]
+    pts = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=1)
+    dst = apply_transform_to_points(M, pts)
+    x2 = dst[:, 0].reshape(h, w)
+    y2 = dst[:, 1].reshape(h, w)
 
     bias_x = x2 - xx
     bias_y = y2 - yy
@@ -1542,12 +889,8 @@ def apply_affine_bias_to_map(map_x, map_y, A):
     return out_x, out_y
 
 
-def quantize_affine_cp_bias(cp_bias, step, bits, cp_num=3):
-    """
-    cp_bias: [cp_num,2] in pixel units.
-    Components are coded with signed truncated Exp-Golomb.
-    Bit estimate assumes 50:50 bin probability, so bin count = bit count.
-    """
+def quantize_transform_cp_bias(cp_bias, step, bits, cp_num=3):
+    cp_num = int(cp_num)
     cp_bias = np.asarray(cp_bias, dtype=np.float32).reshape(cp_num, 2)
     flat = cp_bias.reshape(cp_num * 2)
 
@@ -1568,11 +911,10 @@ def quantize_affine_cp_bias(cp_bias, step, bits, cp_num=3):
     )
 
 
-def affine_cp_component_names(cp_num):
+def transform_cp_component_names(cp_num):
     names = []
-    for i in range(cp_num):
-        names.append(f"cp{i}_dx")
-        names.append(f"cp{i}_dy")
+    for i in range(int(cp_num)):
+        names.extend([f"cp{i}_dx", f"cp{i}_dy"])
     return names
 
 
@@ -2011,73 +1353,13 @@ def main():
 
     # Affine bias: off by default, same decoded application path as sequence test.
     ap.add_argument("--global-affine-bias", action="store_true")
-    ap.add_argument(
-        "--affine-estimator",
-        choices=["lk", "block_lk"],
-        default="block_lk",
-        help="lk: direct global LK. block_lk: estimate local block affines then robustly aggregate one global affine.",
-    )
-    ap.add_argument("--affine-cp-num", type=int, choices=[2, 3], default=3)
+    ap.add_argument("--affine-cp-num", type=int, choices=[2, 3, 4], default=3)
     ap.add_argument("--affine-cp-step", type=float, default=1.0)
     ap.add_argument("--affine-cp-bits", type=int, default=16)
     ap.add_argument("--affine-valid-erode", type=int, default=2)
-    ap.add_argument("--affine-lk-iters", type=int, default=30)
-    ap.add_argument("--affine-lk-eps", type=float, default=1e-4)
-    ap.add_argument("--affine-lk-sample-step", type=int, default=4)
-    ap.add_argument(
-        "--affine-lk-normalize",
-        choices=["none", "zero_mean", "zncc_approx"],
-        default="zero_mean",
-    )
-    ap.add_argument("--affine-lk-damping", type=float, default=1e-6)
-    ap.add_argument("--affine-lk-max-update", type=float, default=4.0)
-    ap.add_argument(
-        "--affine-lk-robust-iters",
-        type=int,
-        default=0,
-        help="Number of robust outlier-removal rounds after LK fitting.",
-    )
-    ap.add_argument(
-        "--affine-lk-outlier-percent",
-        type=float,
-        default=0.0,
-        help="Percent of largest residual LK samples removed per robust round.",
-    )
-    ap.add_argument(
-        "--affine-lk-min-samples",
-        type=int,
-        default=128,
-        help="Minimum number of LK samples required after outlier removal.",
-    )
-    ap.add_argument(
-        "--affine-lk-min-keep-ratio",
-        type=float,
-        default=0.25,
-        help="Lower bound on sample keep ratio during robust outlier removal.",
-    )
-
-    # Block-wise local affine aggregation estimator.
-    ap.add_argument("--affine-block-size", type=int, default=128)
-    ap.add_argument("--affine-block-sample-step", type=int, default=8)
-    ap.add_argument("--affine-block-lk-iters", type=int, default=20)
-    ap.add_argument("--affine-block-lk-eps", type=float, default=1e-4)
-    ap.add_argument("--affine-block-min-samples", type=int, default=64)
-    ap.add_argument("--affine-block-min-valid-ratio", type=float, default=0.05)
-    ap.add_argument("--affine-block-robust-iters", type=int, default=3)
-    ap.add_argument("--affine-block-outlier-percent", type=float, default=20.0)
-    ap.add_argument(
-        "--affine-block-remove-worst-count",
-        type=int,
-        default=0,
-        help="If >0, remove this many worst local-affine blocks per robust round instead of using percent.",
-    )
-    ap.add_argument("--affine-block-min-keep-blocks", type=int, default=8)
-    ap.add_argument(
-        "--affine-block-weight-mode",
-        choices=["equal", "valid_count"],
-        default="equal",
-        help="How to weight local block affine models when fitting the final global affine.",
-    )
+    ap.add_argument("--affine-ecc-iters", type=int, default=50)
+    ap.add_argument("--affine-ecc-eps", type=float, default=1e-4)
+    ap.add_argument("--affine-ecc-gauss", type=int, default=5)
 
     ap.add_argument("--overwrite", action="store_true")
 
@@ -2091,34 +1373,8 @@ def main():
         raise ValueError("--affine-cp-step must be positive")
     if args.affine_cp_bits < 2:
         raise ValueError("--affine-cp-bits must be >= 2")
-    if args.affine_lk_sample_step <= 0:
-        raise ValueError("--affine-lk-sample-step must be positive")
-    if args.affine_lk_robust_iters < 0:
-        raise ValueError("--affine-lk-robust-iters must be non-negative")
-    if args.affine_lk_outlier_percent < 0.0 or args.affine_lk_outlier_percent >= 100.0:
-        raise ValueError("--affine-lk-outlier-percent must be in [0,100)")
-    if args.affine_lk_min_samples <= 0:
-        raise ValueError("--affine-lk-min-samples must be positive")
-    if args.affine_lk_min_keep_ratio <= 0.0 or args.affine_lk_min_keep_ratio > 1.0:
-        raise ValueError("--affine-lk-min-keep-ratio must be in (0,1]")
-    if args.affine_block_size <= 0:
-        raise ValueError("--affine-block-size must be positive")
-    if args.affine_block_sample_step <= 0:
-        raise ValueError("--affine-block-sample-step must be positive")
-    if args.affine_block_lk_iters <= 0:
-        raise ValueError("--affine-block-lk-iters must be positive")
-    if args.affine_block_min_samples <= 0:
-        raise ValueError("--affine-block-min-samples must be positive")
-    if args.affine_block_min_valid_ratio < 0.0 or args.affine_block_min_valid_ratio > 1.0:
-        raise ValueError("--affine-block-min-valid-ratio must be in [0,1]")
-    if args.affine_block_robust_iters < 0:
-        raise ValueError("--affine-block-robust-iters must be non-negative")
-    if args.affine_block_outlier_percent < 0.0 or args.affine_block_outlier_percent >= 100.0:
-        raise ValueError("--affine-block-outlier-percent must be in [0,100)")
-    if args.affine_block_remove_worst_count < 0:
-        raise ValueError("--affine-block-remove-worst-count must be non-negative")
-    if args.affine_block_min_keep_blocks <= 0:
-        raise ValueError("--affine-block-min-keep-blocks must be positive")
+    if args.affine_ecc_gauss <= 0 or args.affine_ecc_gauss % 2 == 0:
+        raise ValueError("--affine-ecc-gauss must be a positive odd integer")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -2243,57 +1499,26 @@ def main():
     affine_cp_q = np.zeros((args.affine_cp_num, 2), dtype=np.int32)
     affine_cp_dec = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
     affine_cp_clipped = False
-    affine_matrix_est = np.eye(2, 3, dtype=np.float32)
-    affine_matrix_dec = np.eye(2, 3, dtype=np.float32)
-    affine_lk_stats = {}
+    affine_matrix_est = identity_transform_matrix(args.affine_cp_num)
+    affine_matrix_dec = identity_transform_matrix(args.affine_cp_num)
     map_x_final = map_x
     map_y_final = map_y
 
     if affine_enabled:
         affine_flag_bits = 1
-        if args.affine_estimator == "lk":
-            affine_matrix_est, affine_success, affine_score, affine_lk_stats = estimate_global_affine_bias_lk(
-                cur_y=tar_y_pad,
-                cam_warp_y=wy_cam,
-                valid_mask_u8=valid_mask_u8,
-                bit_depth=bit_depth,
-                max_iters=args.affine_lk_iters,
-                eps=args.affine_lk_eps,
-                sample_step=args.affine_lk_sample_step,
-                normalize=args.affine_lk_normalize,
-                damping=args.affine_lk_damping,
-                max_update=args.affine_lk_max_update,
-                robust_iters=args.affine_lk_robust_iters,
-                outlier_percent=args.affine_lk_outlier_percent,
-                min_samples=args.affine_lk_min_samples,
-                min_keep_ratio=args.affine_lk_min_keep_ratio,
-            )
-        elif args.affine_estimator == "block_lk":
-            affine_matrix_est, affine_success, affine_score, affine_lk_stats = estimate_blockwise_global_affine_bias_lk(
-                cur_y=tar_y_pad,
-                cam_warp_y=wy_cam,
-                valid_mask_u8=valid_mask_u8,
-                bit_depth=bit_depth,
-                block_size=args.affine_block_size,
-                block_sample_step=args.affine_block_sample_step,
-                block_lk_iters=args.affine_block_lk_iters,
-                block_lk_eps=args.affine_block_lk_eps,
-                normalize=args.affine_lk_normalize,
-                damping=args.affine_lk_damping,
-                max_update=args.affine_lk_max_update,
-                min_block_samples=args.affine_block_min_samples,
-                min_block_valid_ratio=args.affine_block_min_valid_ratio,
-                robust_iters=args.affine_block_robust_iters,
-                outlier_percent=args.affine_block_outlier_percent,
-                remove_worst_count=args.affine_block_remove_worst_count,
-                min_keep_blocks=args.affine_block_min_keep_blocks,
-                weight_mode=args.affine_block_weight_mode,
-            )
-        else:
-            raise ValueError(args.affine_estimator)
+        affine_matrix_est, affine_success, affine_score = estimate_global_transform_bias_ecc(
+            cur_y=tar_y_pad,
+            cam_warp_y=wy_cam,
+            valid_mask_u8=valid_mask_u8,
+            bit_depth=bit_depth,
+            cp_num=args.affine_cp_num,
+            max_iters=args.affine_ecc_iters,
+            eps=args.affine_ecc_eps,
+            gauss_filt_size=args.affine_ecc_gauss,
+        )
 
         if affine_success:
-            cp_bias_est = affine_matrix_to_cp_bias(
+            cp_bias_est = transform_matrix_to_cp_bias(
                 affine_matrix_est,
                 coded_w,
                 coded_h,
@@ -2306,7 +1531,7 @@ def main():
                 affine_cp_clip_arr,
                 affine_cp_bits_each,
                 affine_cp_bits_total,
-            ) = quantize_affine_cp_bias(
+            ) = quantize_transform_cp_bias(
                 cp_bias_est,
                 step=args.affine_cp_step,
                 bits=args.affine_cp_bits,
@@ -2315,7 +1540,7 @@ def main():
 
             affine_cp_clipped = bool(np.any(affine_cp_clip_arr))
 
-            affine_matrix_dec = cp_bias_to_affine_matrix(
+            affine_matrix_dec = cp_bias_to_transform_matrix(
                 affine_cp_dec,
                 coded_w,
                 coded_h,
@@ -2377,10 +1602,15 @@ def main():
         },
         "global_affine_bias": {
             "enabled": affine_enabled,
-            "estimator": args.affine_estimator,
+            "estimator": "opencv_ecc",
+            "motion_type": "homography" if int(args.affine_cp_num) == 4 else "affine",
             "success": affine_success,
-            "score_negative_rmse": json_safe_float(affine_score),
+            "ecc_cc": json_safe_float(affine_score),
             "cp_num": int(args.affine_cp_num),
+            "cp_semantics": (
+                "4CP homography" if int(args.affine_cp_num) == 4
+                else ("3CP full affine" if int(args.affine_cp_num) == 3 else "2CP constrained affine")
+            ),
             "cp_step": float(args.affine_cp_step),
             "cp_bits": int(args.affine_cp_bits),
             "flag_bits_50_50": int(affine_flag_bits),
@@ -2392,31 +1622,10 @@ def main():
             "cp_clipped": bool(affine_cp_clipped),
             "matrix_est": affine_matrix_est.astype(float).tolist(),
             "matrix_dec": affine_matrix_dec.astype(float).tolist(),
-            "lk": {
-                "iters": int(args.affine_lk_iters),
-                "eps": float(args.affine_lk_eps),
-                "sample_step": int(args.affine_lk_sample_step),
-                "normalize": args.affine_lk_normalize,
-                "damping": float(args.affine_lk_damping),
-                "max_update": float(args.affine_lk_max_update),
-                "robust_iters": int(args.affine_lk_robust_iters),
-                "outlier_percent": float(args.affine_lk_outlier_percent),
-                "min_samples": int(args.affine_lk_min_samples),
-                "min_keep_ratio": float(args.affine_lk_min_keep_ratio),
-                "stats": affine_lk_stats,
-            },
-            "block_lk": {
-                "block_size": int(args.affine_block_size),
-                "block_sample_step": int(args.affine_block_sample_step),
-                "block_lk_iters": int(args.affine_block_lk_iters),
-                "block_lk_eps": float(args.affine_block_lk_eps),
-                "block_min_samples": int(args.affine_block_min_samples),
-                "block_min_valid_ratio": float(args.affine_block_min_valid_ratio),
-                "block_robust_iters": int(args.affine_block_robust_iters),
-                "block_outlier_percent": float(args.affine_block_outlier_percent),
-                "block_remove_worst_count": int(args.affine_block_remove_worst_count),
-                "block_min_keep_blocks": int(args.affine_block_min_keep_blocks),
-                "block_weight_mode": args.affine_block_weight_mode,
+            "ecc": {
+                "iters": int(args.affine_ecc_iters),
+                "eps": float(args.affine_ecc_eps),
+                "gauss_filt_size": int(args.affine_ecc_gauss),
             },
         },
         "final": {
@@ -2462,10 +1671,6 @@ def main():
     print(f"affine cp q            : {affine_cp_q.astype(int).tolist()}")
     print(f"affine cp dec          : {affine_cp_dec.astype(float).tolist()}")
     print(f"affine bits            : {affine_flag_bits + affine_cp_bits_total}")
-    if affine_lk_stats:
-        print(f"lk samples init/final  : {affine_lk_stats.get('num_samples_initial')} / {affine_lk_stats.get('num_samples_final')}")
-        print(f"lk robust iters        : {affine_lk_stats.get('robust_iters_done')} / {affine_lk_stats.get('robust_iters_requested')}")
-        print(f"lk final rmse          : {affine_lk_stats.get('final_rmse')}")
     print("------------------------------------------------------------")
     print(f"warped yuv             : {args.out_yuv}")
     print(f"json                   : {args.out_json}")
