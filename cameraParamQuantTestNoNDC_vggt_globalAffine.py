@@ -11,7 +11,8 @@ Flow:
   1) Generate cam-proj backward map from current depth/camera.
   2) Warp previous frame with cam-proj map only.
   3) Estimate one global affine correction from cam-warped Y to current Y
-     using only valid active-region pixels.
+     using either ECC or a fast non-ECC vectorized Lucas-Kanade/SSD estimator
+     over valid active-region pixels.
   4) Convert affine correction to 2 or 3 control-point biases.
   5) Quantize/decode the CP bias and estimate bits assuming 50:50 bin probability.
   6) Apply decoded affine bias to cam-proj map and perform final warp.
@@ -641,7 +642,13 @@ def backward_warp_yuv420_bilinear(prev_y, prev_u, prev_v, map_x, map_y, bit_dept
 # Global affine bias over cam-proj flow
 # ============================================================
 
-def make_valid_bool_mask(map_x, map_y, w, h, erode=0, active_region=None):
+def normalize_for_ecc(img, bit_depth):
+    x = img.astype(np.float32)
+    maxv = float((1 << bit_depth) - 1)
+    return np.clip(x / maxv, 0.0, 1.0).astype(np.float32)
+
+
+def make_valid_u8_mask(map_x, map_y, w, h, erode=0, active_region=None):
     valid = (
         np.isfinite(map_x)
         & np.isfinite(map_y)
@@ -657,453 +664,267 @@ def make_valid_bool_mask(map_x, map_y, w, h, erode=0, active_region=None):
         active[ys, xs] = True
         valid &= active
 
+    mask = (valid.astype(np.uint8) * 255)
+
     if erode > 0:
         k = 2 * int(erode) + 1
         kernel = np.ones((k, k), dtype=np.uint8)
-        mask_u8 = (valid.astype(np.uint8) * 255)
-        mask_u8 = cv2.erode(mask_u8, kernel, iterations=1)
-        valid = mask_u8 > 0
+        mask = cv2.erode(mask, kernel, iterations=1)
 
-    return valid
+    return mask
 
 
-def make_valid_u8_mask(map_x, map_y, w, h, erode=0, active_region=None):
-    return make_valid_bool_mask(
-        map_x,
-        map_y,
-        w,
-        h,
-        erode=erode,
-        active_region=active_region,
-    ).astype(np.uint8) * 255
+def estimate_global_affine_bias_ecc(
+    cur_y,
+    cam_warp_y,
+    valid_mask_u8,
+    bit_depth,
+    max_iters=50,
+    eps=1e-4,
+):
+    """
+    Estimate residual affine transform between current frame and cam-proj warped frame.
 
+    This estimates a coordinate-domain affine bias:
+        [x_bias_dst, y_bias_dst] = A * [x, y, 1]
+        bias(x,y) = [x_bias_dst-x, y_bias_dst-y]
+        final_map = cam_proj_map + bias(x,y)
 
-def bilinear_sample_float_np(src, x, y):
-    """Vectorized bilinear sampling. Returns (value, valid)."""
-    src_f = src.astype(np.float32, copy=False)
-    h, w = src_f.shape
+    The fitting region is restricted by valid_mask_u8.
+    """
+    if np.count_nonzero(valid_mask_u8) < 100:
+        return np.eye(2, 3, dtype=np.float32), False, None
 
-    x = np.asarray(x, dtype=np.float32)
-    y = np.asarray(y, dtype=np.float32)
+    template = normalize_for_ecc(cur_y, bit_depth)
+    inp = normalize_for_ecc(cam_warp_y, bit_depth)
 
-    valid = (
-        np.isfinite(x)
-        & np.isfinite(y)
-        & (x >= 0.0)
-        & (x <= w - 1)
-        & (y >= 0.0)
-        & (y <= h - 1)
+    warp = np.eye(2, 3, dtype=np.float32)
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        int(max_iters),
+        float(eps),
     )
 
-    xc = np.clip(x, 0.0, float(w - 1))
-    yc = np.clip(y, 0.0, float(h - 1))
+    try:
+        cc, warp = cv2.findTransformECC(
+            templateImage=template,
+            inputImage=inp,
+            warpMatrix=warp,
+            motionType=cv2.MOTION_AFFINE,
+            criteria=criteria,
+            inputMask=valid_mask_u8,
+            gaussFiltSize=5,
+        )
+        return warp.astype(np.float32), True, float(cc)
+    except cv2.error:
+        return np.eye(2, 3, dtype=np.float32), False, None
 
-    x0 = np.floor(xc).astype(np.int32)
-    y0 = np.floor(yc).astype(np.int32)
+
+def bilinear_sample_vectorized(img, xs, ys):
+    """Vectorized bilinear sampling for float32 grayscale images."""
+    h, w = img.shape
+
+    xs = np.asarray(xs, dtype=np.float32)
+    ys = np.asarray(ys, dtype=np.float32)
+
+    valid = (
+        np.isfinite(xs)
+        & np.isfinite(ys)
+        & (xs >= 0.0)
+        & (xs <= w - 1)
+        & (ys >= 0.0)
+        & (ys <= h - 1)
+    )
+
+    xs_safe = np.clip(xs, 0.0, float(w - 1))
+    ys_safe = np.clip(ys, 0.0, float(h - 1))
+
+    x0 = np.floor(xs_safe).astype(np.int32)
+    y0 = np.floor(ys_safe).astype(np.int32)
     x1 = np.minimum(x0 + 1, w - 1)
     y1 = np.minimum(y0 + 1, h - 1)
 
-    fx = xc - x0.astype(np.float32)
-    fy = yc - y0.astype(np.float32)
+    fx = xs_safe - x0.astype(np.float32)
+    fy = ys_safe - y0.astype(np.float32)
 
-    p00 = src_f[y0, x0]
-    p01 = src_f[y0, x1]
-    p10 = src_f[y1, x0]
-    p11 = src_f[y1, x1]
+    p00 = img[y0, x0]
+    p01 = img[y0, x1]
+    p10 = img[y1, x0]
+    p11 = img[y1, x1]
 
     a = p00 * (1.0 - fx) + p01 * fx
     b = p10 * (1.0 - fx) + p11 * fx
-    val = a * (1.0 - fy) + b * fy
+    out = a * (1.0 - fy) + b * fy
 
-    val = np.where(valid, val, 0.0).astype(np.float32)
-    return val, valid
+    out = out.astype(np.float32)
+    out[~valid] = 0.0
 
-
-def local_patch_sad_cost(
-    cur_y,
-    ref_y,
-    map_x,
-    map_y,
-    cx,
-    cy,
-    rdx,
-    rdy,
-    block_radius,
-):
-    h, w = cur_y.shape
-    br = int(block_radius)
-
-    x0 = int(cx) - br
-    x1 = int(cx) + br + 1
-    y0 = int(cy) - br
-    y1 = int(cy) + br + 1
-
-    if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
-        return float("inf")
-
-    cur_patch = cur_y[y0:y1, x0:x1].astype(np.float32)
-    mx = map_x[y0:y1, x0:x1].astype(np.float32) + float(rdx)
-    my = map_y[y0:y1, x0:x1].astype(np.float32) + float(rdy)
-
-    ref_patch, valid = bilinear_sample_float_np(ref_y, mx, my)
-
-    if not np.all(valid):
-        return float("inf")
-
-    return float(np.mean(np.abs(cur_patch - ref_patch)))
+    return out, valid
 
 
-def find_best_residual_for_sample(
-    cur_y,
-    ref_y,
-    map_x,
-    map_y,
-    x,
-    y,
-    search_range,
-    block_radius,
-    subpel_levels=0,
-    min_cur_var=0.0,
-):
-    h, w = cur_y.shape
-    br = int(block_radius)
-
-    x0 = int(x) - br
-    x1 = int(x) + br + 1
-    y0 = int(y) - br
-    y1 = int(y) + br + 1
-
-    if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
-        return False, 0.0, 0.0, float("inf")
-
-    if min_cur_var > 0.0:
-        cur_patch = cur_y[y0:y1, x0:x1].astype(np.float32)
-        if float(np.var(cur_patch)) < float(min_cur_var):
-            return False, 0.0, 0.0, float("inf")
-
-    best_cost = float("inf")
-    best_dx = 0.0
-    best_dy = 0.0
-
-    sr = int(search_range)
-    for dy in range(-sr, sr + 1):
-        for dx in range(-sr, sr + 1):
-            cost = local_patch_sad_cost(
-                cur_y,
-                ref_y,
-                map_x,
-                map_y,
-                x,
-                y,
-                float(dx),
-                float(dy),
-                block_radius,
-            )
-
-            if cost < best_cost:
-                best_cost = cost
-                best_dx = float(dx)
-                best_dy = float(dy)
-
-    if not np.isfinite(best_cost):
-        return False, 0.0, 0.0, float("inf")
-
-    refine_steps = []
-    if int(subpel_levels) >= 1:
-        refine_steps.append(0.5)
-    if int(subpel_levels) >= 2:
-        refine_steps.append(0.25)
-
-    for step in refine_steps:
-        base_dx = best_dx
-        base_dy = best_dy
-        for oy in [-step, 0.0, step]:
-            for ox in [-step, 0.0, step]:
-                dx = base_dx + ox
-                dy = base_dy + oy
-                cost = local_patch_sad_cost(
-                    cur_y,
-                    ref_y,
-                    map_x,
-                    map_y,
-                    x,
-                    y,
-                    dx,
-                    dy,
-                    block_radius,
-                )
-
-                if cost < best_cost:
-                    best_cost = cost
-                    best_dx = dx
-                    best_dy = dy
-
-    return True, float(best_dx), float(best_dy), float(best_cost)
-
-
-def collect_residual_samples_local_search(
-    cur_y,
-    ref_y,
-    map_x,
-    map_y,
-    valid_mask,
-    active_region,
-    sample_step,
-    search_range,
-    block_radius,
-    subpel_levels=0,
-    max_sample_cost=-1.0,
-    min_cur_var=0.0,
-):
-    ys, xs = active_region
-    y_start = ys.start
-    y_stop = ys.stop
-    x_start = xs.start
-    x_stop = xs.stop
-
-    br = int(block_radius)
-    step = max(1, int(sample_step))
-
-    samples = []
-    costs = []
-
-    y0 = y_start + br
-    y1 = y_stop - br
-    x0 = x_start + br
-    x1 = x_stop - br
-
-    if y1 <= y0 or x1 <= x0:
-        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-
-    for y in range(y0, y1, step):
-        for x in range(x0, x1, step):
-            if not bool(valid_mask[y, x]):
-                continue
-
-            ok, dx, dy, cost = find_best_residual_for_sample(
-                cur_y,
-                ref_y,
-                map_x,
-                map_y,
-                x,
-                y,
-                search_range=search_range,
-                block_radius=block_radius,
-                subpel_levels=subpel_levels,
-                min_cur_var=min_cur_var,
-            )
-
-            if not ok:
-                continue
-
-            if max_sample_cost is not None and float(max_sample_cost) >= 0.0:
-                if cost > float(max_sample_cost):
-                    continue
-
-            samples.append([float(x), float(y), float(dx), float(dy)])
-            costs.append(float(cost))
-
-    if not samples:
-        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-
-    return np.asarray(samples, dtype=np.float32), np.asarray(costs, dtype=np.float32)
-
-
-def affine_coeff_to_matrix(ax, ay, w, h):
-    """Convert normalized residual affine coefficients to 2x3 matrix.
-
-    Model:
-      dx = ax0 + ax1 * ((x-cx)/w) + ax2 * ((y-cy)/h)
-      dy = ay0 + ay1 * ((x-cx)/w) + ay2 * ((y-cy)/h)
-      x' = x + dx
-      y' = y + dy
+def params_to_affine_matrix_lk(p, w, h):
     """
+    LK parameterization:
+      x' = x + p0 + p1*xn + p2*yn
+      y' = y + p3 + p4*xn + p5*yn
+      xn = (x-cx)/w, yn = (y-cy)/h
+
+    Return 2x3 matrix A such that [x',y'] = A*[x,y,1].
+    """
+    p = np.asarray(p, dtype=np.float64).reshape(6)
     cx = 0.5 * float(w)
     cy = 0.5 * float(h)
     ww = max(float(w), 1e-12)
     hh = max(float(h), 1e-12)
 
-    ax0, ax1, ax2 = [float(v) for v in ax]
-    ay0, ay1, ay2 = [float(v) for v in ay]
-
-    A = np.array(
+    return np.array(
         [
-            [
-                1.0 + ax1 / ww,
-                ax2 / hh,
-                ax0 - ax1 * cx / ww - ax2 * cy / hh,
-            ],
-            [
-                ay1 / ww,
-                1.0 + ay2 / hh,
-                ay0 - ay1 * cx / ww - ay2 * cy / hh,
-            ],
+            [1.0 + p[1] / ww, p[2] / hh, p[0] - p[1] * cx / ww - p[2] * cy / hh],
+            [p[4] / ww, 1.0 + p[5] / hh, p[3] - p[4] * cx / ww - p[5] * cy / hh],
         ],
         dtype=np.float32,
     )
 
-    return A
 
-
-def fit_affine_residual_robust_lstsq(
-    samples,
-    w,
-    h,
-    min_samples=12,
-    robust_iters=2,
-    outlier_percent=25.0,
+def estimate_global_affine_bias_lk(
+    cur_y,
+    cam_warp_y,
+    valid_mask_u8,
+    bit_depth,
+    max_iters=30,
+    eps=1e-4,
+    sample_step=4,
+    normalize="zero_mean",
+    damping=1e-6,
+    max_update=4.0,
 ):
-    samples = np.asarray(samples, dtype=np.float32).reshape(-1, 4)
+    """
+    Fast non-ECC affine estimator.
 
-    stats = {
-        "num_samples_initial": int(samples.shape[0]),
-        "num_samples_final": 0,
-        "mean_fit_error": None,
-        "median_fit_error": None,
-        "max_fit_error": None,
-    }
+    It minimizes an SSD/zero-mean-SSD alignment objective between current Y and
+    cam-proj-only warped Y using a vectorized forward-additive Lucas-Kanade loop.
 
-    if samples.shape[0] < int(min_samples):
-        return None, None, False, stats
+    This is intended as a Python simulation path that is much closer to a C++
+    implementation than cv2.findTransformECC(), while avoiding the extremely
+    slow sparse local-search prototype.
 
+    Returns:
+      A, success, score
+    where score is negative RMSE after fitting, so larger is better.
+    """
+    if sample_step <= 0:
+        raise ValueError("sample_step must be positive")
+
+    mask = valid_mask_u8 > 0
+    if sample_step > 1:
+        sample_mask = np.zeros_like(mask, dtype=bool)
+        sample_mask[::sample_step, ::sample_step] = True
+        mask &= sample_mask
+
+    ys, xs = np.nonzero(mask)
+    if xs.size < 64:
+        return np.eye(2, 3, dtype=np.float32), False, None
+
+    maxv = float((1 << bit_depth) - 1)
+    T_img = np.clip(cur_y.astype(np.float32) / maxv, 0.0, 1.0)
+    I_img = np.clip(cam_warp_y.astype(np.float32) / maxv, 0.0, 1.0)
+
+    # Central-difference gradients of input image.  This maps cleanly to C++.
+    gy, gx = np.gradient(I_img)
+    gx = gx.astype(np.float32)
+    gy = gy.astype(np.float32)
+
+    xs = xs.astype(np.float32)
+    ys = ys.astype(np.float32)
+    T = T_img[ys.astype(np.int32), xs.astype(np.int32)].astype(np.float32)
+
+    h, w = cur_y.shape
     cx = 0.5 * float(w)
     cy = 0.5 * float(h)
-    ww = max(float(w), 1e-12)
-    hh = max(float(h), 1e-12)
+    xn = ((xs - cx) / max(float(w), 1e-12)).astype(np.float32)
+    yn = ((ys - cy) / max(float(h), 1e-12)).astype(np.float32)
 
-    work = samples.copy()
-    ax = None
-    ay = None
-    err = None
+    p = np.zeros(6, dtype=np.float64)
+    final_rmse = None
 
-    num_passes = max(1, int(robust_iters) + 1)
+    for _iter in range(int(max_iters)):
+        xw = xs + float(p[0]) + float(p[1]) * xn + float(p[2]) * yn
+        yw = ys + float(p[3]) + float(p[4]) * xn + float(p[5]) * yn
 
-    for it in range(num_passes):
-        x = work[:, 0].astype(np.float64)
-        y = work[:, 1].astype(np.float64)
-        dx = work[:, 2].astype(np.float64)
-        dy = work[:, 3].astype(np.float64)
+        I, valid = bilinear_sample_vectorized(I_img, xw, yw)
+        Ix, valid_x = bilinear_sample_vectorized(gx, xw, yw)
+        Iy, valid_y = bilinear_sample_vectorized(gy, xw, yw)
+        valid &= valid_x & valid_y
 
-        nx = (x - cx) / ww
-        ny = (y - cy) / hh
-        X = np.stack([np.ones_like(nx), nx, ny], axis=1)
-
-        ax, _, _, _ = np.linalg.lstsq(X, dx, rcond=None)
-        ay, _, _, _ = np.linalg.lstsq(X, dy, rcond=None)
-
-        pred_dx = X @ ax
-        pred_dy = X @ ay
-        err = np.sqrt((pred_dx - dx) ** 2 + (pred_dy - dy) ** 2)
-
-        if it >= num_passes - 1:
+        if np.count_nonzero(valid) < 64:
             break
 
-        pct = float(outlier_percent)
-        if pct <= 0.0:
-            continue
+        Tv = T[valid]
+        Iv = I[valid]
+        Ixv = Ix[valid]
+        Iyv = Iy[valid]
+        xnv = xn[valid]
+        ynv = yn[valid]
 
-        thr = np.percentile(err, max(0.0, min(100.0, 100.0 - pct)))
-        keep = err <= thr
+        if normalize == "none":
+            e = Tv - Iv
+            scale = 1.0
+        elif normalize == "zero_mean":
+            e = (Tv - np.mean(Tv)) - (Iv - np.mean(Iv))
+            scale = 1.0
+        elif normalize == "zncc_approx":
+            Tv0 = Tv - np.mean(Tv)
+            Iv0 = Iv - np.mean(Iv)
+            std_t = float(np.std(Tv0)) + 1e-6
+            std_i = float(np.std(Iv0)) + 1e-6
+            e = Tv0 / std_t - Iv0 / std_i
+            scale = 1.0 / std_i
+        else:
+            raise ValueError(f"Unknown LK normalize mode: {normalize}")
 
-        if int(np.count_nonzero(keep)) < int(min_samples):
+        # J is dI/dp. Linearized residual: e_new = e - J*dp.
+        J = np.empty((e.size, 6), dtype=np.float32)
+        J[:, 0] = Ixv * scale
+        J[:, 1] = Ixv * xnv * scale
+        J[:, 2] = Ixv * ynv * scale
+        J[:, 3] = Iyv * scale
+        J[:, 4] = Iyv * xnv * scale
+        J[:, 5] = Iyv * ynv * scale
+
+        H = (J.T @ J).astype(np.float64)
+        b = (J.T @ e.astype(np.float32)).astype(np.float64)
+
+        H += np.eye(6, dtype=np.float64) * float(damping)
+
+        try:
+            dp = np.linalg.solve(H, b)
+        except np.linalg.LinAlgError:
             break
 
-        work = work[keep]
+        dp_norm = float(np.linalg.norm(dp))
+        if not np.isfinite(dp_norm):
+            break
 
-    if ax is None or ay is None or err is None:
-        return None, None, False, stats
+        # Avoid catastrophic jumps on hard frames.
+        if max_update is not None and max_update > 0 and dp_norm > float(max_update):
+            dp *= float(max_update) / dp_norm
+            dp_norm = float(max_update)
 
-    stats["num_samples_final"] = int(work.shape[0])
-    stats["mean_fit_error"] = float(np.mean(err))
-    stats["median_fit_error"] = float(np.median(err))
-    stats["max_fit_error"] = float(np.max(err))
+        p += dp
+        final_rmse = float(np.sqrt(np.mean(e.astype(np.float64) ** 2)))
 
-    A = affine_coeff_to_matrix(ax, ay, w, h)
-    coeff = {
-        "ax": [float(v) for v in ax],
-        "ay": [float(v) for v in ay],
-    }
+        if dp_norm < float(eps):
+            break
 
-    return A.astype(np.float32), coeff, True, stats
+    A = params_to_affine_matrix_lk(p, w, h)
 
+    if final_rmse is None or not np.isfinite(final_rmse):
+        return np.eye(2, 3, dtype=np.float32), False, None
 
-def estimate_global_affine_bias_local_search(
-    cur_y,
-    ref_y,
-    map_x,
-    map_y,
-    w,
-    h,
-    active_region,
-    valid_erode=2,
-    sample_step=16,
-    search_range=4,
-    block_radius=2,
-    subpel_levels=0,
-    max_sample_cost=-1.0,
-    min_cur_var=0.0,
-    min_samples=12,
-    robust_iters=2,
-    outlier_percent=25.0,
-):
-    """Estimate global residual affine without ECC.
-
-    Method:
-      valid active-region sparse sampling
-      + local block matching around cam-proj map
-      + robust least-squares affine fitting to residual MV samples.
-    """
-    valid_mask = make_valid_bool_mask(
-        map_x,
-        map_y,
-        w,
-        h,
-        erode=valid_erode,
-        active_region=active_region,
-    )
-
-    samples, costs = collect_residual_samples_local_search(
-        cur_y=cur_y,
-        ref_y=ref_y,
-        map_x=map_x,
-        map_y=map_y,
-        valid_mask=valid_mask,
-        active_region=active_region,
-        sample_step=sample_step,
-        search_range=search_range,
-        block_radius=block_radius,
-        subpel_levels=subpel_levels,
-        max_sample_cost=max_sample_cost,
-        min_cur_var=min_cur_var,
-    )
-
-    A, coeff, ok, stats = fit_affine_residual_robust_lstsq(
-        samples,
-        w,
-        h,
-        min_samples=min_samples,
-        robust_iters=robust_iters,
-        outlier_percent=outlier_percent,
-    )
-
-    stats["estimator"] = "local_search_lstsq_no_ecc"
-    stats["num_samples_collected"] = int(samples.shape[0])
-    stats["sample_step"] = int(sample_step)
-    stats["search_range"] = int(search_range)
-    stats["block_radius"] = int(block_radius)
-    stats["subpel_levels"] = int(subpel_levels)
-    stats["max_sample_cost"] = None if float(max_sample_cost) < 0.0 else float(max_sample_cost)
-    stats["min_cur_var"] = float(min_cur_var)
-    stats["robust_iters"] = int(robust_iters)
-    stats["outlier_percent"] = float(outlier_percent)
-    stats["mean_sample_cost"] = float(np.mean(costs)) if costs.size > 0 else None
-    stats["median_sample_cost"] = float(np.median(costs)) if costs.size > 0 else None
-    stats["affine_coeff"] = coeff
-
-    if not ok:
-        return np.eye(2, 3, dtype=np.float32), False, stats
-
-    return A.astype(np.float32), True, stats
+    # score: larger is better, similar role to ECC cc for logging only.
+    score = -final_rmse
+    return A.astype(np.float32), True, float(score)
 
 
 def affine_cp_points(w, h, cp_num):
@@ -1561,6 +1382,15 @@ def main():
     # Global affine bias over cam-proj flow.
     ap.add_argument("--global-affine-bias", action="store_true")
     ap.add_argument(
+        "--affine-estimator",
+        choices=["ecc", "lk"],
+        default="lk",
+        help=(
+            "Global affine estimator. ecc uses cv2.findTransformECC; "
+            "lk uses a fast non-ECC vectorized Lucas-Kanade/SSD estimator."
+        ),
+    )
+    ap.add_argument(
         "--affine-cp-num",
         type=int,
         choices=[2, 3],
@@ -1582,66 +1412,34 @@ def main():
         default=16,
         help="Signed truncated Exp-Golomb range for affine CP bias.",
     )
+    ap.add_argument("--affine-ecc-iters", type=int, default=50)
+    ap.add_argument("--affine-ecc-eps", type=float, default=1e-4)
+    ap.add_argument("--affine-lk-iters", type=int, default=30)
+    ap.add_argument("--affine-lk-eps", type=float, default=1e-4)
+    ap.add_argument(
+        "--affine-lk-sample-step",
+        type=int,
+        default=4,
+        help="Pixel subsampling step for vectorized LK estimator. 1=all valid pixels, 4=every 4th pixel.",
+    )
+    ap.add_argument(
+        "--affine-lk-normalize",
+        choices=["none", "zero_mean", "zncc_approx"],
+        default="zero_mean",
+        help="Photometric normalization used by LK estimator.",
+    )
+    ap.add_argument("--affine-lk-damping", type=float, default=1e-6)
+    ap.add_argument(
+        "--affine-lk-max-update",
+        type=float,
+        default=4.0,
+        help="Maximum LK parameter update norm per iteration. Use <=0 to disable clamp.",
+    )
     ap.add_argument(
         "--affine-valid-erode",
         type=int,
         default=2,
-        help="Erode valid active-region mask before affine local-search sampling.",
-    )
-    ap.add_argument(
-        "--affine-sample-step",
-        type=int,
-        default=16,
-        help="Sparse sampling step for no-ECC local-search affine estimation.",
-    )
-    ap.add_argument(
-        "--affine-search-range",
-        type=int,
-        default=4,
-        help="Integer-pel residual search range around cam-proj position.",
-    )
-    ap.add_argument(
-        "--affine-block-radius",
-        type=int,
-        default=2,
-        help="Patch radius for local SAD matching. 2 means 5x5 block.",
-    )
-    ap.add_argument(
-        "--affine-subpel-levels",
-        type=int,
-        choices=[0, 1, 2],
-        default=1,
-        help="0: integer only, 1: add half-pel refinement, 2: add half+quarter refinement.",
-    )
-    ap.add_argument(
-        "--affine-max-sample-cost",
-        type=float,
-        default=-1.0,
-        help="Reject local samples whose average SAD cost exceeds this. Negative disables.",
-    )
-    ap.add_argument(
-        "--affine-min-cur-var",
-        type=float,
-        default=0.0,
-        help="Reject local samples with current patch variance below this threshold.",
-    )
-    ap.add_argument(
-        "--affine-min-samples",
-        type=int,
-        default=12,
-        help="Minimum residual samples required for affine fitting.",
-    )
-    ap.add_argument(
-        "--affine-robust-iters",
-        type=int,
-        default=2,
-        help="Number of outlier-rejection refit iterations.",
-    )
-    ap.add_argument(
-        "--affine-outlier-percent",
-        type=float,
-        default=25.0,
-        help="Percentage of largest fitting-error samples removed at each robust iteration.",
+        help="Erode valid active-region mask before affine estimation.",
     )
 
     ap.add_argument("--overwrite", action="store_true")
@@ -1658,18 +1456,6 @@ def main():
         raise ValueError("--affine-cp-step must be positive")
     if args.affine_cp_bits < 2:
         raise ValueError("--affine-cp-bits must be >= 2")
-    if args.affine_sample_step <= 0:
-        raise ValueError("--affine-sample-step must be positive")
-    if args.affine_search_range < 0:
-        raise ValueError("--affine-search-range must be non-negative")
-    if args.affine_block_radius < 0:
-        raise ValueError("--affine-block-radius must be non-negative")
-    if args.affine_min_samples < 3:
-        raise ValueError("--affine-min-samples must be >= 3")
-    if args.affine_robust_iters < 0:
-        raise ValueError("--affine-robust-iters must be non-negative")
-    if args.affine_outlier_percent < 0 or args.affine_outlier_percent >= 100:
-        raise ValueError("--affine-outlier-percent must be in [0, 100)")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -1842,7 +1628,7 @@ def main():
     print(f"pose_mode             : {pose_mode}")
     print(f"warp_filter           : {args.warp_filter}")
     print(f"global affine bias    : {args.global_affine_bias}")
-    print("affine estimator      : local_search_lstsq_no_ecc")
+    print(f"affine estimator      : {args.affine_estimator}")
     print("------------------------------------------------------------")
     print(f"ext-bits              : {args.ext_bits}")
     print(f"r-step                : {args.r_step}")
@@ -1852,10 +1638,6 @@ def main():
     print(f"affine-cp-num         : {args.affine_cp_num}")
     print(f"affine-cp-bits        : {args.affine_cp_bits}")
     print(f"affine-cp-step        : {args.affine_cp_step}")
-    print(f"affine-sample-step    : {args.affine_sample_step}")
-    print(f"affine-search-range   : {args.affine_search_range}")
-    print(f"affine-block-radius   : {args.affine_block_radius}")
-    print(f"affine-subpel-levels  : {args.affine_subpel_levels}")
     print("============================================================")
 
     with open(out_q_jsonl, "w", encoding="utf-8") as fq:
@@ -1925,8 +1707,8 @@ def main():
 
             "global_affine_bias": {
                 "enabled": bool(args.global_affine_bias),
+                "estimator": args.affine_estimator,
                 "mode": "final_map = cam_proj_map + affine_bias(x,y)",
-                "estimator": "local_search_lstsq_no_ecc",
                 "fit_region": "valid cam-proj pixels inside active source region only",
                 "cp_num": int(args.affine_cp_num),
                 "cp_convention": (
@@ -1943,18 +1725,6 @@ def main():
                 "cp_bits": args.affine_cp_bits,
                 "cp_q_abs_max": q_abs_max_affine_cp,
                 "bit_model": "signed truncated Exp-Golomb, 50:50 bin probability, 1 bin = 1 bit",
-                "local_search": {
-                    "sample_step": args.affine_sample_step,
-                    "search_range": args.affine_search_range,
-                    "block_radius": args.affine_block_radius,
-                    "subpel_levels": args.affine_subpel_levels,
-                    "valid_erode": args.affine_valid_erode,
-                    "max_sample_cost": None if args.affine_max_sample_cost < 0.0 else args.affine_max_sample_cost,
-                    "min_cur_var": args.affine_min_cur_var,
-                    "min_samples": args.affine_min_samples,
-                    "robust_iters": args.affine_robust_iters,
-                    "outlier_percent": args.affine_outlier_percent,
-                },
             },
 
             "bit_count": {
@@ -2227,7 +1997,7 @@ def main():
             # ------------------------------------------------------------
             affine_enabled = bool(args.global_affine_bias)
             affine_success = False
-            affine_est_stats = {}
+            affine_cc = None
             affine_flag_bits = 0
             affine_cp_bits_total = 0
             affine_cp_bits_each = [0] * (args.affine_cp_num * 2)
@@ -2246,25 +2016,39 @@ def main():
                 total_affine_flag_bits += affine_flag_bits
                 total_affine_frames += 1
 
-                affine_matrix_est, affine_success, affine_est_stats = estimate_global_affine_bias_local_search(
-                    cur_y=cur_y_pad,
-                    ref_y=prev_y_pad,
-                    map_x=map_x,
-                    map_y=map_y,
-                    w=coded_w,
-                    h=coded_h,
+                valid_mask_u8 = make_valid_u8_mask(
+                    map_x,
+                    map_y,
+                    coded_w,
+                    coded_h,
+                    erode=args.affine_valid_erode,
                     active_region=(ys_active, xs_active),
-                    valid_erode=args.affine_valid_erode,
-                    sample_step=args.affine_sample_step,
-                    search_range=args.affine_search_range,
-                    block_radius=args.affine_block_radius,
-                    subpel_levels=args.affine_subpel_levels,
-                    max_sample_cost=args.affine_max_sample_cost,
-                    min_cur_var=args.affine_min_cur_var,
-                    min_samples=args.affine_min_samples,
-                    robust_iters=args.affine_robust_iters,
-                    outlier_percent=args.affine_outlier_percent,
                 )
+
+                if args.affine_estimator == "ecc":
+                    affine_matrix_est, affine_success, affine_cc = estimate_global_affine_bias_ecc(
+                        cur_y=cur_y_pad,
+                        cam_warp_y=wy_cam,
+                        valid_mask_u8=valid_mask_u8,
+                        bit_depth=bit_depth,
+                        max_iters=args.affine_ecc_iters,
+                        eps=args.affine_ecc_eps,
+                    )
+                elif args.affine_estimator == "lk":
+                    affine_matrix_est, affine_success, affine_cc = estimate_global_affine_bias_lk(
+                        cur_y=cur_y_pad,
+                        cam_warp_y=wy_cam,
+                        valid_mask_u8=valid_mask_u8,
+                        bit_depth=bit_depth,
+                        max_iters=args.affine_lk_iters,
+                        eps=args.affine_lk_eps,
+                        sample_step=args.affine_lk_sample_step,
+                        normalize=args.affine_lk_normalize,
+                        damping=args.affine_lk_damping,
+                        max_update=args.affine_lk_max_update,
+                    )
+                else:
+                    raise ValueError(args.affine_estimator)
 
                 if affine_success:
                     total_affine_success_frames += 1
@@ -2402,8 +2186,7 @@ def main():
                     "enabled": affine_enabled,
                     "cp_num": int(args.affine_cp_num),
                     "success": affine_success,
-                    "estimator": "local_search_lstsq_no_ecc",
-                    "estimator_stats": affine_est_stats,
+                    "ecc_cc": json_safe_float(affine_cc),
                     "flag_bits_50_50": int(affine_flag_bits),
                     "cp_q": affine_cp_q.astype(int).tolist(),
                     "cp_dec": affine_cp_dec.astype(float).tolist(),
@@ -2566,6 +2349,7 @@ def main():
     print("Global affine bias")
     print("------------------------------------------------------------")
     print(f"affine enabled        : {args.global_affine_bias}")
+    print(f"affine estimator      : {args.affine_estimator}")
     print(f"affine frames         : {total_affine_frames}")
     print(f"affine success frames : {total_affine_success_frames}")
     print(f"affine clipped frames : {total_affine_clipped_frames}")
@@ -2575,13 +2359,10 @@ def main():
     print(f"affine cp num         : {args.affine_cp_num}")
     print(f"affine cp step        : {args.affine_cp_step}")
     print(f"affine cp bits range  : [-{q_abs_max_affine_cp}, {q_abs_max_affine_cp}]")
-    print("affine estimator      : local_search_lstsq_no_ecc")
-    print(f"affine sample step    : {args.affine_sample_step}")
-    print(f"affine search range   : {args.affine_search_range}")
-    print(f"affine block radius   : {args.affine_block_radius}")
-    print(f"affine subpel levels  : {args.affine_subpel_levels}")
-    print(f"affine robust iters   : {args.affine_robust_iters}")
-    print(f"affine outlier pct    : {args.affine_outlier_percent}")
+    if args.affine_estimator == "lk":
+        print(f"affine lk sample step : {args.affine_lk_sample_step}")
+        print(f"affine lk iters       : {args.affine_lk_iters}")
+        print(f"affine lk normalize   : {args.affine_lk_normalize}")
 
     if total_affine_success_frames > 0:
         avg_affine_cp_bits = total_affine_cp_bits / total_affine_success_frames
