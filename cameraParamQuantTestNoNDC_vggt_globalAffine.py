@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Project previous frame to current frame using decoded depth/camera parameters,
-with optional global 3CP affine bias correction over cam-proj flow.
+with optional global 2CP/3CP affine bias correction over cam-proj flow.
 
 Main addition:
   --global-affine-bias
@@ -12,8 +12,8 @@ Flow:
   2) Warp previous frame with cam-proj map only.
   3) Estimate one global affine correction from cam-warped Y to current Y
      using only valid active-region pixels.
-  4) Convert affine correction to 3 control-point biases.
-  5) Quantize/decode the 3CP bias and estimate bits assuming 50:50 bin probability.
+  4) Convert affine correction to 2 or 3 control-point biases.
+  5) Quantize/decode the CP bias and estimate bits assuming 50:50 bin probability.
   6) Apply decoded affine bias to cam-proj map and perform final warp.
 """
 
@@ -720,49 +720,94 @@ def estimate_global_affine_bias_ecc(
         return np.eye(2, 3, dtype=np.float32), False, None
 
 
-def affine_matrix_to_cp_bias(A, w, h):
-    """
-    Convert affine coordinate warp to 3CP bias.
+def affine_cp_points(w, h, cp_num):
+    """Return CP coordinates used for coding.
 
-    CP convention:
-      CP0 = (0, 0)
-      CP1 = (w, 0)
-      CP2 = (0, h)
+    cp_num=2 follows a 4-parameter affine/similarity-style convention:
+      CP0=(0,0), CP1=(w,0), CP2 is derived.
+
+    cp_num=3 follows full 6-parameter affine:
+      CP0=(0,0), CP1=(w,0), CP2=(0,h).
+    """
+    if cp_num == 2:
+        return np.array(
+            [
+                [0.0, 0.0],
+                [float(w), 0.0],
+            ],
+            dtype=np.float32,
+        )
+    if cp_num == 3:
+        return np.array(
+            [
+                [0.0, 0.0],
+                [float(w), 0.0],
+                [0.0, float(h)],
+            ],
+            dtype=np.float32,
+        )
+    raise ValueError(f"cp_num must be 2 or 3, got {cp_num}")
+
+
+def affine_matrix_to_cp_bias(A, w, h, cp_num=3):
+    """Convert affine coordinate warp to coded CP bias.
+
+    For cp_num=3, all three CP biases are extracted from the estimated affine.
+    For cp_num=2, only CP0/CP1 are extracted.  The decoder reconstructs a
+    constrained 4-parameter affine from those two CPs.
 
     bias = warped_cp - original_cp
     """
-    src = np.array(
-        [
-            [0.0, 0.0],
-            [float(w), 0.0],
-            [0.0, float(h)],
-        ],
-        dtype=np.float32,
-    )
-
-    ones = np.ones((3, 1), dtype=np.float32)
+    src = affine_cp_points(w, h, cp_num)
+    ones = np.ones((src.shape[0], 1), dtype=np.float32)
     src_homo = np.concatenate([src, ones], axis=1)
 
-    dst = src_homo @ A.T
+    dst = src_homo @ np.asarray(A, dtype=np.float32).T
     bias = dst - src
 
     return bias.astype(np.float32)
 
 
-def cp_bias_to_affine_matrix(cp_bias, w, h):
-    src = np.array(
-        [
-            [0.0, 0.0],
-            [float(w), 0.0],
-            [0.0, float(h)],
-        ],
-        dtype=np.float32,
-    )
+def cp_bias_to_affine_matrix(cp_bias, w, h, cp_num=3):
+    """Reconstruct affine matrix from decoded CP bias.
 
-    dst = src + np.asarray(cp_bias, dtype=np.float32).reshape(3, 2)
+    cp_num=3: full affine from CP0/CP1/CP2.
+    cp_num=2: constrained 4-parameter model from CP0/CP1:
+      x' = a*x - b*y + tx
+      y' = b*x + a*y + ty
+    where CP0 gives tx/ty and CP1 gives a/b.
+    """
+    cp_bias = np.asarray(cp_bias, dtype=np.float32).reshape(cp_num, 2)
 
-    A = cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32))
-    return A.astype(np.float32)
+    if cp_num == 3:
+        src = affine_cp_points(w, h, 3)
+        dst = src + cp_bias
+        A = cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32))
+        return A.astype(np.float32)
+
+    if cp_num == 2:
+        dx0, dy0 = float(cp_bias[0, 0]), float(cp_bias[0, 1])
+        dx1, dy1 = float(cp_bias[1, 0]), float(cp_bias[1, 1])
+
+        ww = max(float(w), 1e-12)
+        tx = dx0
+        ty = dy0
+
+        # CP0 original=(0,0), warped=(dx0,dy0)
+        # CP1 original=(w,0), warped=(w+dx1,dy1)
+        # For x'=a*x-b*y+tx, y'=b*x+a*y+ty:
+        a = (float(w) + dx1 - tx) / ww
+        b = (dy1 - ty) / ww
+
+        return np.array(
+            [
+                [a, -b, tx],
+                [b,  a, ty],
+            ],
+            dtype=np.float32,
+        )
+
+    raise ValueError(f"cp_num must be 2 or 3, got {cp_num}")
 
 
 def apply_affine_bias_to_map(map_x, map_y, A):
@@ -808,13 +853,14 @@ def apply_affine_bias_to_map(map_x, map_y, A):
     return out_x, out_y
 
 
-def quantize_affine_cp_bias(cp_bias, step, bits):
+def quantize_affine_cp_bias(cp_bias, step, bits, cp_num=3):
     """
-    cp_bias: [3,2] in pixel units.
-    6 components are coded with signed truncated Exp-Golomb.
+    cp_bias: [cp_num,2] in pixel units.
+    Components are coded with signed truncated Exp-Golomb.
     Bit estimate assumes 50:50 bin probability, so bin count = bit count.
     """
-    flat = np.asarray(cp_bias, dtype=np.float32).reshape(6)
+    cp_bias = np.asarray(cp_bias, dtype=np.float32).reshape(cp_num, 2)
+    flat = cp_bias.reshape(cp_num * 2)
 
     q, dec, clipped = quant_s(flat, step=step, bits=bits)
 
@@ -825,12 +871,20 @@ def quantize_affine_cp_bias(cp_bias, step, bits):
     )
 
     return (
-        q.astype(np.int32).reshape(3, 2),
-        dec.astype(np.float32).reshape(3, 2),
-        clipped.reshape(3, 2),
+        q.astype(np.int32).reshape(cp_num, 2),
+        dec.astype(np.float32).reshape(cp_num, 2),
+        clipped.reshape(cp_num, 2),
         bits_each,
         int(bits_total),
     )
+
+
+def affine_cp_component_names(cp_num):
+    names = []
+    for i in range(cp_num):
+        names.append(f"cp{i}_dx")
+        names.append(f"cp{i}_dy")
+    return names
 
 
 # ============================================================
@@ -1121,10 +1175,20 @@ def main():
     # Global affine bias over cam-proj flow.
     ap.add_argument("--global-affine-bias", action="store_true")
     ap.add_argument(
+        "--affine-cp-num",
+        type=int,
+        choices=[2, 3],
+        default=3,
+        help=(
+            "Number of affine control points to code. "
+            "3 = full 6-parameter affine, 2 = constrained 4-parameter affine using CP0/CP1."
+        ),
+    )
+    ap.add_argument(
         "--affine-cp-step",
         type=float,
         default=1.0 / 16.0,
-        help="3CP affine bias quantization step in pixel units.",
+        help="Affine CP bias quantization step in pixel units.",
     )
     ap.add_argument(
         "--affine-cp-bits",
@@ -1291,7 +1355,7 @@ def main():
     total_affine_frames = 0
     total_affine_success_frames = 0
     total_affine_clipped_frames = 0
-    total_affine_bits_each = np.zeros(6, dtype=np.int64)
+    total_affine_bits_each = np.zeros(args.affine_cp_num * 2, dtype=np.int64)
 
     total_coded_frames = 0
     total_clipped_frames = 0
@@ -1333,6 +1397,7 @@ def main():
     print(f"t-step-norm           : {args.t_step_norm}")
     print(f"intr-delta-bits       : {args.intr_delta_bits}")
     print(f"intr-step             : {args.intr_step}")
+    print(f"affine-cp-num         : {args.affine_cp_num}")
     print(f"affine-cp-bits        : {args.affine_cp_bits}")
     print(f"affine-cp-step        : {args.affine_cp_step}")
     print("============================================================")
@@ -1406,7 +1471,17 @@ def main():
                 "enabled": bool(args.global_affine_bias),
                 "mode": "final_map = cam_proj_map + affine_bias(x,y)",
                 "fit_region": "valid cam-proj pixels inside active source region only",
-                "cp_convention": ["CP0=(0,0)", "CP1=(coded_w,0)", "CP2=(0,coded_h)"],
+                "cp_num": int(args.affine_cp_num),
+                "cp_convention": (
+                    ["CP0=(0,0)", "CP1=(coded_w,0)"]
+                    if args.affine_cp_num == 2
+                    else ["CP0=(0,0)", "CP1=(coded_w,0)", "CP2=(0,coded_h)"]
+                ),
+                "cp_num_note": (
+                    "2CP reconstructs constrained 4-parameter affine; CP2 is derived from CP0/CP1"
+                    if args.affine_cp_num == 2
+                    else "3CP reconstructs full 6-parameter affine"
+                ),
                 "cp_step": args.affine_cp_step,
                 "cp_bits": args.affine_cp_bits,
                 "cp_q_abs_max": q_abs_max_affine_cp,
@@ -1686,9 +1761,9 @@ def main():
             affine_cc = None
             affine_flag_bits = 0
             affine_cp_bits_total = 0
-            affine_cp_bits_each = [0, 0, 0, 0, 0, 0]
-            affine_cp_q = np.zeros((3, 2), dtype=np.int32)
-            affine_cp_dec = np.zeros((3, 2), dtype=np.float32)
+            affine_cp_bits_each = [0] * (args.affine_cp_num * 2)
+            affine_cp_q = np.zeros((args.affine_cp_num, 2), dtype=np.int32)
+            affine_cp_dec = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
             affine_cp_clipped = False
             affine_matrix_est = np.eye(2, 3, dtype=np.float32)
             affine_matrix_dec = np.eye(2, 3, dtype=np.float32)
@@ -1727,6 +1802,7 @@ def main():
                         affine_matrix_est,
                         coded_w,
                         coded_h,
+                        cp_num=args.affine_cp_num,
                     )
 
                     (
@@ -1739,6 +1815,7 @@ def main():
                         cp_bias_est,
                         step=args.affine_cp_step,
                         bits=args.affine_cp_bits,
+                        cp_num=args.affine_cp_num,
                     )
 
                     affine_cp_clipped = bool(np.any(affine_cp_clip_arr))
@@ -1756,6 +1833,7 @@ def main():
                         affine_cp_dec,
                         coded_w,
                         coded_h,
+                        cp_num=args.affine_cp_num,
                     )
 
                     map_x_final, map_y_final = apply_affine_bias_to_map(
@@ -1851,6 +1929,7 @@ def main():
 
                 "global_affine_bias": {
                     "enabled": affine_enabled,
+                    "cp_num": int(args.affine_cp_num),
                     "success": affine_success,
                     "ecc_cc": json_safe_float(affine_cc),
                     "flag_bits_50_50": int(affine_flag_bits),
@@ -2021,6 +2100,7 @@ def main():
     print(f"affine flag bits      : {total_affine_flag_bits} bits")
     print(f"affine CP bits        : {total_affine_cp_bits} bits")
     print(f"affine total bits     : {total_affine_flag_bits + total_affine_cp_bits} bits")
+    print(f"affine cp num         : {args.affine_cp_num}")
     print(f"affine cp step        : {args.affine_cp_step}")
     print(f"affine cp bits range  : [-{q_abs_max_affine_cp}, {q_abs_max_affine_cp}]")
 
@@ -2033,15 +2113,11 @@ def main():
 
         print(f"avg affine CP bits/frame    : {avg_affine_cp_bits:.3f}")
         print(f"avg affine total bits/frame : {avg_affine_total_bits:.3f}")
-        print(
-            "avg affine bits each        : "
-            f"cp0_dx={avg_affine_each[0]:.3f}, "
-            f"cp0_dy={avg_affine_each[1]:.3f}, "
-            f"cp1_dx={avg_affine_each[2]:.3f}, "
-            f"cp1_dy={avg_affine_each[3]:.3f}, "
-            f"cp2_dx={avg_affine_each[4]:.3f}, "
-            f"cp2_dy={avg_affine_each[5]:.3f}"
-        )
+        avg_affine_parts = [
+            f"{name}={val:.3f}"
+            for name, val in zip(affine_cp_component_names(args.affine_cp_num), avg_affine_each)
+        ]
+        print("avg affine bits each        : " + ", ".join(avg_affine_parts))
 
     print("------------------------------------------------------------")
     print(f"total bits            : {total_bits} bits")
