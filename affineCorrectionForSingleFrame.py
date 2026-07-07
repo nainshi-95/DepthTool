@@ -749,23 +749,37 @@ def estimate_global_affine_bias_lk(
     normalize="zero_mean",
     damping=1e-6,
     max_update=4.0,
+    robust_iters=0,
+    outlier_percent=0.0,
+    min_samples=128,
+    min_keep_ratio=0.25,
 ):
     """
-    Fast non-ECC affine estimator.
+    Fast non-ECC affine estimator with optional robust outlier rejection.
 
-    It minimizes an SSD/zero-mean-SSD alignment objective between current Y and
-    cam-proj-only warped Y using a vectorized forward-additive Lucas-Kanade loop.
+    Objective:
+      align cam-proj-only warped Y to current Y using a vectorized
+      forward-additive Lucas-Kanade / SSD affine fitting loop.
 
-    This is intended as a Python simulation path that is much closer to a C++
-    implementation than cv2.findTransformECC(), while avoiding the extremely
-    slow sparse local-search prototype.
+    Robust loop:
+      1) fit affine with current inlier set
+      2) compute per-sample residual under fitted affine
+      3) remove the largest residual samples by percentile
+      4) repeat fitting
+
+    This is useful for large POC distance where occlusion, object motion,
+    depth error, and projection holes produce unstable samples.
 
     Returns:
-      A, success, score
+      A, success, score, stats
     where score is negative RMSE after fitting, so larger is better.
     """
     if sample_step <= 0:
         raise ValueError("sample_step must be positive")
+    if min_samples <= 0:
+        raise ValueError("min_samples must be positive")
+    if min_keep_ratio <= 0.0 or min_keep_ratio > 1.0:
+        raise ValueError("min_keep_ratio must be in (0,1]")
 
     mask = valid_mask_u8 > 0
     if sample_step > 1:
@@ -773,22 +787,30 @@ def estimate_global_affine_bias_lk(
         sample_mask[::sample_step, ::sample_step] = True
         mask &= sample_mask
 
-    ys, xs = np.nonzero(mask)
-    if xs.size < 64:
-        return np.eye(2, 3, dtype=np.float32), False, None
+    ys_i, xs_i = np.nonzero(mask)
+    total_initial = int(xs_i.size)
+    if total_initial < int(min_samples):
+        stats = {
+            "num_samples_initial": total_initial,
+            "num_samples_final": 0,
+            "robust_iters_requested": int(robust_iters),
+            "robust_iters_done": 0,
+            "reason": "too_few_initial_samples",
+        }
+        return np.eye(2, 3, dtype=np.float32), False, None, stats
 
     maxv = float((1 << bit_depth) - 1)
     T_img = np.clip(cur_y.astype(np.float32) / maxv, 0.0, 1.0)
     I_img = np.clip(cam_warp_y.astype(np.float32) / maxv, 0.0, 1.0)
 
-    # Central-difference gradients of input image.  This maps cleanly to C++.
+    # Central-difference gradients of input image. This maps cleanly to C++.
     gy, gx = np.gradient(I_img)
     gx = gx.astype(np.float32)
     gy = gy.astype(np.float32)
 
-    xs = xs.astype(np.float32)
-    ys = ys.astype(np.float32)
-    T = T_img[ys.astype(np.int32), xs.astype(np.int32)].astype(np.float32)
+    xs = xs_i.astype(np.float32)
+    ys = ys_i.astype(np.float32)
+    T_all = T_img[ys_i, xs_i].astype(np.float32)
 
     h, w = cur_y.shape
     cx = 0.5 * float(w)
@@ -796,28 +818,16 @@ def estimate_global_affine_bias_lk(
     xn = ((xs - cx) / max(float(w), 1e-12)).astype(np.float32)
     yn = ((ys - cy) / max(float(h), 1e-12)).astype(np.float32)
 
-    p = np.zeros(6, dtype=np.float64)
-    final_rmse = None
-
-    for _iter in range(int(max_iters)):
+    def sample_with_params(p):
         xw = xs + float(p[0]) + float(p[1]) * xn + float(p[2]) * yn
         yw = ys + float(p[3]) + float(p[4]) * xn + float(p[5]) * yn
-
-        I, valid = bilinear_sample_vectorized(I_img, xw, yw)
+        I, valid_i = bilinear_sample_vectorized(I_img, xw, yw)
         Ix, valid_x = bilinear_sample_vectorized(gx, xw, yw)
         Iy, valid_y = bilinear_sample_vectorized(gy, xw, yw)
-        valid &= valid_x & valid_y
+        valid = valid_i & valid_x & valid_y
+        return I, Ix, Iy, valid
 
-        if np.count_nonzero(valid) < 64:
-            break
-
-        Tv = T[valid]
-        Iv = I[valid]
-        Ixv = Ix[valid]
-        Iyv = Iy[valid]
-        xnv = xn[valid]
-        ynv = yn[valid]
-
+    def make_residual(Tv, Iv):
         if normalize == "none":
             e = Tv - Iv
             scale = 1.0
@@ -833,50 +843,173 @@ def estimate_global_affine_bias_lk(
             scale = 1.0 / std_i
         else:
             raise ValueError(f"Unknown LK normalize mode: {normalize}")
+        return e.astype(np.float32), float(scale)
 
-        # J is dI/dp. Linearized residual: e_new = e - J*dp.
-        J = np.empty((e.size, 6), dtype=np.float32)
-        J[:, 0] = Ixv * scale
-        J[:, 1] = Ixv * xnv * scale
-        J[:, 2] = Ixv * ynv * scale
-        J[:, 3] = Iyv * scale
-        J[:, 4] = Iyv * xnv * scale
-        J[:, 5] = Iyv * ynv * scale
+    def compute_errors(p, keep_mask):
+        I, _, _, valid_warp = sample_with_params(p)
+        valid = keep_mask & valid_warp
+        if np.count_nonzero(valid) < int(min_samples):
+            return None, valid
+        e, _scale = make_residual(T_all[valid], I[valid])
+        err = np.full(xs.shape[0], np.inf, dtype=np.float32)
+        err[valid] = np.abs(e).astype(np.float32)
+        return err, valid
 
-        H = (J.T @ J).astype(np.float64)
-        b = (J.T @ e.astype(np.float32)).astype(np.float64)
+    def fit_once(p_init, keep_mask):
+        p_cur = np.asarray(p_init, dtype=np.float64).reshape(6).copy()
+        final_rmse = None
+        iters_done = 0
+        num_valid_last = 0
 
-        H += np.eye(6, dtype=np.float64) * float(damping)
+        for it in range(int(max_iters)):
+            I, Ix, Iy, valid_warp = sample_with_params(p_cur)
+            valid = keep_mask & valid_warp
+            num_valid = int(np.count_nonzero(valid))
+            num_valid_last = num_valid
+            if num_valid < int(min_samples):
+                break
 
-        try:
-            dp = np.linalg.solve(H, b)
-        except np.linalg.LinAlgError:
+            Tv = T_all[valid]
+            Iv = I[valid]
+            Ixv = Ix[valid]
+            Iyv = Iy[valid]
+            xnv = xn[valid]
+            ynv = yn[valid]
+
+            e, scale = make_residual(Tv, Iv)
+
+            # J is dI/dp. Linearized residual: e_new = e - J*dp.
+            J = np.empty((e.size, 6), dtype=np.float32)
+            J[:, 0] = Ixv * scale
+            J[:, 1] = Ixv * xnv * scale
+            J[:, 2] = Ixv * ynv * scale
+            J[:, 3] = Iyv * scale
+            J[:, 4] = Iyv * xnv * scale
+            J[:, 5] = Iyv * ynv * scale
+
+            H = (J.T @ J).astype(np.float64)
+            b = (J.T @ e.astype(np.float32)).astype(np.float64)
+            H += np.eye(6, dtype=np.float64) * float(damping)
+
+            try:
+                dp = np.linalg.solve(H, b)
+            except np.linalg.LinAlgError:
+                break
+
+            dp_norm = float(np.linalg.norm(dp))
+            if not np.isfinite(dp_norm):
+                break
+
+            if max_update is not None and max_update > 0 and dp_norm > float(max_update):
+                dp *= float(max_update) / dp_norm
+                dp_norm = float(max_update)
+
+            p_cur += dp
+            final_rmse = float(np.sqrt(np.mean(e.astype(np.float64) ** 2)))
+            iters_done = it + 1
+
+            if dp_norm < float(eps):
+                break
+
+        return p_cur, final_rmse, iters_done, num_valid_last
+
+    p = np.zeros(6, dtype=np.float64)
+    keep = np.ones(xs.shape[0], dtype=bool)
+
+    robust_iters = max(0, int(robust_iters))
+    outlier_percent = float(outlier_percent)
+    outlier_percent = max(0.0, min(outlier_percent, 95.0))
+
+    history = []
+    final_rmse = None
+    final_lk_iters = 0
+    final_valid = 0
+
+    # Number of robust rounds.  robust_iters=0 means one normal LK fit only.
+    num_rounds = robust_iters + 1
+    for r in range(num_rounds):
+        p, final_rmse, lk_iters, num_valid = fit_once(p, keep)
+        final_lk_iters += int(lk_iters)
+        final_valid = int(num_valid)
+
+        err, valid_for_err = compute_errors(p, keep)
+        if err is None:
+            history.append({
+                "round": int(r),
+                "num_keep_before": int(np.count_nonzero(keep)),
+                "num_valid": int(np.count_nonzero(valid_for_err)),
+                "rmse": json_safe_float(final_rmse),
+                "reason": "too_few_valid_for_error",
+            })
             break
 
-        dp_norm = float(np.linalg.norm(dp))
-        if not np.isfinite(dp_norm):
+        finite_err = err[np.isfinite(err)]
+        mean_abs = float(np.mean(finite_err)) if finite_err.size else None
+        median_abs = float(np.median(finite_err)) if finite_err.size else None
+        p90_abs = float(np.percentile(finite_err, 90.0)) if finite_err.size else None
+
+        history.append({
+            "round": int(r),
+            "num_keep_before": int(np.count_nonzero(keep)),
+            "num_valid": int(finite_err.size),
+            "rmse": json_safe_float(final_rmse),
+            "mean_abs_residual": json_safe_float(mean_abs),
+            "median_abs_residual": json_safe_float(median_abs),
+            "p90_abs_residual": json_safe_float(p90_abs),
+        })
+
+        # Last round: do not remove more outliers.
+        if r >= robust_iters or outlier_percent <= 0.0:
             break
 
-        # Avoid catastrophic jumps on hard frames.
-        if max_update is not None and max_update > 0 and dp_norm > float(max_update):
-            dp *= float(max_update) / dp_norm
-            dp_norm = float(max_update)
-
-        p += dp
-        final_rmse = float(np.sqrt(np.mean(e.astype(np.float64) ** 2)))
-
-        if dp_norm < float(eps):
+        valid_idx = np.flatnonzero(np.isfinite(err))
+        if valid_idx.size < int(min_samples):
             break
+
+        keep_ratio = max(float(min_keep_ratio), 1.0 - outlier_percent / 100.0)
+        num_keep_target = int(round(float(valid_idx.size) * keep_ratio))
+        num_keep_target = max(int(min_samples), min(num_keep_target, int(valid_idx.size)))
+
+        # Keep lowest residual samples. Deterministic and C++-friendly.
+        order = np.argsort(err[valid_idx], kind="stable")
+        selected = valid_idx[order[:num_keep_target]]
+        new_keep = np.zeros_like(keep, dtype=bool)
+        new_keep[selected] = True
+
+        if np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
 
     A = params_to_affine_matrix_lk(p, w, h)
 
-    if final_rmse is None or not np.isfinite(final_rmse):
-        return np.eye(2, 3, dtype=np.float32), False, None
+    if final_rmse is None or not np.isfinite(final_rmse) or final_valid < int(min_samples):
+        stats = {
+            "num_samples_initial": total_initial,
+            "num_samples_final": int(np.count_nonzero(keep)),
+            "num_valid_final": int(final_valid),
+            "robust_iters_requested": int(robust_iters),
+            "robust_iters_done": max(0, len(history) - 1),
+            "lk_iters_total": int(final_lk_iters),
+            "history": history,
+            "reason": "fit_failed_or_too_few_final_samples",
+        }
+        return np.eye(2, 3, dtype=np.float32), False, None, stats
 
-    # score: larger is better, similar role to ECC cc for logging only.
-    score = -final_rmse
-    return A.astype(np.float32), True, float(score)
-
+    score = -float(final_rmse)
+    stats = {
+        "num_samples_initial": total_initial,
+        "num_samples_final": int(np.count_nonzero(keep)),
+        "num_valid_final": int(final_valid),
+        "robust_iters_requested": int(robust_iters),
+        "robust_iters_done": max(0, len(history) - 1),
+        "outlier_percent": float(outlier_percent),
+        "min_keep_ratio": float(min_keep_ratio),
+        "min_samples": int(min_samples),
+        "lk_iters_total": int(final_lk_iters),
+        "final_rmse": float(final_rmse),
+        "history": history,
+    }
+    return A.astype(np.float32), True, float(score), stats
 
 def affine_cp_points(w, h, cp_num):
     """Return CP coordinates used for coding.
@@ -1494,6 +1627,30 @@ def main():
     )
     ap.add_argument("--affine-lk-damping", type=float, default=1e-6)
     ap.add_argument("--affine-lk-max-update", type=float, default=4.0)
+    ap.add_argument(
+        "--affine-lk-robust-iters",
+        type=int,
+        default=0,
+        help="Number of robust outlier-removal rounds after LK fitting.",
+    )
+    ap.add_argument(
+        "--affine-lk-outlier-percent",
+        type=float,
+        default=0.0,
+        help="Percent of largest residual LK samples removed per robust round.",
+    )
+    ap.add_argument(
+        "--affine-lk-min-samples",
+        type=int,
+        default=128,
+        help="Minimum number of LK samples required after outlier removal.",
+    )
+    ap.add_argument(
+        "--affine-lk-min-keep-ratio",
+        type=float,
+        default=0.25,
+        help="Lower bound on sample keep ratio during robust outlier removal.",
+    )
 
     ap.add_argument("--overwrite", action="store_true")
 
@@ -1509,6 +1666,14 @@ def main():
         raise ValueError("--affine-cp-bits must be >= 2")
     if args.affine_lk_sample_step <= 0:
         raise ValueError("--affine-lk-sample-step must be positive")
+    if args.affine_lk_robust_iters < 0:
+        raise ValueError("--affine-lk-robust-iters must be non-negative")
+    if args.affine_lk_outlier_percent < 0.0 or args.affine_lk_outlier_percent >= 100.0:
+        raise ValueError("--affine-lk-outlier-percent must be in [0,100)")
+    if args.affine_lk_min_samples <= 0:
+        raise ValueError("--affine-lk-min-samples must be positive")
+    if args.affine_lk_min_keep_ratio <= 0.0 or args.affine_lk_min_keep_ratio > 1.0:
+        raise ValueError("--affine-lk-min-keep-ratio must be in (0,1]")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -1635,12 +1800,13 @@ def main():
     affine_cp_clipped = False
     affine_matrix_est = np.eye(2, 3, dtype=np.float32)
     affine_matrix_dec = np.eye(2, 3, dtype=np.float32)
+    affine_lk_stats = {}
     map_x_final = map_x
     map_y_final = map_y
 
     if affine_enabled:
         affine_flag_bits = 1
-        affine_matrix_est, affine_success, affine_score = estimate_global_affine_bias_lk(
+        affine_matrix_est, affine_success, affine_score, affine_lk_stats = estimate_global_affine_bias_lk(
             cur_y=tar_y_pad,
             cam_warp_y=wy_cam,
             valid_mask_u8=valid_mask_u8,
@@ -1651,6 +1817,10 @@ def main():
             normalize=args.affine_lk_normalize,
             damping=args.affine_lk_damping,
             max_update=args.affine_lk_max_update,
+            robust_iters=args.affine_lk_robust_iters,
+            outlier_percent=args.affine_lk_outlier_percent,
+            min_samples=args.affine_lk_min_samples,
+            min_keep_ratio=args.affine_lk_min_keep_ratio,
         )
 
         if affine_success:
@@ -1760,6 +1930,11 @@ def main():
                 "normalize": args.affine_lk_normalize,
                 "damping": float(args.affine_lk_damping),
                 "max_update": float(args.affine_lk_max_update),
+                "robust_iters": int(args.affine_lk_robust_iters),
+                "outlier_percent": float(args.affine_lk_outlier_percent),
+                "min_samples": int(args.affine_lk_min_samples),
+                "min_keep_ratio": float(args.affine_lk_min_keep_ratio),
+                "stats": affine_lk_stats,
             },
         },
         "final": {
@@ -1805,6 +1980,10 @@ def main():
     print(f"affine cp q            : {affine_cp_q.astype(int).tolist()}")
     print(f"affine cp dec          : {affine_cp_dec.astype(float).tolist()}")
     print(f"affine bits            : {affine_flag_bits + affine_cp_bits_total}")
+    if affine_lk_stats:
+        print(f"lk samples init/final  : {affine_lk_stats.get('num_samples_initial')} / {affine_lk_stats.get('num_samples_final')}")
+        print(f"lk robust iters        : {affine_lk_stats.get('robust_iters_done')} / {affine_lk_stats.get('robust_iters_requested')}")
+        print(f"lk final rmse          : {affine_lk_stats.get('final_rmse')}")
     print("------------------------------------------------------------")
     print(f"warped yuv             : {args.out_yuv}")
     print(f"json                   : {args.out_json}")
