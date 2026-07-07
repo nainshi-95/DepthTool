@@ -6,10 +6,16 @@ Single-frame ref->target camera-projection warp test using OpenCV ECC.
 This script is for testing arbitrary ref/target pairs, e.g. ref=0 -> tar=16.
 It optionally applies a global residual transform estimated by cv2.findTransformECC().
 
-Recommended geometry-oriented mode:
-  Use Scharr structure images instead of raw Y for ECC, and estimate the global
-  transform only from valid active strong-structure pixels. This favors pillars,
-  window frames, wall boundaries, and other geometric edges over raw PSNR.
+Recommended geometry-oriented stable mode:
+  Use Scharr structure images instead of raw Y for ECC, estimate the global
+  transform only from valid active strong-structure pixels, then run optional
+  structure-residual mask refinement. This favors pillars, window frames, wall
+  boundaries, and other geometric edges over raw PSNR.
+
+Stabilization additions:
+  - multi-round structure ECC with residual-based mask update
+  - CP damping: cp_final = alpha * cp_ecc
+  - CP magnitude clamp for fail-safe
 
 CP modes:
   --affine-cp-num 2: ECC affine estimation, code CP0/CP1, constrained 4-param affine decode.
@@ -935,6 +941,243 @@ def estimate_global_transform_bias_ecc(
         return identity_transform_matrix(cp_num), False, None, ecc_stats, ecc_mask_u8
 
 
+
+def warp_ecc_input_to_template_domain(inp, M, cp_num):
+    """Warp ECC input image into template/current domain for residual analysis.
+
+    OpenCV findTransformECC is conventionally applied with WARP_INVERSE_MAP
+    when warping inputImage to templateImage.
+    """
+    h, w = inp.shape
+    if int(cp_num) == 4:
+        return cv2.warpPerspective(
+            inp.astype(np.float32),
+            np.asarray(M, dtype=np.float32),
+            (w, h),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        ).astype(np.float32)
+
+    return cv2.warpAffine(
+        inp.astype(np.float32),
+        np.asarray(M, dtype=np.float32),
+        (w, h),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    ).astype(np.float32)
+
+
+def run_find_transform_ecc_with_init(
+    template,
+    inp,
+    mask_u8,
+    cp_num=3,
+    init_matrix=None,
+    max_iters=50,
+    eps=1e-4,
+    gauss_filt_size=5,
+):
+    cp_num = int(cp_num)
+    if cp_num == 4:
+        motion_type = cv2.MOTION_HOMOGRAPHY
+        warp = np.eye(3, dtype=np.float32) if init_matrix is None else np.asarray(init_matrix, dtype=np.float32).reshape(3, 3).copy()
+    else:
+        motion_type = cv2.MOTION_AFFINE
+        warp = np.eye(2, 3, dtype=np.float32) if init_matrix is None else np.asarray(init_matrix, dtype=np.float32).reshape(2, 3).copy()
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        int(max_iters),
+        float(eps),
+    )
+
+    cc, warp = cv2.findTransformECC(
+        templateImage=template.astype(np.float32),
+        inputImage=inp.astype(np.float32),
+        warpMatrix=warp,
+        motionType=motion_type,
+        criteria=criteria,
+        inputMask=mask_u8.astype(np.uint8),
+        gaussFiltSize=int(gauss_filt_size),
+    )
+    return warp.astype(np.float32), float(cc)
+
+
+def refine_mask_by_structure_residual(
+    template,
+    inp,
+    M,
+    current_mask_u8,
+    base_mask_u8,
+    cp_num=3,
+    keep_percent=80.0,
+    min_mask_count=100,
+):
+    """Remove high structure-residual pixels after applying current transform."""
+    current = current_mask_u8 > 0
+    base = base_mask_u8 > 0
+    use = current & base
+
+    stats = {
+        "input_count": int(np.count_nonzero(use)),
+        "output_count": int(np.count_nonzero(use)),
+        "keep_percent": float(keep_percent),
+        "threshold": None,
+        "mean_residual": None,
+        "median_residual": None,
+        "p90_residual": None,
+    }
+
+    if np.count_nonzero(use) < int(min_mask_count):
+        return current_mask_u8.copy(), stats
+
+    warped = warp_ecc_input_to_template_domain(inp, M, cp_num=cp_num)
+    residual = np.abs(template.astype(np.float32) - warped.astype(np.float32))
+    vals = residual[use]
+
+    if vals.size < int(min_mask_count):
+        return current_mask_u8.copy(), stats
+
+    keep_percent = max(0.1, min(100.0, float(keep_percent)))
+    thr = float(np.percentile(vals, keep_percent))
+    new_mask = use & (residual <= thr)
+
+    if np.count_nonzero(new_mask) < int(min_mask_count):
+        # Do not collapse the mask. Keep previous one.
+        return current_mask_u8.copy(), stats
+
+    stats.update({
+        "output_count": int(np.count_nonzero(new_mask)),
+        "threshold": thr,
+        "mean_residual": float(np.mean(vals)),
+        "median_residual": float(np.median(vals)),
+        "p90_residual": float(np.percentile(vals, 90.0)),
+    })
+
+    return (new_mask.astype(np.uint8) * 255), stats
+
+
+def estimate_global_transform_bias_ecc_stable(
+    cur_y,
+    cam_warp_y,
+    valid_mask_u8,
+    bit_depth,
+    cp_num=3,
+    max_iters=50,
+    eps=1e-4,
+    gauss_filt_size=5,
+    ecc_input="structure",
+    structure_mode="scharr_mag",
+    structure_keep_percent=35.0,
+    structure_mask_dilate=1,
+    structure_log_gain=20.0,
+    structure_pre_blur=0,
+    ecc_rounds=2,
+    residual_keep_percent=80.0,
+    min_mask_count=100,
+):
+    """Stable OpenCV ECC for geometry alignment.
+
+    Round 0 uses valid+strong-structure mask. Later rounds warp the ECC input
+    with the current transform, compute structure residual, remove high-residual
+    pixels, and rerun ECC from the previous transform.
+    """
+    cp_num = int(cp_num)
+    if cp_num not in (2, 3, 4):
+        raise ValueError(f"cp_num must be 2, 3, or 4, got {cp_num}")
+
+    template, inp, ecc_mask_u8, prep_stats = prepare_ecc_input_images_and_mask(
+        cur_y=cur_y,
+        cam_warp_y=cam_warp_y,
+        valid_mask_u8=valid_mask_u8,
+        bit_depth=bit_depth,
+        ecc_input=ecc_input,
+        structure_mode=structure_mode,
+        structure_keep_percent=structure_keep_percent,
+        structure_mask_dilate=structure_mask_dilate,
+        structure_log_gain=structure_log_gain,
+        structure_pre_blur=structure_pre_blur,
+    )
+
+    base_mask_u8 = ecc_mask_u8.copy()
+    stats = dict(prep_stats)
+    stats.update({
+        "stable_ecc": True,
+        "ecc_rounds_requested": int(ecc_rounds),
+        "residual_keep_percent": float(residual_keep_percent),
+        "min_mask_count": int(min_mask_count),
+        "rounds": [],
+    })
+
+    if np.count_nonzero(ecc_mask_u8) < int(min_mask_count):
+        return identity_transform_matrix(cp_num), False, None, stats, ecc_mask_u8
+
+    M = identity_transform_matrix(cp_num)
+    score = None
+    success = False
+    rounds = max(1, int(ecc_rounds))
+
+    for r in range(rounds):
+        round_stats = {
+            "round": int(r),
+            "mask_count_before_ecc": int(np.count_nonzero(ecc_mask_u8)),
+            "ecc_success": False,
+            "ecc_cc": None,
+            "residual_refine": None,
+        }
+
+        if np.count_nonzero(ecc_mask_u8) < int(min_mask_count):
+            stats["rounds"].append(round_stats)
+            break
+
+        try:
+            M, score = run_find_transform_ecc_with_init(
+                template=template,
+                inp=inp,
+                mask_u8=ecc_mask_u8,
+                cp_num=cp_num,
+                init_matrix=M,
+                max_iters=max_iters,
+                eps=eps,
+                gauss_filt_size=gauss_filt_size,
+            )
+            success = True
+            round_stats["ecc_success"] = True
+            round_stats["ecc_cc"] = float(score)
+        except cv2.error as exc:
+            round_stats["ecc_error"] = str(exc)
+            stats["rounds"].append(round_stats)
+            break
+
+        # Last round does not need another mask update.
+        if r < rounds - 1:
+            new_mask_u8, res_stats = refine_mask_by_structure_residual(
+                template=template,
+                inp=inp,
+                M=M,
+                current_mask_u8=ecc_mask_u8,
+                base_mask_u8=base_mask_u8,
+                cp_num=cp_num,
+                keep_percent=residual_keep_percent,
+                min_mask_count=min_mask_count,
+            )
+            round_stats["residual_refine"] = res_stats
+            ecc_mask_u8 = new_mask_u8
+            round_stats["mask_count_after_refine"] = int(np.count_nonzero(ecc_mask_u8))
+
+        stats["rounds"].append(round_stats)
+
+    stats["mask_count_used"] = int(np.count_nonzero(ecc_mask_u8))
+    stats["final_ecc_cc"] = json_safe_float(score)
+    stats["success"] = bool(success)
+
+    if not success:
+        return identity_transform_matrix(cp_num), False, None, stats, ecc_mask_u8
+
+    return M.astype(np.float32), True, score, stats, ecc_mask_u8
+
 def transform_cp_points(w, h, cp_num):
     """Return coded CP coordinates.
 
@@ -1575,6 +1818,38 @@ def main():
     ap.add_argument("--structure-log-gain", type=float, default=20.0)
     ap.add_argument("--structure-pre-blur", type=int, default=0)
 
+    # Stabilization for geometry-oriented ECC.
+    ap.add_argument(
+        "--structure-ecc-rounds",
+        type=int,
+        default=2,
+        help="Number of ECC rounds. Round 1 uses strong-structure mask; later rounds refine the mask by structure residual.",
+    )
+    ap.add_argument(
+        "--structure-residual-keep-percent",
+        type=float,
+        default=80.0,
+        help="After each ECC round, keep this percentile of lowest structure residual pixels for the next round.",
+    )
+    ap.add_argument(
+        "--affine-alpha",
+        type=float,
+        default=0.85,
+        help="Damping applied to estimated CP bias before quantization: cp = alpha * cp_ecc.",
+    )
+    ap.add_argument(
+        "--affine-cp-max-abs",
+        type=float,
+        default=16.0,
+        help="Clamp each CP bias component to [-value,value] before quantization. Use <=0 to disable.",
+    )
+    ap.add_argument(
+        "--affine-min-mask-count",
+        type=int,
+        default=100,
+        help="Minimum mask pixels required for ECC/refinement.",
+    )
+
     ap.add_argument("--overwrite", action="store_true")
 
     args = ap.parse_args()
@@ -1595,6 +1870,14 @@ def main():
         raise ValueError("--structure-mask-dilate must be non-negative")
     if args.structure_pre_blur < 0:
         raise ValueError("--structure-pre-blur must be non-negative")
+    if args.structure_ecc_rounds < 1:
+        raise ValueError("--structure-ecc-rounds must be >= 1")
+    if args.structure_residual_keep_percent <= 0 or args.structure_residual_keep_percent > 100:
+        raise ValueError("--structure-residual-keep-percent must be in (0, 100]")
+    if args.affine_alpha < 0.0:
+        raise ValueError("--affine-alpha must be non-negative")
+    if args.affine_min_mask_count < 1:
+        raise ValueError("--affine-min-mask-count must be >= 1")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -1715,6 +1998,8 @@ def main():
     affine_cp_bits_each = [0] * (args.affine_cp_num * 2)
     affine_cp_q = np.zeros((args.affine_cp_num, 2), dtype=np.int32)
     affine_cp_dec = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
+    affine_cp_bias_est_raw = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
+    affine_cp_bias_est_damped = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
     affine_cp_clipped = False
     affine_matrix_est = identity_transform_matrix(args.affine_cp_num)
     affine_matrix_dec = identity_transform_matrix(args.affine_cp_num)
@@ -1735,7 +2020,7 @@ def main():
             affine_score,
             affine_ecc_stats,
             ecc_mask_u8,
-        ) = estimate_global_transform_bias_ecc(
+        ) = estimate_global_transform_bias_ecc_stable(
             cur_y=tar_y_pad,
             cam_warp_y=wy_cam,
             valid_mask_u8=valid_mask_u8,
@@ -1750,15 +2035,30 @@ def main():
             structure_mask_dilate=args.structure_mask_dilate,
             structure_log_gain=args.structure_log_gain,
             structure_pre_blur=args.structure_pre_blur,
+            ecc_rounds=args.structure_ecc_rounds,
+            residual_keep_percent=args.structure_residual_keep_percent,
+            min_mask_count=args.affine_min_mask_count,
         )
 
         if affine_success:
-            cp_bias_est = transform_matrix_to_cp_bias(
+            cp_bias_est_raw = transform_matrix_to_cp_bias(
                 affine_matrix_est,
                 coded_w,
                 coded_h,
                 cp_num=args.affine_cp_num,
             )
+
+            affine_cp_bias_est_raw = cp_bias_est_raw.astype(np.float32)
+            cp_bias_est = cp_bias_est_raw.astype(np.float32) * float(args.affine_alpha)
+
+            if float(args.affine_cp_max_abs) > 0.0:
+                cp_bias_est = np.clip(
+                    cp_bias_est,
+                    -float(args.affine_cp_max_abs),
+                    float(args.affine_cp_max_abs),
+                ).astype(np.float32)
+
+            affine_cp_bias_est_damped = cp_bias_est.astype(np.float32)
 
             (
                 affine_cp_q,
@@ -1856,7 +2156,11 @@ def main():
             ),
             "cp_step": float(args.affine_cp_step),
             "cp_bits": int(args.affine_cp_bits),
+            "alpha": float(args.affine_alpha),
+            "cp_max_abs": float(args.affine_cp_max_abs),
             "flag_bits_50_50": int(affine_flag_bits),
+            "cp_bias_est_raw": affine_cp_bias_est_raw.astype(float).tolist(),
+            "cp_bias_est_after_alpha_clamp": affine_cp_bias_est_damped.astype(float).tolist(),
             "cp_q": affine_cp_q.astype(int).tolist(),
             "cp_dec": affine_cp_dec.astype(float).tolist(),
             "cp_bits_each_50_50": affine_cp_bits_each,
@@ -1870,6 +2174,9 @@ def main():
                 "eps": float(args.affine_ecc_eps),
                 "gauss_filt_size": int(args.affine_ecc_gauss),
                 "input": str(args.affine_ecc_input),
+                "structure_ecc_rounds": int(args.structure_ecc_rounds),
+                "structure_residual_keep_percent": float(args.structure_residual_keep_percent),
+                "min_mask_count": int(args.affine_min_mask_count),
                 "stats": affine_ecc_stats,
             },
         },
@@ -1914,10 +2221,14 @@ def main():
     print(f"affine success         : {affine_success}")
     print(f"affine cp num          : {args.affine_cp_num}")
     print(f"affine cp step         : {args.affine_cp_step}")
+    print(f"affine alpha           : {args.affine_alpha}")
+    print(f"affine cp max abs      : {args.affine_cp_max_abs}")
     print(f"affine ECC input       : {args.affine_ecc_input}")
     if args.affine_ecc_input == "structure":
         print(f"structure mode         : {args.structure_mode}")
         print(f"structure keep percent : {args.structure_keep_percent}")
+        print(f"structure ECC rounds   : {args.structure_ecc_rounds}")
+        print(f"residual keep percent  : {args.structure_residual_keep_percent}")
     print(f"affine cp q            : {affine_cp_q.astype(int).tolist()}")
     print(f"affine cp dec          : {affine_cp_dec.astype(float).tolist()}")
     print(f"affine bits            : {affine_flag_bits + affine_cp_bits_total}")
