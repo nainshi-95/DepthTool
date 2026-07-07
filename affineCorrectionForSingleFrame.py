@@ -1011,6 +1011,404 @@ def estimate_global_affine_bias_lk(
     }
     return A.astype(np.float32), True, float(score), stats
 
+
+def affine_local_matrix_to_global(A_local, x0, y0):
+    """Convert an affine matrix estimated on a cropped block coordinate system
+    into the full-picture coordinate system.
+
+    local:  [xl', yl'] = A_local * [xl, yl, 1]
+    global: x = xl + x0, y = yl + y0
+    """
+    A = np.asarray(A_local, dtype=np.float64).reshape(2, 3)
+    x0 = float(x0)
+    y0 = float(y0)
+
+    A_global = np.empty((2, 3), dtype=np.float32)
+    A_global[0, 0] = A[0, 0]
+    A_global[0, 1] = A[0, 1]
+    A_global[0, 2] = x0 + A[0, 2] - A[0, 0] * x0 - A[0, 1] * y0
+    A_global[1, 0] = A[1, 0]
+    A_global[1, 1] = A[1, 1]
+    A_global[1, 2] = y0 + A[1, 2] - A[1, 0] * x0 - A[1, 1] * y0
+    return A_global.astype(np.float32)
+
+
+def affine_bias_at_points(A, pts):
+    """Return residual bias [x'-x, y'-y] at arbitrary global points."""
+    A = np.asarray(A, dtype=np.float64).reshape(2, 3)
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+    src = np.concatenate([pts, ones], axis=1)
+    dst = src @ A.T
+    return (dst - pts).astype(np.float64)
+
+
+def block_affine_sample_points(x0, y0, x1, y1):
+    """Five representative points for comparing/fitting block affine models.
+
+    x1/y1 are exclusive block boundaries, so using them is consistent with
+    picture-level CP convention CP1=(w,0), CP2=(0,h).
+    """
+    x0 = float(x0)
+    y0 = float(y0)
+    x1 = float(x1)
+    y1 = float(y1)
+    return np.array(
+        [
+            [x0, y0],
+            [x1, y0],
+            [x0, y1],
+            [x1, y1],
+            [0.5 * (x0 + x1), 0.5 * (y0 + y1)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def fit_global_affine_from_block_models(blocks, keep_mask, w, h, weight_mode="equal"):
+    """Fit one global affine residual bias to local block affine models.
+
+    Each local block affine contributes bias samples at block corners and center.
+    The fitted model is the same normalized 6-parameter residual model used by LK:
+      dx = p0 + p1*xn + p2*yn
+      dy = p3 + p4*xn + p5*yn
+    """
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    if len(blocks) == 0 or np.count_nonzero(keep_mask) < 3:
+        return np.eye(2, 3, dtype=np.float32), None
+
+    cx = 0.5 * float(w)
+    cy = 0.5 * float(h)
+    ww = max(float(w), 1e-12)
+    hh = max(float(h), 1e-12)
+
+    rows = []
+    dxs = []
+    dys = []
+    weights = []
+
+    for bi, b in enumerate(blocks):
+        if not keep_mask[bi]:
+            continue
+
+        pts = b["fit_points"]
+        bias = b["fit_bias"]
+
+        xn = (pts[:, 0] - cx) / ww
+        yn = (pts[:, 1] - cy) / hh
+        basis = np.stack([np.ones_like(xn), xn, yn], axis=1)
+
+        if weight_mode == "equal":
+            # Equal block weight regardless of block valid-sample count.
+            wt = np.full(pts.shape[0], 1.0 / max(pts.shape[0], 1), dtype=np.float64)
+        elif weight_mode == "valid_count":
+            # More valid/reliable blocks receive higher weight, but avoid extreme dominance.
+            wt_block = np.sqrt(max(float(b.get("num_valid", 1)), 1.0))
+            wt = np.full(pts.shape[0], wt_block / max(pts.shape[0], 1), dtype=np.float64)
+        else:
+            raise ValueError(f"Unknown affine block weight mode: {weight_mode}")
+
+        rows.append(basis)
+        dxs.append(bias[:, 0])
+        dys.append(bias[:, 1])
+        weights.append(wt)
+
+    if not rows:
+        return np.eye(2, 3, dtype=np.float32), None
+
+    X = np.concatenate(rows, axis=0).astype(np.float64)
+    dx = np.concatenate(dxs, axis=0).astype(np.float64)
+    dy = np.concatenate(dys, axis=0).astype(np.float64)
+    wt = np.concatenate(weights, axis=0).astype(np.float64)
+    sw = np.sqrt(np.maximum(wt, 1e-12))
+
+    Xw = X * sw[:, None]
+    dxw = dx * sw
+    dyw = dy * sw
+
+    try:
+        coef_x, _, _, _ = np.linalg.lstsq(Xw, dxw, rcond=None)
+        coef_y, _, _, _ = np.linalg.lstsq(Xw, dyw, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.eye(2, 3, dtype=np.float32), None
+
+    p = np.array(
+        [coef_x[0], coef_x[1], coef_x[2], coef_y[0], coef_y[1], coef_y[2]],
+        dtype=np.float64,
+    )
+    A = params_to_affine_matrix_lk(p, w, h)
+    return A.astype(np.float32), p
+
+
+def compute_block_model_errors(blocks, keep_mask, A_global):
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    errors = np.full(len(blocks), np.inf, dtype=np.float64)
+
+    for bi, b in enumerate(blocks):
+        if not keep_mask[bi]:
+            continue
+        pts = b["fit_points"]
+        local_bias = b["fit_bias"]
+        global_bias = affine_bias_at_points(A_global, pts)
+        diff = global_bias - local_bias
+        l2 = np.sqrt(np.sum(diff * diff, axis=1))
+        errors[bi] = float(np.sqrt(np.mean(l2 * l2)))
+
+    return errors
+
+
+def estimate_blockwise_global_affine_bias_lk(
+    cur_y,
+    cam_warp_y,
+    valid_mask_u8,
+    bit_depth,
+    block_size=128,
+    block_sample_step=8,
+    block_lk_iters=20,
+    block_lk_eps=1e-4,
+    normalize="zero_mean",
+    damping=1e-6,
+    max_update=4.0,
+    min_block_samples=64,
+    min_block_valid_ratio=0.05,
+    robust_iters=3,
+    outlier_percent=20.0,
+    remove_worst_count=0,
+    min_keep_blocks=8,
+    weight_mode="equal",
+):
+    """Estimate one global affine using block-wise local affine candidates.
+
+    Procedure:
+      1) Split valid active region into non-overlapping block_size x block_size blocks.
+      2) Estimate a local LK affine for each block independently.
+      3) Fit a single global affine that best covers all local block affine models.
+      4) Remove block-affine outliers with the largest model disagreement.
+      5) Refit the global affine.
+
+    This is intended for large ref->target POC distance where a direct global LK
+    fit can be destabilized by occlusion/object motion/depth errors.
+    """
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if block_sample_step <= 0:
+        raise ValueError("block_sample_step must be positive")
+    if min_block_samples <= 0:
+        raise ValueError("min_block_samples must be positive")
+    if min_keep_blocks <= 0:
+        raise ValueError("min_keep_blocks must be positive")
+
+    h, w = cur_y.shape
+    valid_bool = valid_mask_u8 > 0
+    blocks = []
+    total_blocks = 0
+    skipped_too_few = 0
+    skipped_failed = 0
+
+    for y0 in range(0, h, int(block_size)):
+        y1 = min(y0 + int(block_size), h)
+        for x0 in range(0, w, int(block_size)):
+            x1 = min(x0 + int(block_size), w)
+            total_blocks += 1
+
+            block_valid = valid_bool[y0:y1, x0:x1]
+            valid_count = int(np.count_nonzero(block_valid))
+            area = max((x1 - x0) * (y1 - y0), 1)
+            valid_ratio = float(valid_count) / float(area)
+            if valid_count < int(min_block_samples) or valid_ratio < float(min_block_valid_ratio):
+                skipped_too_few += 1
+                continue
+
+            A_local, ok, score, st = estimate_global_affine_bias_lk(
+                cur_y=cur_y[y0:y1, x0:x1],
+                cam_warp_y=cam_warp_y[y0:y1, x0:x1],
+                valid_mask_u8=valid_mask_u8[y0:y1, x0:x1],
+                bit_depth=bit_depth,
+                max_iters=block_lk_iters,
+                eps=block_lk_eps,
+                sample_step=block_sample_step,
+                normalize=normalize,
+                damping=damping,
+                max_update=max_update,
+                robust_iters=0,
+                outlier_percent=0.0,
+                min_samples=min_block_samples,
+                min_keep_ratio=1.0,
+            )
+
+            if not ok:
+                skipped_failed += 1
+                continue
+
+            A_global_local = affine_local_matrix_to_global(A_local, x0, y0)
+            pts = block_affine_sample_points(x0, y0, x1, y1)
+            bias = affine_bias_at_points(A_global_local, pts)
+
+            blocks.append({
+                "block_index": int(len(blocks)),
+                "x0": int(x0),
+                "y0": int(y0),
+                "x1": int(x1),
+                "y1": int(y1),
+                "num_valid": int(valid_count),
+                "valid_ratio": float(valid_ratio),
+                "local_score_negative_rmse": json_safe_float(score),
+                "local_stats": {
+                    "num_samples_initial": st.get("num_samples_initial"),
+                    "num_samples_final": st.get("num_samples_final"),
+                    "num_valid_final": st.get("num_valid_final"),
+                    "final_rmse": st.get("final_rmse"),
+                    "lk_iters_total": st.get("lk_iters_total"),
+                },
+                "A_local_global_coords": A_global_local.astype(float).tolist(),
+                "fit_points": pts,
+                "fit_bias": bias,
+            })
+
+    n = len(blocks)
+    if n < int(min_keep_blocks):
+        stats = {
+            "mode": "block_lk",
+            "total_blocks": int(total_blocks),
+            "local_success_blocks": int(n),
+            "skipped_too_few": int(skipped_too_few),
+            "skipped_failed": int(skipped_failed),
+            "reason": "too_few_successful_blocks",
+        }
+        return np.eye(2, 3, dtype=np.float32), False, None, stats
+
+    keep = np.ones(n, dtype=bool)
+    robust_iters = max(0, int(robust_iters))
+    outlier_percent = max(0.0, min(float(outlier_percent), 95.0))
+    remove_worst_count = max(0, int(remove_worst_count))
+
+    history = []
+    A_global = np.eye(2, 3, dtype=np.float32)
+    errors = np.full(n, np.inf, dtype=np.float64)
+
+    for r in range(robust_iters + 1):
+        A_global, p_global = fit_global_affine_from_block_models(
+            blocks,
+            keep,
+            w,
+            h,
+            weight_mode=weight_mode,
+        )
+        if p_global is None:
+            break
+
+        errors = compute_block_model_errors(blocks, keep, A_global)
+        finite = errors[np.isfinite(errors)]
+        kept_before = int(np.count_nonzero(keep))
+        if finite.size == 0:
+            break
+
+        hist = {
+            "round": int(r),
+            "kept_blocks_before": int(kept_before),
+            "mean_block_model_error": float(np.mean(finite)),
+            "median_block_model_error": float(np.median(finite)),
+            "p90_block_model_error": float(np.percentile(finite, 90.0)),
+            "max_block_model_error": float(np.max(finite)),
+        }
+
+        worst_order = np.argsort(errors)[::-1]
+        top = []
+        for bi in worst_order[:min(8, worst_order.size)]:
+            if not np.isfinite(errors[bi]):
+                continue
+            b = blocks[int(bi)]
+            top.append({
+                "block_index": int(bi),
+                "x0": int(b["x0"]),
+                "y0": int(b["y0"]),
+                "x1": int(b["x1"]),
+                "y1": int(b["y1"]),
+                "error": float(errors[bi]),
+            })
+        hist["worst_blocks"] = top
+        history.append(hist)
+
+        if r >= robust_iters:
+            break
+
+        valid_idx = np.flatnonzero(keep & np.isfinite(errors))
+        if valid_idx.size <= int(min_keep_blocks):
+            break
+
+        if remove_worst_count > 0:
+            remove_count = min(remove_worst_count, max(0, valid_idx.size - int(min_keep_blocks)))
+        else:
+            remove_count = int(np.ceil(valid_idx.size * outlier_percent / 100.0))
+            remove_count = max(1 if outlier_percent > 0.0 else 0, remove_count)
+            remove_count = min(remove_count, max(0, valid_idx.size - int(min_keep_blocks)))
+
+        if remove_count <= 0:
+            break
+
+        order = valid_idx[np.argsort(errors[valid_idx])[::-1]]
+        remove_idx = order[:remove_count]
+        keep[remove_idx] = False
+        history[-1]["removed_blocks"] = [int(x) for x in remove_idx.tolist()]
+
+    kept_final = int(np.count_nonzero(keep))
+    if kept_final < int(min_keep_blocks):
+        stats = {
+            "mode": "block_lk",
+            "total_blocks": int(total_blocks),
+            "local_success_blocks": int(n),
+            "kept_final": int(kept_final),
+            "history": history,
+            "reason": "too_few_final_blocks",
+        }
+        return np.eye(2, 3, dtype=np.float32), False, None, stats
+
+    final_errors = compute_block_model_errors(blocks, keep, A_global)
+    finite_final = final_errors[np.isfinite(final_errors)]
+    final_rmse = float(np.sqrt(np.mean(finite_final * finite_final))) if finite_final.size else None
+    score = -final_rmse if final_rmse is not None else None
+
+    # Keep detailed block model list compact enough for JSON by omitting raw fit_points/fit_bias.
+    block_summaries = []
+    for bi, b in enumerate(blocks):
+        block_summaries.append({
+            "block_index": int(bi),
+            "x0": int(b["x0"]),
+            "y0": int(b["y0"]),
+            "x1": int(b["x1"]),
+            "y1": int(b["y1"]),
+            "num_valid": int(b["num_valid"]),
+            "valid_ratio": float(b["valid_ratio"]),
+            "kept_final": bool(keep[bi]),
+            "final_model_error": json_safe_float(final_errors[bi]),
+            "local_score_negative_rmse": b.get("local_score_negative_rmse"),
+        })
+
+    stats = {
+        "mode": "block_lk",
+        "block_size": int(block_size),
+        "block_sample_step": int(block_sample_step),
+        "block_lk_iters": int(block_lk_iters),
+        "block_lk_eps": float(block_lk_eps),
+        "min_block_samples": int(min_block_samples),
+        "min_block_valid_ratio": float(min_block_valid_ratio),
+        "weight_mode": weight_mode,
+        "total_blocks": int(total_blocks),
+        "local_success_blocks": int(n),
+        "skipped_too_few": int(skipped_too_few),
+        "skipped_failed": int(skipped_failed),
+        "robust_iters_requested": int(robust_iters),
+        "outlier_percent": float(outlier_percent),
+        "remove_worst_count": int(remove_worst_count),
+        "min_keep_blocks": int(min_keep_blocks),
+        "kept_final": int(kept_final),
+        "final_block_rmse": json_safe_float(final_rmse),
+        "history": history,
+        "blocks": block_summaries,
+    }
+
+    return A_global.astype(np.float32), True, json_safe_float(score), stats
+
 def affine_cp_points(w, h, cp_num):
     """Return CP coordinates used for coding.
 
@@ -1613,6 +2011,12 @@ def main():
 
     # Affine bias: off by default, same decoded application path as sequence test.
     ap.add_argument("--global-affine-bias", action="store_true")
+    ap.add_argument(
+        "--affine-estimator",
+        choices=["lk", "block_lk"],
+        default="block_lk",
+        help="lk: direct global LK. block_lk: estimate local block affines then robustly aggregate one global affine.",
+    )
     ap.add_argument("--affine-cp-num", type=int, choices=[2, 3], default=3)
     ap.add_argument("--affine-cp-step", type=float, default=1.0)
     ap.add_argument("--affine-cp-bits", type=int, default=16)
@@ -1652,6 +2056,29 @@ def main():
         help="Lower bound on sample keep ratio during robust outlier removal.",
     )
 
+    # Block-wise local affine aggregation estimator.
+    ap.add_argument("--affine-block-size", type=int, default=128)
+    ap.add_argument("--affine-block-sample-step", type=int, default=8)
+    ap.add_argument("--affine-block-lk-iters", type=int, default=20)
+    ap.add_argument("--affine-block-lk-eps", type=float, default=1e-4)
+    ap.add_argument("--affine-block-min-samples", type=int, default=64)
+    ap.add_argument("--affine-block-min-valid-ratio", type=float, default=0.05)
+    ap.add_argument("--affine-block-robust-iters", type=int, default=3)
+    ap.add_argument("--affine-block-outlier-percent", type=float, default=20.0)
+    ap.add_argument(
+        "--affine-block-remove-worst-count",
+        type=int,
+        default=0,
+        help="If >0, remove this many worst local-affine blocks per robust round instead of using percent.",
+    )
+    ap.add_argument("--affine-block-min-keep-blocks", type=int, default=8)
+    ap.add_argument(
+        "--affine-block-weight-mode",
+        choices=["equal", "valid_count"],
+        default="equal",
+        help="How to weight local block affine models when fitting the final global affine.",
+    )
+
     ap.add_argument("--overwrite", action="store_true")
 
     args = ap.parse_args()
@@ -1674,6 +2101,24 @@ def main():
         raise ValueError("--affine-lk-min-samples must be positive")
     if args.affine_lk_min_keep_ratio <= 0.0 or args.affine_lk_min_keep_ratio > 1.0:
         raise ValueError("--affine-lk-min-keep-ratio must be in (0,1]")
+    if args.affine_block_size <= 0:
+        raise ValueError("--affine-block-size must be positive")
+    if args.affine_block_sample_step <= 0:
+        raise ValueError("--affine-block-sample-step must be positive")
+    if args.affine_block_lk_iters <= 0:
+        raise ValueError("--affine-block-lk-iters must be positive")
+    if args.affine_block_min_samples <= 0:
+        raise ValueError("--affine-block-min-samples must be positive")
+    if args.affine_block_min_valid_ratio < 0.0 or args.affine_block_min_valid_ratio > 1.0:
+        raise ValueError("--affine-block-min-valid-ratio must be in [0,1]")
+    if args.affine_block_robust_iters < 0:
+        raise ValueError("--affine-block-robust-iters must be non-negative")
+    if args.affine_block_outlier_percent < 0.0 or args.affine_block_outlier_percent >= 100.0:
+        raise ValueError("--affine-block-outlier-percent must be in [0,100)")
+    if args.affine_block_remove_worst_count < 0:
+        raise ValueError("--affine-block-remove-worst-count must be non-negative")
+    if args.affine_block_min_keep_blocks <= 0:
+        raise ValueError("--affine-block-min-keep-blocks must be positive")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
@@ -1806,22 +2251,46 @@ def main():
 
     if affine_enabled:
         affine_flag_bits = 1
-        affine_matrix_est, affine_success, affine_score, affine_lk_stats = estimate_global_affine_bias_lk(
-            cur_y=tar_y_pad,
-            cam_warp_y=wy_cam,
-            valid_mask_u8=valid_mask_u8,
-            bit_depth=bit_depth,
-            max_iters=args.affine_lk_iters,
-            eps=args.affine_lk_eps,
-            sample_step=args.affine_lk_sample_step,
-            normalize=args.affine_lk_normalize,
-            damping=args.affine_lk_damping,
-            max_update=args.affine_lk_max_update,
-            robust_iters=args.affine_lk_robust_iters,
-            outlier_percent=args.affine_lk_outlier_percent,
-            min_samples=args.affine_lk_min_samples,
-            min_keep_ratio=args.affine_lk_min_keep_ratio,
-        )
+        if args.affine_estimator == "lk":
+            affine_matrix_est, affine_success, affine_score, affine_lk_stats = estimate_global_affine_bias_lk(
+                cur_y=tar_y_pad,
+                cam_warp_y=wy_cam,
+                valid_mask_u8=valid_mask_u8,
+                bit_depth=bit_depth,
+                max_iters=args.affine_lk_iters,
+                eps=args.affine_lk_eps,
+                sample_step=args.affine_lk_sample_step,
+                normalize=args.affine_lk_normalize,
+                damping=args.affine_lk_damping,
+                max_update=args.affine_lk_max_update,
+                robust_iters=args.affine_lk_robust_iters,
+                outlier_percent=args.affine_lk_outlier_percent,
+                min_samples=args.affine_lk_min_samples,
+                min_keep_ratio=args.affine_lk_min_keep_ratio,
+            )
+        elif args.affine_estimator == "block_lk":
+            affine_matrix_est, affine_success, affine_score, affine_lk_stats = estimate_blockwise_global_affine_bias_lk(
+                cur_y=tar_y_pad,
+                cam_warp_y=wy_cam,
+                valid_mask_u8=valid_mask_u8,
+                bit_depth=bit_depth,
+                block_size=args.affine_block_size,
+                block_sample_step=args.affine_block_sample_step,
+                block_lk_iters=args.affine_block_lk_iters,
+                block_lk_eps=args.affine_block_lk_eps,
+                normalize=args.affine_lk_normalize,
+                damping=args.affine_lk_damping,
+                max_update=args.affine_lk_max_update,
+                min_block_samples=args.affine_block_min_samples,
+                min_block_valid_ratio=args.affine_block_min_valid_ratio,
+                robust_iters=args.affine_block_robust_iters,
+                outlier_percent=args.affine_block_outlier_percent,
+                remove_worst_count=args.affine_block_remove_worst_count,
+                min_keep_blocks=args.affine_block_min_keep_blocks,
+                weight_mode=args.affine_block_weight_mode,
+            )
+        else:
+            raise ValueError(args.affine_estimator)
 
         if affine_success:
             cp_bias_est = affine_matrix_to_cp_bias(
@@ -1908,7 +2377,7 @@ def main():
         },
         "global_affine_bias": {
             "enabled": affine_enabled,
-            "estimator": "lk_non_ecc",
+            "estimator": args.affine_estimator,
             "success": affine_success,
             "score_negative_rmse": json_safe_float(affine_score),
             "cp_num": int(args.affine_cp_num),
@@ -1935,6 +2404,19 @@ def main():
                 "min_samples": int(args.affine_lk_min_samples),
                 "min_keep_ratio": float(args.affine_lk_min_keep_ratio),
                 "stats": affine_lk_stats,
+            },
+            "block_lk": {
+                "block_size": int(args.affine_block_size),
+                "block_sample_step": int(args.affine_block_sample_step),
+                "block_lk_iters": int(args.affine_block_lk_iters),
+                "block_lk_eps": float(args.affine_block_lk_eps),
+                "block_min_samples": int(args.affine_block_min_samples),
+                "block_min_valid_ratio": float(args.affine_block_min_valid_ratio),
+                "block_robust_iters": int(args.affine_block_robust_iters),
+                "block_outlier_percent": float(args.affine_block_outlier_percent),
+                "block_remove_worst_count": int(args.affine_block_remove_worst_count),
+                "block_min_keep_blocks": int(args.affine_block_min_keep_blocks),
+                "block_weight_mode": args.affine_block_weight_mode,
             },
         },
         "final": {
