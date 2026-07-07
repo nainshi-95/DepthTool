@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Project previous frame to current frame using decoded depth/camera parameters,
-with optional global 2CP/3CP affine bias correction over cam-proj flow.
+Single-frame ref->target camera-projection warp test WITHOUT OpenCV.
 
-Main addition:
-  --global-affine-bias
+This is a no-cv2 replacement for the geometry-oriented structure-ECC test.
+Since cv2.findTransformECC(), cv2.remap(), cv2.Scharr(), cv2.Rodrigues(),
+cv2.getAffineTransform(), etc. are unavailable, this script implements:
+
+  - Rodrigues rvec -> rotation matrix in NumPy
+  - bilinear remap in NumPy
+  - Scharr-like structure image in NumPy
+  - valid + active + strong-structure mask in NumPy
+  - global affine residual fitting by vectorized Lucas-Kanade / SSD alignment
+
+Recommended geometry-oriented mode:
+  Use Scharr structure images, keep the top ~35% structure pixels inside the
+  valid active region, and fit one global 3CP affine residual transform.
+
+CP modes:
+  --affine-cp-num 2: constrained 4-param affine from CP0/CP1
+  --affine-cp-num 3: full 3CP affine
 
 Flow:
-  1) Generate cam-proj backward map from current depth/camera.
-  2) Warp previous frame with cam-proj map only.
-  3) Estimate one global affine correction from cam-warped Y to current Y
-     using either ECC or a fast non-ECC vectorized Lucas-Kanade/SSD estimator
-     over valid active-region pixels.
-  4) Convert affine correction to 2 or 3 control-point biases.
-  5) Quantize/decode the CP bias and estimate bits assuming 50:50 bin probability.
-  6) Apply decoded affine bias to cam-proj map and perform final warp.
+  1) Read ref frame, target frame, target depth, and camera parameters.
+  2) Build target->reference projection map.
+  3) Warp reference frame to target frame by cam-proj only.
+  4) Optional: estimate global affine bias from structure(cam-warped Y) to
+     structure(target Y), using valid active strong-structure pixels only.
+  5) Quantize/decode CP bias, apply it to the map, and warp again.
 """
 
 import argparse
@@ -23,7 +35,6 @@ import json
 import os
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 
@@ -38,43 +49,22 @@ def align_to(x, a):
 def calc_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top):
     pad_right = coded_w - src_w - pad_left
     pad_bottom = coded_h - src_h - pad_top
-
     if pad_right < 0 or pad_bottom < 0:
         raise ValueError(
-            f"Invalid padding: src=({src_w}x{src_h}), "
-            f"coded=({coded_w}x{coded_h}), "
+            f"Invalid padding: src=({src_w}x{src_h}), coded=({coded_w}x{coded_h}), "
             f"pad_left={pad_left}, pad_top={pad_top}"
         )
-
     return pad_right, pad_bottom
 
 
-def validate_yuv420_padding(
-    src_w,
-    src_h,
-    coded_w,
-    coded_h,
-    pad_left,
-    pad_top,
-    pad_right,
-    pad_bottom,
-):
+def validate_yuv420_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top, pad_right, pad_bottom):
     vals = {
-        "src_w": src_w,
-        "src_h": src_h,
-        "coded_w": coded_w,
-        "coded_h": coded_h,
-        "pad_left": pad_left,
-        "pad_top": pad_top,
-        "pad_right": pad_right,
-        "pad_bottom": pad_bottom,
+        "src_w": src_w, "src_h": src_h, "coded_w": coded_w, "coded_h": coded_h,
+        "pad_left": pad_left, "pad_top": pad_top, "pad_right": pad_right, "pad_bottom": pad_bottom,
     }
-
     for name, v in vals.items():
         if v < 0:
             raise ValueError(f"{name} must be non-negative: {v}")
-
-    for name, v in vals.items():
         if v % 2 != 0:
             raise ValueError(f"{name} must be even for YUV420: {v}")
 
@@ -83,52 +73,26 @@ def pad_2d_edge(arr, coded_w, coded_h, pad_left, pad_top):
     h, w = arr.shape
     pad_right = coded_w - w - pad_left
     pad_bottom = coded_h - h - pad_top
-
-    return np.pad(
-        arr,
-        ((pad_top, pad_bottom), (pad_left, pad_right)),
-        mode="edge",
-    )
+    return np.pad(arr, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="edge")
 
 
 def pad_yuv420_edge(y, u, v, coded_w, coded_h, pad_left, pad_top):
     y_pad = pad_2d_edge(y, coded_w, coded_h, pad_left, pad_top)
-
-    u_pad = pad_2d_edge(
-        u,
-        coded_w // 2,
-        coded_h // 2,
-        pad_left // 2,
-        pad_top // 2,
-    )
-
-    v_pad = pad_2d_edge(
-        v,
-        coded_w // 2,
-        coded_h // 2,
-        pad_left // 2,
-        pad_top // 2,
-    )
-
+    u_pad = pad_2d_edge(u, coded_w // 2, coded_h // 2, pad_left // 2, pad_top // 2)
+    v_pad = pad_2d_edge(v, coded_w // 2, coded_h // 2, pad_left // 2, pad_top // 2)
     return y_pad, u_pad, v_pad
 
 
 def active_slice(src_w, src_h, pad_left, pad_top):
-    return (
-        slice(pad_top, pad_top + src_h),
-        slice(pad_left, pad_left + src_w),
-    )
+    return slice(pad_top, pad_top + src_h), slice(pad_left, pad_left + src_w)
 
 
 def calc_psnr(a, b, bit_depth):
     a = a.astype(np.float64)
     b = b.astype(np.float64)
-
     mse = np.mean((a - b) ** 2)
-
     if mse == 0:
         return float("inf")
-
     maxv = (1 << bit_depth) - 1
     return 10.0 * np.log10((maxv * maxv) / mse)
 
@@ -163,25 +127,17 @@ def yuv_dtype(bit_depth):
 
 def read_yuv420(path, idx, w, h, bit_depth):
     dtype = yuv_dtype(bit_depth)
-
     y_size = w * h
     uv_size = (w // 2) * (h // 2)
     fs = frame_size_yuv420(w, h, bit_depth)
-
     with open(path, "rb") as f:
         f.seek(idx * fs)
         y = np.fromfile(f, dtype=dtype, count=y_size)
         u = np.fromfile(f, dtype=dtype, count=uv_size)
         v = np.fromfile(f, dtype=dtype, count=uv_size)
-
     if y.size != y_size or u.size != uv_size or v.size != uv_size:
         raise RuntimeError(f"Cannot read frame {idx}: {path}")
-
-    return (
-        y.reshape(h, w),
-        u.reshape(h // 2, w // 2),
-        v.reshape(h // 2, w // 2),
-    )
+    return y.reshape(h, w), u.reshape(h // 2, w // 2), v.reshape(h // 2, w // 2)
 
 
 def write_yuv420(path, y, u, v):
@@ -191,38 +147,41 @@ def write_yuv420(path, y, u, v):
         f.write(np.ascontiguousarray(v).tobytes())
 
 
+def write_mask_yuv420(path, mask_y, bit_depth):
+    maxv = (1 << bit_depth) - 1
+    dtype = yuv_dtype(bit_depth)
+    y = np.where(mask_y > 0, maxv, 0).astype(dtype)
+    h, w = y.shape
+    neutral = 128 if bit_depth <= 8 else 512
+    u = np.full((h // 2, w // 2), neutral, dtype=dtype)
+    v = np.full((h // 2, w // 2), neutral, dtype=dtype)
+    write_yuv420(path, y, u, v)
+
+
 # ============================================================
-# Param JSONL
+# JSONL / quantization
 # ============================================================
 
 def load_param_jsonl(path):
     header = None
     frames = {}
-
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
-
             obj = json.loads(line)
-
             if obj.get("type") in ["header", "intrinsic"]:
                 header = obj
             elif "poc" in obj:
                 frames[int(obj["poc"])] = obj
-
     if header is None:
         raise RuntimeError("header line not found in param jsonl")
-
     if "depth_scale" not in header:
         raise RuntimeError("depth_scale not found in header")
-
-    if "intrinsic" not in header:
+    if "intrinsic" not in header and "intrinsic_dec_first" not in header and "intrinsic_gt_padded0" not in header:
         raise RuntimeError("intrinsic not found in header")
-
     if not frames:
         raise RuntimeError("no frame lines found in param jsonl")
-
     return header, frames
 
 
@@ -232,10 +191,8 @@ def get_depth_scale_real_from_header(header):
         if precision <= 0:
             raise ValueError("depth_scale_precision must be positive")
         return float(header["depth_scale"]) / precision
-
     if "depth_scale_real" in header:
         return float(header["depth_scale_real"])
-
     return float(header["depth_scale"])
 
 
@@ -243,22 +200,6 @@ def get_depth_scale_precision_from_header(header):
     if "depth_scale_precision" in header:
         return int(header["depth_scale_precision"])
     return None
-
-
-# ============================================================
-# Quantization
-# ============================================================
-
-def quant_u(value, lo, hi, bits):
-    qmax = (1 << bits) - 1
-
-    q = np.round((value - lo) / (hi - lo) * qmax)
-    q = np.clip(q, 0, qmax).astype(np.int32)
-
-    dec = q.astype(np.float32) / qmax * (hi - lo) + lo
-    clipped = (value < lo) | (value > hi)
-
-    return q, dec, clipped
 
 
 def signed_q_abs_max(bits):
@@ -271,14 +212,40 @@ def quant_s(value, step, bits):
     q_abs_max = signed_q_abs_max(bits)
     qmin = -q_abs_max
     qmax = q_abs_max
-
-    q = np.round(value / step)
+    q = np.round(np.asarray(value, dtype=np.float32) / float(step))
     clipped = (q < qmin) | (q > qmax)
-
     q = np.clip(q, qmin, qmax).astype(np.int32)
-    dec = q.astype(np.float32) * step
-
+    dec = q.astype(np.float32) * float(step)
     return q, dec, clipped
+
+
+def signed_to_code_num(x):
+    x = int(x)
+    if x == 0:
+        return 0
+    if x > 0:
+        return 2 * x - 1
+    return -2 * x
+
+
+def ue_exp_golomb_bits(code_num):
+    code_num = int(code_num)
+    if code_num < 0:
+        raise ValueError("code_num must be non-negative")
+    k = (code_num + 1).bit_length() - 1
+    return 2 * k + 1
+
+
+def signed_truncated_exp_golomb_bits(x, q_abs_max):
+    x = int(x)
+    if x < -q_abs_max or x > q_abs_max:
+        raise ValueError(f"x={x} outside signed truncated range [-{q_abs_max}, {q_abs_max}]")
+    return ue_exp_golomb_bits(signed_to_code_num(x))
+
+
+def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
+    bits_each = [signed_truncated_exp_golomb_bits(int(v), q_abs_max) for v in q_residual]
+    return bits_each, int(sum(bits_each))
 
 
 def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
@@ -301,1001 +268,660 @@ def add_intrinsic_delta(intr, delta):
     }
 
 
-def intrinsic_to_vec4(intr):
-    return np.array(
-        [
-            float(intr["fx"]),
-            float(intr["fy"]),
-            float(intr["cx"]),
-            float(intr["cy"]),
-        ],
-        dtype=np.float32,
-    )
+def _maybe_padded_intrinsic(intr, pad_left, pad_top, assume_already_padded=False):
+    if assume_already_padded:
+        return {
+            "fx": float(intr["fx"]), "fy": float(intr["fy"]),
+            "cx": float(intr["cx"]), "cy": float(intr["cy"]),
+            "z_sign": float(intr.get("z_sign", 1.0)),
+        }
+    return make_padded_intrinsic_from_original(intr, pad_left, pad_top)
 
 
-def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
-    fx_n = intr["fx"] / w
-    fy_n = intr["fy"] / h
-    cx_n = intr["cx"] / w
-    cy_n = intr["cy"] / h
+def build_frame_intrinsics(header, frames, max_idx, pad_left, pad_top):
+    intrs = {}
+    if "intrinsic_dec_first" in header:
+        intr0 = _maybe_padded_intrinsic(header["intrinsic_dec_first"], pad_left, pad_top, True)
+    elif "intrinsic_gt_padded0" in header:
+        intr0 = _maybe_padded_intrinsic(header["intrinsic_gt_padded0"], pad_left, pad_top, True)
+    elif "intrinsic" in header:
+        intr0 = make_padded_intrinsic_from_original(header["intrinsic"], pad_left, pad_top)
+    else:
+        raise RuntimeError("No intrinsic information found in JSONL header")
+    intrs[0] = intr0
 
-    q_fx, d_fx, c_fx = quant_u(fx_n, -f_max, f_max, 16)
-    q_fy, d_fy, c_fy = quant_u(fy_n, -f_max, f_max, 16)
-    q_cx, d_cx, c_cx = quant_u(cx_n, c_min, c_max, 16)
-    q_cy, d_cy, c_cy = quant_u(cy_n, c_min, c_max, 16)
-
-    intr_dec = {
-        "fx": float(d_fx * w),
-        "fy": float(d_fy * h),
-        "cx": float(d_cx * w),
-        "cy": float(d_cy * h),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
-
-    intr_q = {
-        "fx": int(q_fx),
-        "fy": int(q_fy),
-        "cx": int(q_cx),
-        "cy": int(q_cy),
-    }
-
-    clipped = bool(c_fx or c_fy or c_cx or c_cy)
-
-    return intr_q, intr_dec, clipped
-
-
-def quantize_intrinsic_delta_4(delta, step, bits):
-    """
-    delta order:
-      [dfx, dfy, dcx, dcy]
-
-    q = round(delta / step)
-    dec_delta = q * step
-    """
-    delta = np.asarray(delta, dtype=np.float32).reshape(4)
-    q, dec, clipped = quant_s(delta, step=step, bits=bits)
-    return q.astype(np.int32), dec.astype(np.float32), clipped
-
-
-def param6_from_frame(frame, depth_scale_real):
-    r = np.array(frame["rvec"], dtype=np.float32)
-    t = np.array(frame["tvec"], dtype=np.float32) / float(depth_scale_real)
-
-    return np.concatenate([r, t], axis=0)
-
-
-def rt_from_param6(p, depth_scale_real):
-    return {
-        "rvec": p[:3].astype(float).tolist(),
-        "tvec": (p[3:] * float(depth_scale_real)).astype(float).tolist(),
-    }
+    for i in range(1, int(max_idx) + 1):
+        f = frames.get(i, {})
+        if "intrinsic_tar_dec" in f:
+            intrs[i] = _maybe_padded_intrinsic(f["intrinsic_tar_dec"], pad_left, pad_top, True)
+        elif "intrinsic_dec" in f:
+            intrs[i] = _maybe_padded_intrinsic(f["intrinsic_dec"], pad_left, pad_top, True)
+        elif "intrinsic" in f:
+            intrs[i] = make_padded_intrinsic_from_original(f["intrinsic"], pad_left, pad_top)
+        elif "intrinsic_delta" in f:
+            delta = np.asarray(f["intrinsic_delta"], dtype=np.float32).reshape(4)
+            intrs[i] = add_intrinsic_delta(intrs[i - 1], delta)
+        else:
+            intrs[i] = intrs[i - 1].copy()
+    return intrs
 
 
 # ============================================================
-# Signed truncated Exp-Golomb bit count
+# Rotation / pose helpers without cv2
 # ============================================================
 
-def signed_to_code_num(x):
-    x = int(x)
-
-    if x == 0:
-        return 0
-
-    if x > 0:
-        return 2 * x - 1
-
-    return -2 * x
-
-
-def ue_exp_golomb_bits(code_num):
-    code_num = int(code_num)
-
-    if code_num < 0:
-        raise ValueError("code_num must be non-negative")
-
-    k = (code_num + 1).bit_length() - 1
-    return 2 * k + 1
+def rodrigues_to_matrix(rvec):
+    r = np.asarray(rvec, dtype=np.float64).reshape(3)
+    theta = float(np.linalg.norm(r))
+    if theta < 1e-12:
+        K = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]], dtype=np.float64)
+        return np.eye(3, dtype=np.float64) + K
+    k = r / theta
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]], dtype=np.float64)
+    return np.eye(3, dtype=np.float64) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
 
 
-def signed_truncated_exp_golomb_bits(x, q_abs_max):
-    x = int(x)
+def _as_extrinsic_matrix(frame):
+    for key in ["extrinsic_abs", "extrinsic", "camera_extrinsic", "cam_from_world"]:
+        if key in frame:
+            E = np.asarray(frame[key], dtype=np.float64)
+            if E.shape == (4, 4):
+                return E[:3, :4]
+            if E.shape == (3, 4):
+                return E
+            if E.size == 12:
+                return E.reshape(3, 4)
+            if E.size == 16:
+                return E.reshape(4, 4)[:3, :4]
+    if "rvec_abs" in frame and "tvec_abs" in frame:
+        R = rodrigues_to_matrix(frame["rvec_abs"])
+        t = np.asarray(frame["tvec_abs"], dtype=np.float64).reshape(3)
+        return np.concatenate([R, t.reshape(3, 1)], axis=1)
+    return None
 
-    if x < -q_abs_max or x > q_abs_max:
-        raise ValueError(
-            f"x={x} outside signed truncated range "
-            f"[-{q_abs_max}, {q_abs_max}]"
-        )
 
-    code_num = signed_to_code_num(x)
-    max_code_num = 2 * q_abs_max
-
-    if code_num > max_code_num:
-        raise ValueError(
-            f"code_num={code_num} outside truncated range [0, {max_code_num}]"
-        )
-
-    return ue_exp_golomb_bits(code_num)
+def _frame_relative_rt_current_to_previous(frame):
+    if "rt_dec" in frame:
+        rt = frame["rt_dec"]
+        rvec = rt["rvec"]
+        tvec = rt["tvec"]
+    elif "rvec" in frame and "tvec" in frame:
+        rvec = frame["rvec"]
+        tvec = frame["tvec"]
+    else:
+        raise RuntimeError("Frame has no relative pose. Expected either rt_dec or rvec/tvec.")
+    return rodrigues_to_matrix(rvec), np.asarray(tvec, dtype=np.float64).reshape(3)
 
 
-def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
-    bits_each = [
-        signed_truncated_exp_golomb_bits(int(v), q_abs_max)
-        for v in q_residual
-    ]
+def _invert_rt(R, t):
+    Ri = R.T
+    ti = -Ri @ t
+    return Ri, ti
 
-    return bits_each, int(sum(bits_each))
+
+def _compose_rt(R2, t2, R1, t1):
+    return R2 @ R1, R2 @ t1 + t2
+
+
+def get_target_to_reference_rt(frames, ref_idx, tar_idx):
+    ref_idx = int(ref_idx)
+    tar_idx = int(tar_idx)
+    if ref_idx == tar_idx:
+        return {"R": np.eye(3, dtype=np.float64), "t": np.zeros(3, dtype=np.float64), "source": "identity"}
+
+    f_ref = frames.get(ref_idx, {})
+    f_tar = frames.get(tar_idx, {})
+    E_ref = _as_extrinsic_matrix(f_ref)
+    E_tar = _as_extrinsic_matrix(f_tar)
+    if E_ref is not None and E_tar is not None:
+        R_ref, t_ref = E_ref[:, :3], E_ref[:, 3]
+        R_tar, t_tar = E_tar[:, :3], E_tar[:, 3]
+        R = R_ref @ R_tar.T
+        t = t_ref - R @ t_tar
+        return {"R": R.astype(np.float64), "t": t.astype(np.float64), "source": "absolute_extrinsic"}
+
+    if tar_idx > ref_idx:
+        R_tot = np.eye(3, dtype=np.float64)
+        t_tot = np.zeros(3, dtype=np.float64)
+        for p in range(tar_idx, ref_idx, -1):
+            if p not in frames:
+                raise RuntimeError(f"Missing frame {p} for relative pose composition")
+            R_p, t_p = _frame_relative_rt_current_to_previous(frames[p])
+            R_tot, t_tot = _compose_rt(R_p, t_p, R_tot, t_tot)
+    else:
+        R_fwd = np.eye(3, dtype=np.float64)
+        t_fwd = np.zeros(3, dtype=np.float64)
+        for p in range(ref_idx, tar_idx, -1):
+            if p not in frames:
+                raise RuntimeError(f"Missing frame {p} for relative pose composition")
+            R_p, t_p = _frame_relative_rt_current_to_previous(frames[p])
+            R_fwd, t_fwd = _compose_rt(R_p, t_p, R_fwd, t_fwd)
+        R_tot, t_tot = _invert_rt(R_fwd, t_fwd)
+
+    return {"R": R_tot.astype(np.float64), "t": t_tot.astype(np.float64), "source": "composed_current_to_previous"}
 
 
 # ============================================================
-# Predictor
-# ============================================================
-
-def predict_from_history(decoded_hist, pred_n, pred_degree):
-    if not decoded_hist:
-        return np.zeros(6, dtype=np.float32)
-
-    m = min(len(decoded_hist), pred_n)
-    y = np.stack(decoded_hist[-m:], axis=0).astype(np.float32)
-
-    if m == 1:
-        return y[-1].copy()
-
-    deg = min(pred_degree, m - 1)
-
-    x = np.arange(m, dtype=np.float32)
-    x_next = np.array([m], dtype=np.float32)
-
-    A = np.vander(x, N=deg + 1, increasing=True)
-    b = np.vander(x_next, N=deg + 1, increasing=True)
-
-    coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-    pred = b @ coef
-
-    return pred.reshape(6).astype(np.float32)
-
-
-# ============================================================
-# Fast Pixel-coordinate Projection
+# Projection
 # ============================================================
 
 def make_projection_precompute_dual(w, h, intr_tar, intr_ref):
-    """
-    target unprojection uses intr_tar.
-    reference projection uses intr_ref.
-
-      X_tar = [(x-cx_tar)/fx_tar*z,
-               (y-cy_tar)/fy_tar*z,
-               z_sign*z]
-
-      X_ref = R * X_tar + t
-
-      map_x = fx_ref * X_ref.x / |X_ref.z| + cx_ref
-      map_y = fy_ref * X_ref.y / |X_ref.z| + cy_ref
-    """
-    fx_t = float(intr_tar["fx"])
-    fy_t = float(intr_tar["fy"])
-    cx_t = float(intr_tar["cx"])
-    cy_t = float(intr_tar["cy"])
-
-    fx_r = float(intr_ref["fx"])
-    fy_r = float(intr_ref["fy"])
-    cx_r = float(intr_ref["cx"])
-    cy_r = float(intr_ref["cy"])
-
+    fx_t, fy_t = float(intr_tar["fx"]), float(intr_tar["fy"])
+    cx_t, cy_t = float(intr_tar["cx"]), float(intr_tar["cy"])
+    fx_r, fy_r = float(intr_ref["fx"]), float(intr_ref["fy"])
+    cx_r, cy_r = float(intr_ref["cx"]), float(intr_ref["cy"])
     z_sign = float(intr_tar.get("z_sign", intr_ref.get("z_sign", 1.0)))
-
-    x, y = np.meshgrid(
-        np.arange(w, dtype=np.float32),
-        np.arange(h, dtype=np.float32),
-    )
-
+    x, y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     x_norm = (x - cx_t) / fx_t
     y_norm = (y - cy_t) / fy_t
-
     return {
-        "w": int(w),
-        "h": int(h),
-
-        "fx_ref": fx_r,
-        "fy_ref": fy_r,
-        "cx_ref": cx_r,
-        "cy_ref": cy_r,
-
+        "w": int(w), "h": int(h),
+        "fx_ref": fx_r, "fy_ref": fy_r, "cx_ref": cx_r, "cy_ref": cy_r,
         "z_sign": z_sign,
-        "x_norm": x_norm.astype(np.float32),
-        "y_norm": y_norm.astype(np.float32),
+        "x_norm": x_norm.astype(np.float32), "y_norm": y_norm.astype(np.float32),
     }
 
 
 def backward_map_fast_pixel_coord_dual(depth_linear, precomp, rt):
-    w = precomp["w"]
-    h = precomp["h"]
-
-    fx = precomp["fx_ref"]
-    fy = precomp["fy_ref"]
-    cx = precomp["cx_ref"]
-    cy = precomp["cy_ref"]
-
+    w, h = precomp["w"], precomp["h"]
+    fx, fy = precomp["fx_ref"], precomp["fy_ref"]
+    cx, cy = precomp["cx_ref"], precomp["cy_ref"]
     z_sign = precomp["z_sign"]
-
-    x_norm = precomp["x_norm"]
-    y_norm = precomp["y_norm"]
-
+    x_norm, y_norm = precomp["x_norm"], precomp["y_norm"]
     z = depth_linear.astype(np.float32)
-
-    rvec = np.array(rt["rvec"], dtype=np.float32).reshape(3, 1)
-    tvec = np.array(rt["tvec"], dtype=np.float32)
-
-    R, _ = cv2.Rodrigues(rvec)
-    R = R.astype(np.float32)
-
-    tx = float(tvec[0])
-    ty = float(tvec[1])
-    tz = float(tvec[2])
+    R = np.asarray(rt["R"], dtype=np.float32).reshape(3, 3)
+    t = np.asarray(rt["t"], dtype=np.float32).reshape(3)
 
     kx = R[0, 0] * x_norm + R[0, 1] * y_norm + R[0, 2] * z_sign
     ky = R[1, 0] * x_norm + R[1, 1] * y_norm + R[1, 2] * z_sign
     kz = R[2, 0] * x_norm + R[2, 1] * y_norm + R[2, 2] * z_sign
 
-    Xp = z * kx + tx
-    Yp = z * ky + ty
-    Zp = z * kz + tz
-
+    Xp = z * kx + float(t[0])
+    Yp = z * ky + float(t[1])
+    Zp = z * kz + float(t[2])
     denom = np.maximum(np.abs(Zp), 1e-8)
-
     map_x = fx * (Xp / denom) + cx
     map_y = fy * (Yp / denom) + cy
-
     valid = (
-        np.isfinite(map_x)
-        & np.isfinite(map_y)
-        & (Zp * z_sign > 0)
-        & (map_x >= 0.0)
-        & (map_x <= w - 1)
-        & (map_y >= 0.0)
-        & (map_y <= h - 1)
-        & (z > 0.0)
+        np.isfinite(map_x) & np.isfinite(map_y) & (Zp * z_sign > 0) &
+        (map_x >= 0.0) & (map_x <= w - 1) & (map_y >= 0.0) & (map_y <= h - 1) & (z > 0.0)
     )
-
     map_x = map_x.astype(np.float32)
     map_y = map_y.astype(np.float32)
-
     map_x[~valid] = -1.0
     map_y[~valid] = -1.0
-
     return map_x, map_y
 
 
 # ============================================================
-# Remap / Warp
+# No-OpenCV remap / filters / masks
 # ============================================================
+
+def bilinear_sample(src, x, y, border_value=0.0):
+    src_f = src.astype(np.float32, copy=False)
+    h, w = src_f.shape
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    valid = np.isfinite(x) & np.isfinite(y) & (x >= 0.0) & (x <= w - 1) & (y >= 0.0) & (y <= h - 1)
+
+    x0 = np.floor(np.clip(x, 0.0, w - 1)).astype(np.int32)
+    y0 = np.floor(np.clip(y, 0.0, h - 1)).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    fx = np.clip(x - x0.astype(np.float32), 0.0, 1.0)
+    fy = np.clip(y - y0.astype(np.float32), 0.0, 1.0)
+
+    p00 = src_f[y0, x0]
+    p01 = src_f[y0, x1]
+    p10 = src_f[y1, x0]
+    p11 = src_f[y1, x1]
+    a = p00 * (1.0 - fx) + p01 * fx
+    b = p10 * (1.0 - fx) + p11 * fx
+    out = a * (1.0 - fy) + b * fy
+    out = np.where(valid, out, float(border_value)).astype(np.float32)
+    return out
+
 
 def remap_plane(src, map_x, map_y, bit_depth, border_value):
     maxv = (1 << bit_depth) - 1
-
-    dst = cv2.remap(
-        src.astype(np.float32),
-        map_x.astype(np.float32),
-        map_y.astype(np.float32),
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=float(border_value),
-    )
-
+    dst = bilinear_sample(src, map_x, map_y, border_value=float(border_value))
     dst = np.clip(np.round(dst), 0, maxv)
-
-    if bit_depth <= 8:
-        return dst.astype(np.uint8)
-
-    return dst.astype(np.dtype("<u2"))
+    return dst.astype(yuv_dtype(bit_depth))
 
 
 def downsample_luma_map_to_chroma_map(map_x, map_y):
     h, w = map_x.shape
-
     if h % 2 != 0 or w % 2 != 0:
         raise ValueError("luma map size must be even for YUV420")
-
-    uv_h = h // 2
-    uv_w = w // 2
-
+    uv_h, uv_w = h // 2, w // 2
     mx = map_x.reshape(uv_h, 2, uv_w, 2)
     my = map_y.reshape(uv_h, 2, uv_w, 2)
-
     valid = (mx >= 0.0) & (my >= 0.0)
     cnt = np.sum(valid, axis=(1, 3)).astype(np.float32)
-
     sum_x = np.sum(np.where(valid, mx, 0.0), axis=(1, 3))
     sum_y = np.sum(np.where(valid, my, 0.0), axis=(1, 3))
-
     avg_x = np.full((uv_h, uv_w), -1.0, dtype=np.float32)
     avg_y = np.full((uv_h, uv_w), -1.0, dtype=np.float32)
-
     ok = cnt > 0
-
     avg_x[ok] = sum_x[ok] / cnt[ok]
     avg_y[ok] = sum_y[ok] / cnt[ok]
-
     map_x_uv = avg_x * 0.5
     map_y_uv = avg_y * 0.5
-
     map_x_uv[~ok] = -1.0
     map_y_uv[~ok] = -1.0
-
     return map_x_uv.astype(np.float32), map_y_uv.astype(np.float32)
 
 
 def backward_warp_yuv420_bilinear(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
     y = remap_plane(prev_y, map_x, map_y, bit_depth, 0)
-
     map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
-
     neutral = 128 if bit_depth <= 8 else 512
-
     u = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
     v = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
-
     return y, u, v
 
 
-# ============================================================
-# Global affine bias over cam-proj flow
-# ============================================================
-
-def normalize_for_ecc(img, bit_depth):
-    x = img.astype(np.float32)
-    maxv = float((1 << bit_depth) - 1)
-    return np.clip(x / maxv, 0.0, 1.0).astype(np.float32)
+def morph_mask(mask_u8, radius, op):
+    radius = int(radius)
+    if radius <= 0:
+        return mask_u8.astype(np.uint8).copy()
+    m = mask_u8 > 0
+    pad_value = False if op == "dilate" else True
+    p = np.pad(m, ((radius, radius), (radius, radius)), mode="constant", constant_values=pad_value)
+    out = np.zeros_like(m, dtype=bool) if op == "dilate" else np.ones_like(m, dtype=bool)
+    for dy in range(2 * radius + 1):
+        for dx in range(2 * radius + 1):
+            s = p[dy:dy + m.shape[0], dx:dx + m.shape[1]]
+            if op == "dilate":
+                out |= s
+            elif op == "erode":
+                out &= s
+            else:
+                raise ValueError(op)
+    return (out.astype(np.uint8) * 255)
 
 
 def make_valid_u8_mask(map_x, map_y, w, h, erode=0, active_region=None):
     valid = (
-        np.isfinite(map_x)
-        & np.isfinite(map_y)
-        & (map_x >= 0.0)
-        & (map_x <= w - 1)
-        & (map_y >= 0.0)
-        & (map_y <= h - 1)
+        np.isfinite(map_x) & np.isfinite(map_y) &
+        (map_x >= 0.0) & (map_x <= w - 1) & (map_y >= 0.0) & (map_y <= h - 1)
     )
-
     if active_region is not None:
         ys, xs = active_region
         active = np.zeros_like(valid, dtype=bool)
         active[ys, xs] = True
         valid &= active
-
-    mask = (valid.astype(np.uint8) * 255)
-
-    if erode > 0:
-        k = 2 * int(erode) + 1
-        kernel = np.ones((k, k), dtype=np.uint8)
-        mask = cv2.erode(mask, kernel, iterations=1)
-
+    mask = valid.astype(np.uint8) * 255
+    if int(erode) > 0:
+        mask = morph_mask(mask, int(erode), "erode")
     return mask
 
 
-def estimate_global_affine_bias_ecc(
-    cur_y,
-    cam_warp_y,
-    valid_mask_u8,
-    bit_depth,
-    max_iters=50,
-    eps=1e-4,
-):
-    """
-    Estimate residual affine transform between current frame and cam-proj warped frame.
+def normalize_for_fit(img, bit_depth):
+    x = img.astype(np.float32)
+    maxv = float((1 << bit_depth) - 1)
+    return np.clip(x / maxv, 0.0, 1.0).astype(np.float32)
 
-    This estimates a coordinate-domain affine bias:
-        [x_bias_dst, y_bias_dst] = A * [x, y, 1]
-        bias(x,y) = [x_bias_dst-x, y_bias_dst-y]
-        final_map = cam_proj_map + bias(x,y)
 
-    The fitting region is restricted by valid_mask_u8.
-    """
-    if np.count_nonzero(valid_mask_u8) < 100:
-        return np.eye(2, 3, dtype=np.float32), False, None
+def gaussian_blur_np(img, radius):
+    radius = int(radius)
+    if radius <= 0:
+        return img.astype(np.float32, copy=False)
+    sigma = max(radius / 2.0, 0.5)
+    xs = np.arange(-radius, radius + 1, dtype=np.float32)
+    k = np.exp(-(xs * xs) / (2.0 * sigma * sigma))
+    k /= np.sum(k)
+    tmp = np.pad(img.astype(np.float32), ((0, 0), (radius, radius)), mode="edge")
+    out = np.zeros_like(img, dtype=np.float32)
+    for i, kv in enumerate(k):
+        out += kv * tmp[:, i:i + img.shape[1]]
+    tmp = np.pad(out, ((radius, radius), (0, 0)), mode="edge")
+    out2 = np.zeros_like(img, dtype=np.float32)
+    for i, kv in enumerate(k):
+        out2 += kv * tmp[i:i + img.shape[0], :]
+    return out2
 
-    template = normalize_for_ecc(cur_y, bit_depth)
-    inp = normalize_for_ecc(cam_warp_y, bit_depth)
 
-    warp = np.eye(2, 3, dtype=np.float32)
-
-    criteria = (
-        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-        int(max_iters),
-        float(eps),
+def scharr_grad_np(y):
+    y = y.astype(np.float32, copy=False)
+    p = np.pad(y, ((1, 1), (1, 1)), mode="edge")
+    # Sign is irrelevant for magnitude/abs; this matches a Scharr-like derivative scale.
+    gx = (
+        -3.0 * p[:-2, :-2] + 3.0 * p[:-2, 2:] +
+        -10.0 * p[1:-1, :-2] + 10.0 * p[1:-1, 2:] +
+        -3.0 * p[2:, :-2] + 3.0 * p[2:, 2:]
     )
-
-    try:
-        cc, warp = cv2.findTransformECC(
-            templateImage=template,
-            inputImage=inp,
-            warpMatrix=warp,
-            motionType=cv2.MOTION_AFFINE,
-            criteria=criteria,
-            inputMask=valid_mask_u8,
-            gaussFiltSize=5,
-        )
-        return warp.astype(np.float32), True, float(cc)
-    except cv2.error:
-        return np.eye(2, 3, dtype=np.float32), False, None
-
-
-def bilinear_sample_vectorized(img, xs, ys):
-    """Vectorized bilinear sampling for float32 grayscale images."""
-    h, w = img.shape
-
-    xs = np.asarray(xs, dtype=np.float32)
-    ys = np.asarray(ys, dtype=np.float32)
-
-    valid = (
-        np.isfinite(xs)
-        & np.isfinite(ys)
-        & (xs >= 0.0)
-        & (xs <= w - 1)
-        & (ys >= 0.0)
-        & (ys <= h - 1)
+    gy = (
+        -3.0 * p[:-2, :-2] -10.0 * p[:-2, 1:-1] -3.0 * p[:-2, 2:] +
+         3.0 * p[2:, :-2] +10.0 * p[2:, 1:-1] +3.0 * p[2:, 2:]
     )
-
-    xs_safe = np.clip(xs, 0.0, float(w - 1))
-    ys_safe = np.clip(ys, 0.0, float(h - 1))
-
-    x0 = np.floor(xs_safe).astype(np.int32)
-    y0 = np.floor(ys_safe).astype(np.int32)
-    x1 = np.minimum(x0 + 1, w - 1)
-    y1 = np.minimum(y0 + 1, h - 1)
-
-    fx = xs_safe - x0.astype(np.float32)
-    fy = ys_safe - y0.astype(np.float32)
-
-    p00 = img[y0, x0]
-    p01 = img[y0, x1]
-    p10 = img[y1, x0]
-    p11 = img[y1, x1]
-
-    a = p00 * (1.0 - fx) + p01 * fx
-    b = p10 * (1.0 - fx) + p11 * fx
-    out = a * (1.0 - fy) + b * fy
-
-    out = out.astype(np.float32)
-    out[~valid] = 0.0
-
-    return out, valid
+    return gx.astype(np.float32), gy.astype(np.float32)
 
 
-def params_to_affine_matrix_lk(p, w, h):
-    """
-    LK parameterization:
-      x' = x + p0 + p1*xn + p2*yn
-      y' = y + p3 + p4*xn + p5*yn
-      xn = (x-cx)/w, yn = (y-cy)/h
+def make_structure_image(img, bit_depth, mode="scharr_mag", log_gain=20.0, pre_blur=0):
+    y = normalize_for_fit(img, bit_depth)
+    if int(pre_blur) > 0:
+        y = gaussian_blur_np(y, int(pre_blur))
+    gx, gy = scharr_grad_np(y)
+    mode = str(mode)
+    if mode == "scharr_mag":
+        s = np.sqrt(gx * gx + gy * gy)
+    elif mode == "scharr_l1":
+        s = np.abs(gx) + np.abs(gy)
+    elif mode == "scharr_x":
+        s = np.abs(gx)
+    elif mode == "scharr_y":
+        s = np.abs(gy)
+    elif mode == "scharr_x_weighted":
+        s = 0.75 * np.abs(gx) + 0.25 * np.abs(gy)
+    else:
+        raise ValueError(f"Unsupported structure mode: {mode}")
+    if float(log_gain) > 0.0:
+        s = np.log1p(float(log_gain) * s)
+    m = float(np.max(s))
+    if m > 1e-8:
+        s = s / m
+    return np.clip(s, 0.0, 1.0).astype(np.float32)
 
-    Return 2x3 matrix A such that [x',y'] = A*[x,y,1].
-    """
+
+def make_structure_mask_u8(structure, base_mask_u8, keep_percent=35.0, dilate=1):
+    base = base_mask_u8 > 0
+    valid_vals = structure[base]
+    stats = {
+        "base_count": int(np.count_nonzero(base)),
+        "keep_percent": float(keep_percent),
+        "threshold": None,
+        "structure_count": 0,
+        "final_count": 0,
+        "final_ratio_vs_base": 0.0,
+    }
+    if valid_vals.size < 100:
+        return base_mask_u8.copy(), stats
+    keep_percent = max(0.1, min(100.0, float(keep_percent)))
+    if keep_percent >= 99.999:
+        thr = float(np.min(valid_vals))
+        mask = base.copy()
+    else:
+        thr = float(np.percentile(valid_vals, 100.0 - keep_percent))
+        mask = base & (structure >= thr)
+    stats["threshold"] = thr
+    stats["structure_count"] = int(np.count_nonzero(mask))
+    mask_u8 = mask.astype(np.uint8) * 255
+    if int(dilate) > 0:
+        mask_u8 = morph_mask(mask_u8, int(dilate), "dilate")
+        mask_u8 = np.where(base, mask_u8, 0).astype(np.uint8)
+    stats["final_count"] = int(np.count_nonzero(mask_u8))
+    if stats["base_count"] > 0:
+        stats["final_ratio_vs_base"] = float(stats["final_count"] / stats["base_count"])
+    return mask_u8, stats
+
+
+# ============================================================
+# No-OpenCV structure LK affine estimator
+# ============================================================
+
+def affine_p_to_matrix(p, w, h):
     p = np.asarray(p, dtype=np.float64).reshape(6)
     cx = 0.5 * float(w)
     cy = 0.5 * float(h)
-    ww = max(float(w), 1e-12)
-    hh = max(float(h), 1e-12)
+    W = max(float(w), 1e-12)
+    H = max(float(h), 1e-12)
+    # x' = x + p0 + p1*(x-cx)/W + p2*(y-cy)/H
+    # y' = y + p3 + p4*(x-cx)/W + p5*(y-cy)/H
+    a = 1.0 + p[1] / W
+    b = p[2] / H
+    c = p[0] - p[1] * cx / W - p[2] * cy / H
+    d = p[4] / W
+    e = 1.0 + p[5] / H
+    f = p[3] - p[4] * cx / W - p[5] * cy / H
+    return np.array([[a, b, c], [d, e, f]], dtype=np.float32)
 
-    return np.array(
-        [
-            [1.0 + p[1] / ww, p[2] / hh, p[0] - p[1] * cx / ww - p[2] * cy / hh],
-            [p[4] / ww, 1.0 + p[5] / hh, p[3] - p[4] * cx / ww - p[5] * cy / hh],
-        ],
-        dtype=np.float32,
-    )
+
+def identity_transform_matrix(cp_num):
+    return np.eye(2, 3, dtype=np.float32)
 
 
-def estimate_global_affine_bias_lk(
+def prepare_structure_images_and_mask(cur_y, cam_warp_y, valid_mask_u8, bit_depth,
+                                      structure_mode="scharr_mag", structure_keep_percent=35.0,
+                                      structure_mask_dilate=1, structure_log_gain=20.0,
+                                      structure_pre_blur=0):
+    template = make_structure_image(cur_y, bit_depth, mode=structure_mode,
+                                    log_gain=structure_log_gain, pre_blur=structure_pre_blur)
+    inp = make_structure_image(cam_warp_y, bit_depth, mode=structure_mode,
+                               log_gain=structure_log_gain, pre_blur=structure_pre_blur)
+    mask, mask_stats = make_structure_mask_u8(template, valid_mask_u8,
+                                              keep_percent=structure_keep_percent,
+                                              dilate=structure_mask_dilate)
+    stats = {
+        "fit_input": "structure_lk_noopencv",
+        "structure_mode": str(structure_mode),
+        "structure_keep_percent": float(structure_keep_percent),
+        "structure_mask_dilate": int(structure_mask_dilate),
+        "structure_log_gain": float(structure_log_gain),
+        "structure_pre_blur": int(structure_pre_blur),
+        "mask_count_valid": int(np.count_nonzero(valid_mask_u8)),
+        "mask_count_used": int(np.count_nonzero(mask)),
+        "structure_mask": mask_stats,
+    }
+    return template, inp, mask, stats
+
+
+def estimate_global_affine_bias_structure_lk(
     cur_y,
     cam_warp_y,
     valid_mask_u8,
     bit_depth,
-    max_iters=30,
-    eps=1e-4,
-    sample_step=4,
-    normalize="zero_mean",
-    damping=1e-6,
-    max_update=4.0,
+    w,
+    h,
+    structure_mode="scharr_mag",
+    structure_keep_percent=35.0,
+    structure_mask_dilate=1,
+    structure_log_gain=20.0,
+    structure_pre_blur=0,
+    lk_sample_step=4,
+    lk_iters=50,
+    lk_eps=1e-4,
+    lk_normalize="none",
+    lk_weight="structure",
+    lk_damping=1.0,
 ):
-    """
-    Fast non-ECC affine estimator.
+    template, inp, fit_mask_u8, stats = prepare_structure_images_and_mask(
+        cur_y=cur_y,
+        cam_warp_y=cam_warp_y,
+        valid_mask_u8=valid_mask_u8,
+        bit_depth=bit_depth,
+        structure_mode=structure_mode,
+        structure_keep_percent=structure_keep_percent,
+        structure_mask_dilate=structure_mask_dilate,
+        structure_log_gain=structure_log_gain,
+        structure_pre_blur=structure_pre_blur,
+    )
 
-    It minimizes an SSD/zero-mean-SSD alignment objective between current Y and
-    cam-proj-only warped Y using a vectorized forward-additive Lucas-Kanade loop.
-
-    This is intended as a Python simulation path that is much closer to a C++
-    implementation than cv2.findTransformECC(), while avoiding the extremely
-    slow sparse local-search prototype.
-
-    Returns:
-      A, success, score
-    where score is negative RMSE after fitting, so larger is better.
-    """
-    if sample_step <= 0:
-        raise ValueError("sample_step must be positive")
-
-    mask = valid_mask_u8 > 0
-    if sample_step > 1:
-        sample_mask = np.zeros_like(mask, dtype=bool)
-        sample_mask[::sample_step, ::sample_step] = True
-        mask &= sample_mask
+    mask = fit_mask_u8 > 0
+    step = max(1, int(lk_sample_step))
+    sub = np.zeros_like(mask, dtype=bool)
+    sub[::step, ::step] = True
+    mask &= sub
 
     ys, xs = np.nonzero(mask)
-    if xs.size < 64:
-        return np.eye(2, 3, dtype=np.float32), False, None
-
-    maxv = float((1 << bit_depth) - 1)
-    T_img = np.clip(cur_y.astype(np.float32) / maxv, 0.0, 1.0)
-    I_img = np.clip(cam_warp_y.astype(np.float32) / maxv, 0.0, 1.0)
-
-    # Central-difference gradients of input image.  This maps cleanly to C++.
-    gy, gx = np.gradient(I_img)
-    gx = gx.astype(np.float32)
-    gy = gy.astype(np.float32)
+    if xs.size < 100:
+        stats.update({"sample_count": int(xs.size), "success_reason": "too_few_samples"})
+        return identity_transform_matrix(3), False, None, stats, fit_mask_u8
 
     xs = xs.astype(np.float32)
     ys = ys.astype(np.float32)
-    T = T_img[ys.astype(np.int32), xs.astype(np.int32)].astype(np.float32)
+    T = template[ys.astype(np.int32), xs.astype(np.int32)].astype(np.float32)
 
-    h, w = cur_y.shape
+    if lk_normalize == "zero_mean":
+        T_mean = float(np.mean(T))
+        T_std = float(np.std(T) + 1e-6)
+        T_fit = (T - T_mean) / T_std
+        inp_fit = (inp - T_mean) / T_std
+    elif lk_normalize == "none":
+        T_fit = T
+        inp_fit = inp
+    else:
+        raise ValueError(f"Unsupported --affine-lk-normalize: {lk_normalize}")
+
+    grad_x, grad_y = scharr_grad_np(inp_fit)
+
     cx = 0.5 * float(w)
     cy = 0.5 * float(h)
-    xn = ((xs - cx) / max(float(w), 1e-12)).astype(np.float32)
-    yn = ((ys - cy) / max(float(h), 1e-12)).astype(np.float32)
+    xn = (xs - cx) / max(float(w), 1e-12)
+    yn = (ys - cy) / max(float(h), 1e-12)
+
+    if lk_weight == "structure":
+        weight = np.sqrt(np.maximum(template[ys.astype(np.int32), xs.astype(np.int32)], 1e-4)).astype(np.float32)
+    elif lk_weight == "none":
+        weight = np.ones_like(xs, dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported --affine-lk-weight: {lk_weight}")
 
     p = np.zeros(6, dtype=np.float64)
-    final_rmse = None
+    history = []
+    success = False
 
-    for _iter in range(int(max_iters)):
-        xw = xs + float(p[0]) + float(p[1]) * xn + float(p[2]) * yn
-        yw = ys + float(p[3]) + float(p[4]) * xn + float(p[5]) * yn
-
-        I, valid = bilinear_sample_vectorized(I_img, xw, yw)
-        Ix, valid_x = bilinear_sample_vectorized(gx, xw, yw)
-        Iy, valid_y = bilinear_sample_vectorized(gy, xw, yw)
-        valid &= valid_x & valid_y
-
-        if np.count_nonzero(valid) < 64:
+    for it in range(int(lk_iters)):
+        xw = xs + p[0] + p[1] * xn + p[2] * yn
+        yw = ys + p[3] + p[4] * xn + p[5] * yn
+        inside = (xw >= 1.0) & (xw <= w - 2) & (yw >= 1.0) & (yw <= h - 2)
+        if np.count_nonzero(inside) < 100:
             break
 
-        Tv = T[valid]
-        Iv = I[valid]
-        Ixv = Ix[valid]
-        Iyv = Iy[valid]
-        xnv = xn[valid]
-        ynv = yn[valid]
+        xwi = xw[inside]
+        ywi = yw[inside]
+        I = bilinear_sample(inp_fit, xwi, ywi, border_value=0.0)
+        Ix = bilinear_sample(grad_x, xwi, ywi, border_value=0.0)
+        Iy = bilinear_sample(grad_y, xwi, ywi, border_value=0.0)
+        e = T_fit[inside] - I
 
-        if normalize == "none":
-            e = Tv - Iv
-            scale = 1.0
-        elif normalize == "zero_mean":
-            e = (Tv - np.mean(Tv)) - (Iv - np.mean(Iv))
-            scale = 1.0
-        elif normalize == "zncc_approx":
-            Tv0 = Tv - np.mean(Tv)
-            Iv0 = Iv - np.mean(Iv)
-            std_t = float(np.std(Tv0)) + 1e-6
-            std_i = float(np.std(Iv0)) + 1e-6
-            e = Tv0 / std_t - Iv0 / std_i
-            scale = 1.0 / std_i
-        else:
-            raise ValueError(f"Unknown LK normalize mode: {normalize}")
+        xi = xn[inside]
+        yi = yn[inside]
+        wi = weight[inside]
 
-        # J is dI/dp. Linearized residual: e_new = e - J*dp.
-        J = np.empty((e.size, 6), dtype=np.float32)
-        J[:, 0] = Ixv * scale
-        J[:, 1] = Ixv * xnv * scale
-        J[:, 2] = Ixv * ynv * scale
-        J[:, 3] = Iyv * scale
-        J[:, 4] = Iyv * xnv * scale
-        J[:, 5] = Iyv * ynv * scale
-
-        H = (J.T @ J).astype(np.float64)
-        b = (J.T @ e.astype(np.float32)).astype(np.float64)
-
-        H += np.eye(6, dtype=np.float64) * float(damping)
+        J = np.stack([Ix, Ix * xi, Ix * yi, Iy, Iy * xi, Iy * yi], axis=1).astype(np.float64)
+        ew = (e * wi).astype(np.float64)
+        Jw = J * wi[:, None].astype(np.float64)
+        Hm = Jw.T @ Jw
+        b = Jw.T @ ew
+        Hm.flat[::7] += 1e-6
 
         try:
-            dp = np.linalg.solve(H, b)
+            dp = np.linalg.solve(Hm, b)
         except np.linalg.LinAlgError:
-            break
+            dp = np.linalg.lstsq(Hm, b, rcond=None)[0]
 
-        dp_norm = float(np.linalg.norm(dp))
-        if not np.isfinite(dp_norm):
-            break
-
-        # Avoid catastrophic jumps on hard frames.
-        if max_update is not None and max_update > 0 and dp_norm > float(max_update):
-            dp *= float(max_update) / dp_norm
-            dp_norm = float(max_update)
-
+        dp *= float(lk_damping)
         p += dp
-        final_rmse = float(np.sqrt(np.mean(e.astype(np.float64) ** 2)))
-
-        if dp_norm < float(eps):
+        dp_norm = float(np.linalg.norm(dp))
+        mean_abs_e = float(np.mean(np.abs(e)))
+        history.append({"iter": int(it), "dp_norm": dp_norm, "mean_abs_error": mean_abs_e, "sample_count": int(np.count_nonzero(inside))})
+        if dp_norm < float(lk_eps):
+            success = True
             break
+    else:
+        success = True
 
-    A = params_to_affine_matrix_lk(p, w, h)
+    M = affine_p_to_matrix(p, w, h)
+    stats.update({
+        "sample_count": int(xs.size),
+        "lk_sample_step": int(lk_sample_step),
+        "lk_iters_requested": int(lk_iters),
+        "lk_iters_done": int(len(history)),
+        "lk_eps": float(lk_eps),
+        "lk_normalize": str(lk_normalize),
+        "lk_weight": str(lk_weight),
+        "lk_damping": float(lk_damping),
+        "p_final": p.astype(float).tolist(),
+        "history_tail": history[-5:],
+    })
+    score = -history[-1]["mean_abs_error"] if history else None
+    return M.astype(np.float32), bool(success), score, stats, fit_mask_u8
 
-    if final_rmse is None or not np.isfinite(final_rmse):
-        return np.eye(2, 3, dtype=np.float32), False, None
 
-    # score: larger is better, similar role to ECC cc for logging only.
-    score = -final_rmse
-    return A.astype(np.float32), True, float(score)
+# ============================================================
+# CP / transform helpers
+# ============================================================
 
-
-def affine_cp_points(w, h, cp_num):
-    """Return CP coordinates used for coding.
-
-    cp_num=2 follows a 4-parameter affine/similarity-style convention:
-      CP0=(0,0), CP1=(w,0), CP2 is derived.
-
-    cp_num=3 follows full 6-parameter affine:
-      CP0=(0,0), CP1=(w,0), CP2=(0,h).
-    """
+def transform_cp_points(w, h, cp_num):
+    cp_num = int(cp_num)
     if cp_num == 2:
-        return np.array(
-            [
-                [0.0, 0.0],
-                [float(w), 0.0],
-            ],
-            dtype=np.float32,
-        )
-    if cp_num == 3:
-        return np.array(
-            [
-                [0.0, 0.0],
-                [float(w), 0.0],
-                [0.0, float(h)],
-            ],
-            dtype=np.float32,
-        )
-    raise ValueError(f"cp_num must be 2 or 3, got {cp_num}")
+        pts = [[0.0, 0.0], [float(w), 0.0]]
+    elif cp_num == 3:
+        pts = [[0.0, 0.0], [float(w), 0.0], [0.0, float(h)]]
+    else:
+        raise ValueError("No-OpenCV LK version supports --affine-cp-num 2 or 3 only")
+    return np.asarray(pts, dtype=np.float32)
 
 
-def affine_matrix_to_cp_bias(A, w, h, cp_num=3):
-    """Convert affine coordinate warp to coded CP bias.
-
-    For cp_num=3, all three CP biases are extracted from the estimated affine.
-    For cp_num=2, only CP0/CP1 are extracted.  The decoder reconstructs a
-    constrained 4-parameter affine from those two CPs.
-
-    bias = warped_cp - original_cp
-    """
-    src = affine_cp_points(w, h, cp_num)
-    ones = np.ones((src.shape[0], 1), dtype=np.float32)
-    src_homo = np.concatenate([src, ones], axis=1)
-
-    dst = src_homo @ np.asarray(A, dtype=np.float32).T
-    bias = dst - src
-
-    return bias.astype(np.float32)
+def apply_transform_to_points(M, pts):
+    M = np.asarray(M, dtype=np.float32)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+    homo = np.concatenate([pts, ones], axis=1)
+    return (homo @ M.T).astype(np.float32)
 
 
-def cp_bias_to_affine_matrix(cp_bias, w, h, cp_num=3):
-    """Reconstruct affine matrix from decoded CP bias.
+def transform_matrix_to_cp_bias(M, w, h, cp_num=3):
+    src = transform_cp_points(w, h, cp_num)
+    dst = apply_transform_to_points(M, src)
+    return (dst - src).astype(np.float32)
 
-    cp_num=3: full affine from CP0/CP1/CP2.
-    cp_num=2: constrained 4-parameter model from CP0/CP1:
-      x' = a*x - b*y + tx
-      y' = b*x + a*y + ty
-    where CP0 gives tx/ty and CP1 gives a/b.
-    """
+
+def cp_bias_to_transform_matrix(cp_bias, w, h, cp_num=3):
+    cp_num = int(cp_num)
     cp_bias = np.asarray(cp_bias, dtype=np.float32).reshape(cp_num, 2)
-
-    if cp_num == 3:
-        src = affine_cp_points(w, h, 3)
-        dst = src + cp_bias
-        A = cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32))
-        return A.astype(np.float32)
-
     if cp_num == 2:
         dx0, dy0 = float(cp_bias[0, 0]), float(cp_bias[0, 1])
         dx1, dy1 = float(cp_bias[1, 0]), float(cp_bias[1, 1])
-
         ww = max(float(w), 1e-12)
-        tx = dx0
-        ty = dy0
-
-        # CP0 original=(0,0), warped=(dx0,dy0)
-        # CP1 original=(w,0), warped=(w+dx1,dy1)
-        # For x'=a*x-b*y+tx, y'=b*x+a*y+ty:
+        tx, ty = dx0, dy0
         a = (float(w) + dx1 - tx) / ww
         b = (dy1 - ty) / ww
+        return np.array([[a, -b, tx], [b, a, ty]], dtype=np.float32)
+    if cp_num == 3:
+        dx0, dy0 = float(cp_bias[0, 0]), float(cp_bias[0, 1])
+        dx1, dy1 = float(cp_bias[1, 0]), float(cp_bias[1, 1])
+        dx2, dy2 = float(cp_bias[2, 0]), float(cp_bias[2, 1])
+        W = max(float(w), 1e-12)
+        H = max(float(h), 1e-12)
+        # Source CPs: (0,0), (W,0), (0,H)
+        c = dx0
+        f = dy0
+        a = (W + dx1 - c) / W
+        d = (dy1 - f) / W
+        b = (dx2 - c) / H
+        e = (H + dy2 - f) / H
+        return np.array([[a, b, c], [d, e, f]], dtype=np.float32)
+    raise ValueError("No-OpenCV LK version supports --affine-cp-num 2 or 3 only")
 
-        return np.array(
-            [
-                [a, -b, tx],
-                [b,  a, ty],
-            ],
-            dtype=np.float32,
-        )
 
-    raise ValueError(f"cp_num must be 2 or 3, got {cp_num}")
-
-
-def apply_affine_bias_to_map(map_x, map_y, A):
-    """
-    final_map = cam_proj_map + affine_bias(x,y)
-
-    affine_bias is generated in current-picture coordinate domain.
-    """
+def apply_affine_bias_to_map(map_x, map_y, M):
     h, w = map_x.shape
-
-    yy, xx = np.meshgrid(
-        np.arange(h, dtype=np.float32),
-        np.arange(w, dtype=np.float32),
-        indexing="ij",
-    )
-
-    x2 = A[0, 0] * xx + A[0, 1] * yy + A[0, 2]
-    y2 = A[1, 0] * xx + A[1, 1] * yy + A[1, 2]
-
-    bias_x = x2 - xx
-    bias_y = y2 - yy
-
-    out_x = map_x + bias_x
-    out_y = map_y + bias_y
-
+    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
+    x2 = M[0, 0] * xx + M[0, 1] * yy + M[0, 2]
+    y2 = M[1, 0] * xx + M[1, 1] * yy + M[1, 2]
+    out_x = map_x + (x2 - xx)
+    out_y = map_y + (y2 - yy)
     valid = (
-        np.isfinite(out_x)
-        & np.isfinite(out_y)
-        & (map_x >= 0.0)
-        & (map_y >= 0.0)
-        & (out_x >= 0.0)
-        & (out_x <= w - 1)
-        & (out_y >= 0.0)
-        & (out_y <= h - 1)
+        np.isfinite(out_x) & np.isfinite(out_y) & (map_x >= 0.0) & (map_y >= 0.0) &
+        (out_x >= 0.0) & (out_x <= w - 1) & (out_y >= 0.0) & (out_y <= h - 1)
     )
-
     out_x = out_x.astype(np.float32)
     out_y = out_y.astype(np.float32)
-
     out_x[~valid] = -1.0
     out_y[~valid] = -1.0
-
     return out_x, out_y
 
 
-def quantize_affine_cp_bias(cp_bias, step, bits, cp_num=3):
-    """
-    cp_bias: [cp_num,2] in pixel units.
-    Components are coded with signed truncated Exp-Golomb.
-    Bit estimate assumes 50:50 bin probability, so bin count = bit count.
-    """
+def quantize_transform_cp_bias(cp_bias, step, bits, cp_num=3):
+    cp_num = int(cp_num)
     cp_bias = np.asarray(cp_bias, dtype=np.float32).reshape(cp_num, 2)
     flat = cp_bias.reshape(cp_num * 2)
-
     q, dec, clipped = quant_s(flat, step=step, bits=bits)
-
     q_abs_max = signed_q_abs_max(bits)
-    bits_each, bits_total = q_residual_bits_signed_trunc_exp_golomb(
-        q,
-        q_abs_max=q_abs_max,
-    )
-
-    return (
-        q.astype(np.int32).reshape(cp_num, 2),
-        dec.astype(np.float32).reshape(cp_num, 2),
-        clipped.reshape(cp_num, 2),
-        bits_each,
-        int(bits_total),
-    )
-
-
-def affine_cp_component_names(cp_num):
-    names = []
-    for i in range(cp_num):
-        names.append(f"cp{i}_dx")
-        names.append(f"cp{i}_dy")
-    return names
-
-
-# ============================================================
-# Optional subblk4 + 6tap torch
-# ============================================================
-
-LUMA_6TAP_32_NP = np.array([
-    [0,   0, 256,   0,   0, 0],
-    [0,  -4, 253,   9,  -2, 0],
-    [1,  -7, 249,  17,  -4, 0],
-    [1, -10, 245,  25,  -6, 1],
-    [1, -13, 241,  34,  -8, 1],
-    [2, -16, 235,  44, -10, 1],
-    [2, -18, 229,  53, -12, 2],
-    [2, -20, 223,  63, -14, 2],
-    [2, -22, 217,  72, -15, 2],
-    [3, -23, 209,  82, -17, 2],
-    [3, -24, 202,  92, -19, 2],
-    [3, -25, 194, 101, -20, 3],
-    [3, -25, 185, 111, -21, 3],
-    [3, -26, 178, 121, -23, 3],
-    [3, -25, 168, 131, -24, 3],
-    [3, -25, 159, 141, -25, 3],
-    [3, -25, 150, 150, -25, 3],
-    [3, -25, 141, 159, -25, 3],
-    [3, -24, 131, 168, -25, 3],
-    [3, -23, 121, 178, -26, 3],
-    [3, -21, 111, 185, -25, 3],
-    [3, -20, 101, 194, -25, 3],
-    [2, -19,  92, 202, -24, 3],
-    [2, -17,  82, 209, -23, 3],
-    [2, -15,  72, 217, -22, 2],
-    [2, -14,  63, 223, -20, 2],
-    [2, -12,  53, 229, -18, 2],
-    [1, -10,  44, 235, -16, 2],
-    [1,  -8,  34, 241, -13, 1],
-    [1,  -6,  25, 245, -10, 1],
-    [0,  -4,  17, 249,  -7, 1],
-    [0,  -2,   9, 253,  -4, 0],
-], dtype=np.float32)
-
-
-def make_subblk4_avg_flow_map_fast(map_x, map_y):
-    h, w = map_x.shape
-
-    if h % 4 != 0 or w % 4 != 0:
-        raise ValueError("subblk4 mode requires width/height multiple of 4")
-
-    yy, xx = np.meshgrid(
-        np.arange(h, dtype=np.float32),
-        np.arange(w, dtype=np.float32),
-        indexing="ij",
-    )
-
-    flow_x = map_x - xx
-    flow_y = map_y - yy
-    valid = (map_x >= 0.0) & (map_y >= 0.0)
-
-    bh = h // 4
-    bw = w // 4
-
-    fx4 = flow_x.reshape(bh, 4, bw, 4)
-    fy4 = flow_y.reshape(bh, 4, bw, 4)
-    vd4 = valid.reshape(bh, 4, bw, 4)
-
-    corner_valid = (
-        vd4[:, 0, :, 0]
-        & vd4[:, 0, :, 3]
-        & vd4[:, 3, :, 0]
-        & vd4[:, 3, :, 3]
-    )
-
-    avg_fx = (
-        fx4[:, 0, :, 0]
-        + fx4[:, 0, :, 3]
-        + fx4[:, 3, :, 0]
-        + fx4[:, 3, :, 3]
-    ) * 0.25
-
-    avg_fy = (
-        fy4[:, 0, :, 0]
-        + fy4[:, 0, :, 3]
-        + fy4[:, 3, :, 0]
-        + fy4[:, 3, :, 3]
-    ) * 0.25
-
-    avg_fx = np.repeat(np.repeat(avg_fx, 4, axis=0), 4, axis=1)
-    avg_fy = np.repeat(np.repeat(avg_fy, 4, axis=0), 4, axis=1)
-    blk_valid = np.repeat(np.repeat(corner_valid, 4, axis=0), 4, axis=1)
-
-    out_x = xx + avg_fx
-    out_y = yy + avg_fy
-
-    out_x[~blk_valid] = -1.0
-    out_y[~blk_valid] = -1.0
-
-    return out_x.astype(np.float32), out_y.astype(np.float32)
-
-
-def remap_plane_subblk4_6tap_torch(src, map_x, map_y, bit_depth, device=None):
-    try:
-        import torch
-        import torch.nn.functional as F
-    except ImportError as exc:
-        raise ImportError(
-            "subblk4_6tap_torch mode requires torch. "
-            "Use --warp-filter bilinear or install torch."
-        ) from exc
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    h, w = src.shape
-    maxv = (1 << bit_depth) - 1
-
-    sub_x, sub_y = make_subblk4_avg_flow_map_fast(map_x, map_y)
-
-    valid_np = (
-        (sub_x >= 0.0)
-        & (sub_y >= 0.0)
-        & (sub_x <= w - 1)
-        & (sub_y <= h - 1)
-    )
-
-    sx = torch.from_numpy(sub_x).to(device=device, dtype=torch.float32)
-    sy = torch.from_numpy(sub_y).to(device=device, dtype=torch.float32)
-    valid = torch.from_numpy(valid_np).to(device=device)
-
-    ix = torch.floor(sx).to(torch.long)
-    iy = torch.floor(sy).to(torch.long)
-
-    frac_x = torch.round((sx - ix.float()) * 32.0).to(torch.long)
-    frac_y = torch.round((sy - iy.float()) * 32.0).to(torch.long)
-
-    carry_x = frac_x >= 32
-    carry_y = frac_y >= 32
-
-    ix = ix + carry_x.long()
-    iy = iy + carry_y.long()
-
-    frac_x = torch.where(carry_x, torch.zeros_like(frac_x), frac_x)
-    frac_y = torch.where(carry_y, torch.zeros_like(frac_y), frac_y)
-
-    ix = ix.clamp(0, w - 1)
-    iy = iy.clamp(0, h - 1)
-
-    src_t = torch.from_numpy(src.astype(np.float32)).to(device)
-    src_t = src_t.view(1, 1, h, w)
-
-    src_pad = F.pad(src_t, (2, 3, 2, 3), mode="replicate")
-
-    patches_all = F.unfold(src_pad, kernel_size=(6, 6), stride=1)
-
-    col_idx = (iy * w + ix).reshape(-1)
-    patches = patches_all[0, :, col_idx]
-
-    coeff = torch.from_numpy(LUMA_6TAP_32_NP).to(device=device, dtype=torch.float32)
-
-    cx = coeff[frac_x.reshape(-1)]
-    cy = coeff[frac_y.reshape(-1)]
-
-    weight = (cy[:, :, None] * cx[:, None, :]).reshape(-1, 36)
-
-    val = torch.sum(patches.transpose(0, 1) * weight, dim=1)
-
-    val = torch.round(val / 65536.0)
-    val = val.clamp(0, maxv)
-
-    val = val.reshape(h, w)
-    val = torch.where(valid, val, torch.zeros_like(val))
-
-    out = val.detach().cpu().numpy()
-
-    if bit_depth <= 8:
-        return out.astype(np.uint8)
-
-    return out.astype(np.dtype("<u2"))
-
-
-def backward_warp_yuv420_subblk4_6tap_torch(
-    prev_y,
-    prev_u,
-    prev_v,
-    map_x,
-    map_y,
-    bit_depth,
-    torch_device=None,
-):
-    wy = remap_plane_subblk4_6tap_torch(
-        prev_y,
-        map_x,
-        map_y,
-        bit_depth,
-        device=torch_device,
-    )
-
-    map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
-
-    neutral = 128 if bit_depth <= 8 else 512
-
-    wu = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
-    wv = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
-
-    return wy, wu, wv
+    bits_each, bits_total = q_residual_bits_signed_trunc_exp_golomb(q, q_abs_max=q_abs_max)
+    return q.astype(np.int32).reshape(cp_num, 2), dec.astype(np.float32).reshape(cp_num, 2), clipped.reshape(cp_num, 2), bits_each, int(bits_total)
 
 
 # ============================================================
@@ -1304,1087 +930,285 @@ def backward_warp_yuv420_subblk4_6tap_torch(
 
 def main():
     ap = argparse.ArgumentParser()
-
     ap.add_argument("--seq-yuv", required=True)
     ap.add_argument("--depth-yuv", required=True)
     ap.add_argument("--param-jsonl", required=True)
-
     ap.add_argument("--width", type=int, required=True)
     ap.add_argument("--height", type=int, required=True)
-
-    ap.add_argument(
-        "--seq-start",
-        type=int,
-        default=0,
-        help=(
-            "Frame index offset in seq-yuv. "
-            "For rap1 starting at original frame 32, use --seq-start 32."
-        ),
-    )
-
+    ap.add_argument("--bit-depth", type=int, default=10)
+    ap.add_argument("--ref-idx", type=int, required=True)
+    ap.add_argument("--tar-idx", type=int, required=True)
+    ap.add_argument("--seq-start", type=int, default=0)
     ap.add_argument("--coded-width", type=int, default=None)
     ap.add_argument("--coded-height", type=int, default=None)
-
     ap.add_argument("--pad-left", type=int, default=0)
     ap.add_argument("--pad-top", type=int, default=0)
-
-    ap.add_argument("--bit-depth", type=int, default=10)
-
     ap.add_argument("--out-yuv", required=True)
-    ap.add_argument("--out-q-jsonl", required=True)
+    ap.add_argument("--out-json", required=True)
+    ap.add_argument("--out-cam-yuv", default=None)
+    ap.add_argument("--out-target-yuv", default=None)
+    ap.add_argument("--out-mask-yuv", default=None)
 
-    ap.add_argument("--pred-n", type=int, default=3)
-    ap.add_argument("--pred-degree", type=int, default=2)
-
-    # User-requested defaults
-    ap.add_argument("--ext-bits", type=int, default=16)
-    ap.add_argument("--r-step", type=float, default=1.0 / 16.0)
-    ap.add_argument("--t-step-norm", type=float, default=1.0 / 4.0)
-
-    # Intrinsic delta coding
-    ap.add_argument("--intr-delta-bits", type=int, default=16)
-    ap.add_argument(
-        "--intr-step",
-        type=float,
-        default=1.0 / 16.0,
-        help=(
-            "Intrinsic delta quantization step in pixel units. "
-            "q_intr_delta = round(delta / intr_step). Default: 1/16 pixel."
-        ),
-    )
-
-    ap.add_argument("--intr-f-max", type=float, default=4.0)
-    ap.add_argument("--intr-c-min", type=float, default=-1.0)
-    ap.add_argument("--intr-c-max", type=float, default=2.0)
-
-    ap.add_argument(
-        "--depth-scale-bits",
-        type=int,
-        default=16,
-        help=(
-            "Bit estimate for fixed-point depth_scale integer. "
-            "depth_scale_precision is assumed known or fixed by design."
-        ),
-    )
-
-    ap.add_argument(
-        "--warp-filter",
-        choices=["bilinear", "subblk4_6tap_torch"],
-        default="bilinear",
-    )
-
-    ap.add_argument(
-        "--torch-device",
-        default=None,
-        help="cuda, cpu, cuda:0, etc. Used only for subblk4_6tap_torch.",
-    )
-
-    # Global affine bias over cam-proj flow.
     ap.add_argument("--global-affine-bias", action="store_true")
-    ap.add_argument(
-        "--affine-estimator",
-        choices=["ecc", "lk"],
-        default="lk",
-        help=(
-            "Global affine estimator. ecc uses cv2.findTransformECC; "
-            "lk uses a fast non-ECC vectorized Lucas-Kanade/SSD estimator."
-        ),
-    )
-    ap.add_argument(
-        "--affine-cp-num",
-        type=int,
-        choices=[2, 3],
-        default=3,
-        help=(
-            "Number of affine control points to code. "
-            "3 = full 6-parameter affine, 2 = constrained 4-parameter affine using CP0/CP1."
-        ),
-    )
-    ap.add_argument(
-        "--affine-cp-step",
-        type=float,
-        default=1.0 / 16.0,
-        help="Affine CP bias quantization step in pixel units.",
-    )
-    ap.add_argument(
-        "--affine-cp-bits",
-        type=int,
-        default=16,
-        help="Signed truncated Exp-Golomb range for affine CP bias.",
-    )
-    ap.add_argument("--affine-ecc-iters", type=int, default=50)
-    ap.add_argument("--affine-ecc-eps", type=float, default=1e-4)
-    ap.add_argument("--affine-lk-iters", type=int, default=30)
+    ap.add_argument("--affine-cp-num", type=int, choices=[2, 3], default=3)
+    ap.add_argument("--affine-cp-step", type=float, default=1.0)
+    ap.add_argument("--affine-cp-bits", type=int, default=16)
+    ap.add_argument("--affine-valid-erode", type=int, default=2)
+
+    # Structure LK settings: no cv2.findTransformECC.
+    ap.add_argument("--structure-mode", choices=["scharr_mag", "scharr_l1", "scharr_x", "scharr_y", "scharr_x_weighted"], default="scharr_mag")
+    ap.add_argument("--structure-keep-percent", type=float, default=35.0)
+    ap.add_argument("--structure-mask-dilate", type=int, default=1)
+    ap.add_argument("--structure-log-gain", type=float, default=20.0)
+    ap.add_argument("--structure-pre-blur", type=int, default=0)
+    ap.add_argument("--affine-lk-sample-step", type=int, default=4)
+    ap.add_argument("--affine-lk-iters", type=int, default=50)
     ap.add_argument("--affine-lk-eps", type=float, default=1e-4)
-    ap.add_argument(
-        "--affine-lk-sample-step",
-        type=int,
-        default=4,
-        help="Pixel subsampling step for vectorized LK estimator. 1=all valid pixels, 4=every 4th pixel.",
-    )
-    ap.add_argument(
-        "--affine-lk-normalize",
-        choices=["none", "zero_mean", "zncc_approx"],
-        default="zero_mean",
-        help="Photometric normalization used by LK estimator.",
-    )
-    ap.add_argument("--affine-lk-damping", type=float, default=1e-6)
-    ap.add_argument(
-        "--affine-lk-max-update",
-        type=float,
-        default=4.0,
-        help="Maximum LK parameter update norm per iteration. Use <=0 to disable clamp.",
-    )
-    ap.add_argument(
-        "--affine-valid-erode",
-        type=int,
-        default=2,
-        help="Erode valid active-region mask before affine estimation.",
-    )
+    ap.add_argument("--affine-lk-normalize", choices=["none", "zero_mean"], default="none")
+    ap.add_argument("--affine-lk-weight", choices=["none", "structure"], default="structure")
+    ap.add_argument("--affine-lk-damping", type=float, default=1.0)
 
     ap.add_argument("--overwrite", action="store_true")
-
     args = ap.parse_args()
 
-    if args.r_step <= 0:
-        raise ValueError("--r-step must be positive")
-    if args.t_step_norm <= 0:
-        raise ValueError("--t-step-norm must be positive")
-    if args.intr_step <= 0:
-        raise ValueError("--intr-step must be positive")
+    if args.ref_idx == args.tar_idx:
+        raise ValueError("--ref-idx and --tar-idx must be different")
+    if args.seq_start < 0:
+        raise ValueError("--seq-start must be non-negative")
     if args.affine_cp_step <= 0:
         raise ValueError("--affine-cp-step must be positive")
     if args.affine_cp_bits < 2:
         raise ValueError("--affine-cp-bits must be >= 2")
+    if args.structure_keep_percent <= 0 or args.structure_keep_percent > 100:
+        raise ValueError("--structure-keep-percent must be in (0, 100]")
+    if args.structure_mask_dilate < 0 or args.structure_pre_blur < 0:
+        raise ValueError("structure mask/blur parameters must be non-negative")
 
     seq_yuv = Path(args.seq_yuv)
     depth_yuv = Path(args.depth_yuv)
     param_jsonl = Path(args.param_jsonl)
-
-    out_yuv = Path(args.out_yuv)
-    out_q_jsonl = Path(args.out_q_jsonl)
-
-    for p in [out_yuv, out_q_jsonl]:
+    out_paths = [Path(args.out_yuv), Path(args.out_json)]
+    for opt in [args.out_cam_yuv, args.out_target_yuv, args.out_mask_yuv]:
+        if opt is not None:
+            out_paths.append(Path(opt))
+    for p in out_paths:
         if p.exists():
             if args.overwrite:
                 p.unlink()
             else:
                 raise RuntimeError(f"Output exists: {p}")
 
-    src_w = int(args.width)
-    src_h = int(args.height)
+    src_w, src_h = int(args.width), int(args.height)
     bit_depth = int(args.bit_depth)
-
-    pad_left = int(args.pad_left)
-    pad_top = int(args.pad_top)
-
-    coded_w = (
-        int(args.coded_width)
-        if args.coded_width is not None
-        else align_to(src_w + pad_left, 4)
-    )
-
-    coded_h = (
-        int(args.coded_height)
-        if args.coded_height is not None
-        else align_to(src_h + pad_top, 4)
-    )
-
-    pad_right, pad_bottom = calc_padding(
-        src_w,
-        src_h,
-        coded_w,
-        coded_h,
-        pad_left,
-        pad_top,
-    )
-
-    validate_yuv420_padding(
-        src_w,
-        src_h,
-        coded_w,
-        coded_h,
-        pad_left,
-        pad_top,
-        pad_right,
-        pad_bottom,
-    )
+    pad_left, pad_top = int(args.pad_left), int(args.pad_top)
+    coded_w = int(args.coded_width) if args.coded_width is not None else align_to(src_w + pad_left, 4)
+    coded_h = int(args.coded_height) if args.coded_height is not None else align_to(src_h + pad_top, 4)
+    pad_right, pad_bottom = calc_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top)
+    validate_yuv420_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top, pad_right, pad_bottom)
 
     header, frames = load_param_jsonl(param_jsonl)
-
-    pose_mode = header.get("pose_mode", "current_to_previous")
-    if pose_mode != "current_to_previous":
-        raise RuntimeError(
-            f"This script expects pose_mode='current_to_previous', got '{pose_mode}'."
-        )
-
     depth_scale_real = get_depth_scale_real_from_header(header)
     depth_scale_precision = get_depth_scale_precision_from_header(header)
-
     if depth_scale_real <= 0:
         raise ValueError(f"Invalid depth_scale_real: {depth_scale_real}")
 
-    intr_gt_original0 = header["intrinsic"]
-
-    intr_gt_padded0 = make_padded_intrinsic_from_original(
-        intr_gt_original0,
-        pad_left=pad_left,
-        pad_top=pad_top,
-    )
-
-    # Header first-frame intrinsic absolute coding.
-    intr_q0, intr_dec0, intr_clip0 = quantize_intrinsic_16(
-        intr_gt_padded0,
-        coded_w,
-        coded_h,
-        f_max=args.intr_f_max,
-        c_min=args.intr_c_min,
-        c_max=args.intr_c_max,
-    )
+    max_idx = max(int(args.ref_idx), int(args.tar_idx), max(frames.keys()))
+    intrs = build_frame_intrinsics(header, frames, max_idx, pad_left, pad_top)
+    intr_ref = intrs[int(args.ref_idx)]
+    intr_tar = intrs[int(args.tar_idx)]
+    rt_tar_to_ref = get_target_to_reference_rt(frames, int(args.ref_idx), int(args.tar_idx))
 
     seq_count = count_frames(seq_yuv, src_w, src_h, bit_depth)
     depth_count = count_frames(depth_yuv, src_w, src_h, 10)
-
-    if args.seq_start < 0:
-        raise ValueError("--seq-start must be non-negative")
-
-    available_seq_count = seq_count - args.seq_start
-    if available_seq_count <= 0:
-        raise RuntimeError(
-            f"--seq-start {args.seq_start} is outside seq-yuv frame count {seq_count}"
-        )
-
-    max_poc = min(
-        available_seq_count,
-        depth_count,
-        max(frames.keys()) + 1,
-    )
-
-    if max_poc <= 0:
-        raise RuntimeError(
-            f"No frames to process: available_seq_count={available_seq_count}, "
-            f"depth_count={depth_count}, param_frames={len(frames)}"
-        )
-
-    decoded_hist = []
-
-    q_abs_max_ext = signed_q_abs_max(args.ext_bits)
-    q_abs_max_intr = signed_q_abs_max(args.intr_delta_bits)
-    q_abs_max_affine_cp = signed_q_abs_max(args.affine_cp_bits)
-
-    header_intrinsic_bits = 4 * 16
-    depth_scale_bits = int(args.depth_scale_bits)
-    z_sign_bits = 1
-    header_bits = header_intrinsic_bits + depth_scale_bits + z_sign_bits
-
-    total_ext_bits = 0
-    total_ext_bits_r = 0
-    total_ext_bits_t = 0
-    total_ext_bits_each = np.zeros(6, dtype=np.int64)
-
-    total_intr_delta_bits = 0
-    total_intr_delta_bits_each = np.zeros(4, dtype=np.int64)
-    total_intr_delta_frames = 0
-    total_intr_clipped_frames = 0
-
-    total_affine_flag_bits = 0
-    total_affine_cp_bits = 0
-    total_affine_frames = 0
-    total_affine_success_frames = 0
-    total_affine_clipped_frames = 0
-    total_affine_bits_each = np.zeros(args.affine_cp_num * 2, dtype=np.int64)
-
-    total_coded_frames = 0
-    total_clipped_frames = 0
-
-    sum_mae_active = 0.0
-    sum_mae_coded = 0.0
-    sum_psnr_active = 0.0
-    sum_psnr_coded = 0.0
-    psnr_count_active = 0
-    psnr_count_coded = 0
-
-    sum_psnr_active_cam_only = 0.0
-    psnr_count_active_cam_only = 0
+    ref_seq_idx = args.seq_start + args.ref_idx
+    tar_seq_idx = args.seq_start + args.tar_idx
+    if ref_seq_idx < 0 or ref_seq_idx >= seq_count:
+        raise RuntimeError(f"ref_seq_idx={ref_seq_idx} outside seq-yuv frame count {seq_count}")
+    if tar_seq_idx < 0 or tar_seq_idx >= seq_count:
+        raise RuntimeError(f"tar_seq_idx={tar_seq_idx} outside seq-yuv frame count {seq_count}")
+    if args.tar_idx < 0 or args.tar_idx >= depth_count:
+        raise RuntimeError(f"tar_idx={args.tar_idx} outside depth-yuv frame count {depth_count}")
 
     ys_active, xs_active = active_slice(src_w, src_h, pad_left, pad_top)
-
-    decoded_intrinsics = [intr_dec0]
-
-    print("============================================================")
-    print("Input summary")
-    print("============================================================")
-    print(f"seq_yuv               : {seq_yuv}")
-    print(f"depth_yuv             : {depth_yuv}")
-    print(f"param_jsonl           : {param_jsonl}")
-    print(f"seq frames total      : {seq_count}")
-    print(f"seq_start             : {args.seq_start}")
-    print(f"depth frames          : {depth_count}")
-    print(f"param max poc         : {max(frames.keys())}")
-    print(f"process frames        : {max_poc}")
-    print(f"depth_scale header    : {header['depth_scale']}")
-    print(f"depth_scale_precision : {depth_scale_precision}")
-    print(f"depth_scale_real      : {depth_scale_real}")
-    print(f"pose_mode             : {pose_mode}")
-    print(f"warp_filter           : {args.warp_filter}")
-    print(f"global affine bias    : {args.global_affine_bias}")
-    print(f"affine estimator      : {args.affine_estimator}")
-    print("------------------------------------------------------------")
-    print(f"ext-bits              : {args.ext_bits}")
-    print(f"r-step                : {args.r_step}")
-    print(f"t-step-norm           : {args.t_step_norm}")
-    print(f"intr-delta-bits       : {args.intr_delta_bits}")
-    print(f"intr-step             : {args.intr_step}")
-    print(f"affine-cp-num         : {args.affine_cp_num}")
-    print(f"affine-cp-bits        : {args.affine_cp_bits}")
-    print(f"affine-cp-step        : {args.affine_cp_step}")
-    print("============================================================")
-
-    with open(out_q_jsonl, "w", encoding="utf-8") as fq:
-        fq.write(json.dumps({
-            "type": "header",
-
-            "source_size": {
-                "width": src_w,
-                "height": src_h,
-            },
-            "coded_size": {
-                "width": coded_w,
-                "height": coded_h,
-            },
-            "padding": {
-                "left": pad_left,
-                "top": pad_top,
-                "right": pad_right,
-                "bottom": pad_bottom,
-            },
-
-            "seq_start": int(args.seq_start),
-
-            "projection_mode": "fast_pixel_coordinate_no_ndc_dual_intrinsic",
-            "warp_filter": args.warp_filter,
-            "precompute": [
-                "target: x_norm=(x-cx_tar)/fx_tar",
-                "target: y_norm=(y-cy_tar)/fy_tar",
-                "reference: fx_ref,fy_ref,cx_ref,cy_ref cached",
-            ],
-            "depth_padding": "edge",
-            "image_padding": "edge",
-
-            "depth_scale_header": header["depth_scale"],
-            "depth_scale_precision": depth_scale_precision,
-            "depth_scale_real": depth_scale_real,
-            "depth_decode_formula": (
-                "depth_linear = depth_y * depth_scale / depth_scale_precision"
-                if depth_scale_precision is not None
-                else "depth_linear = depth_y * depth_scale"
-            ),
-
-            "intrinsic_gt_original0": intr_gt_original0,
-            "intrinsic_gt_padded0": intr_gt_padded0,
-            "intrinsic_q16_first": intr_q0,
-            "intrinsic_dec_first": intr_dec0,
-            "intrinsic_first_clipped": intr_clip0,
-
-            "intrinsic_delta_code": "signed_truncated_exp_golomb",
-            "intrinsic_delta_bits": args.intr_delta_bits,
-            "intrinsic_delta_q_abs_max": q_abs_max_intr,
-            "intrinsic_delta_q_range": [-q_abs_max_intr, q_abs_max_intr],
-            "intrinsic_delta_step": args.intr_step,
-            "intrinsic_delta_order": ["dfx", "dfy", "dcx", "dcy"],
-            "intrinsic_decode": (
-                "intrinsic_dec[poc] = intrinsic_dec[poc-1] "
-                "+ q_intrinsic_delta[poc] * intrinsic_delta_step"
-            ),
-
-            "extrinsic_bits": args.ext_bits,
-            "extrinsic_q_abs_max": q_abs_max_ext,
-            "extrinsic_q_range": [-q_abs_max_ext, q_abs_max_ext],
-            "r_step": args.r_step,
-            "t_step_norm": args.t_step_norm,
-            "pred_n": args.pred_n,
-            "pred_degree": args.pred_degree,
-
-            "global_affine_bias": {
-                "enabled": bool(args.global_affine_bias),
-                "estimator": args.affine_estimator,
-                "mode": "final_map = cam_proj_map + affine_bias(x,y)",
-                "fit_region": "valid cam-proj pixels inside active source region only",
-                "cp_num": int(args.affine_cp_num),
-                "cp_convention": (
-                    ["CP0=(0,0)", "CP1=(coded_w,0)"]
-                    if args.affine_cp_num == 2
-                    else ["CP0=(0,0)", "CP1=(coded_w,0)", "CP2=(0,coded_h)"]
-                ),
-                "cp_num_note": (
-                    "2CP reconstructs constrained 4-parameter affine; CP2 is derived from CP0/CP1"
-                    if args.affine_cp_num == 2
-                    else "3CP reconstructs full 6-parameter affine"
-                ),
-                "cp_step": args.affine_cp_step,
-                "cp_bits": args.affine_cp_bits,
-                "cp_q_abs_max": q_abs_max_affine_cp,
-                "bit_model": "signed truncated Exp-Golomb, 50:50 bin probability, 1 bin = 1 bit",
-            },
-
-            "bit_count": {
-                "header_intrinsic_bits": header_intrinsic_bits,
-                "depth_scale_bits": depth_scale_bits,
-                "z_sign_bits": z_sign_bits,
-                "header_bits": header_bits,
-                "extrinsic_code": "signed_truncated_exp_golomb",
-                "intrinsic_delta_code": "signed_truncated_exp_golomb",
-                "affine_cp_code": "signed_truncated_exp_golomb_50_50_bit_estimate",
-            },
-
-            "param6_order": [
-                "rx",
-                "ry",
-                "rz",
-                "tx_over_depth_scale_real",
-                "ty_over_depth_scale_real",
-                "tz_over_depth_scale_real",
-            ],
-        }, ensure_ascii=False) + "\n")
-
-        for poc in range(max_poc):
-            seq_idx = args.seq_start + poc
-
-            cur_y, cur_u, cur_v = read_yuv420(
-                seq_yuv,
-                seq_idx,
-                src_w,
-                src_h,
-                bit_depth,
-            )
-
-            cur_y_pad, cur_u_pad, cur_v_pad = pad_yuv420_edge(
-                cur_y,
-                cur_u,
-                cur_v,
-                coded_w,
-                coded_h,
-                pad_left,
-                pad_top,
-            )
-
-            if poc == 0:
-                write_yuv420(out_yuv, cur_y_pad, cur_u_pad, cur_v_pad)
-
-                p0_dec = np.zeros(6, dtype=np.float32)
-                decoded_hist.append(p0_dec)
-
-                fq.write(json.dumps({
-                    "poc": 0,
-                    "seq_idx": int(seq_idx),
-
-                    "q_residual": [0, 0, 0, 0, 0, 0],
-                    "q_residual_bits": [0, 0, 0, 0, 0, 0],
-                    "q_residual_total_bits": 0,
-                    "param6_dec": p0_dec.astype(float).tolist(),
-
-                    "intrinsic_delta_gt": [0.0, 0.0, 0.0, 0.0],
-                    "q_intrinsic_delta": [0, 0, 0, 0],
-                    "q_intrinsic_delta_bits": [0, 0, 0, 0],
-                    "q_intrinsic_delta_total_bits": 0,
-                    "intrinsic_dec": intr_dec0,
-
-                    "global_affine_bias": {
-                        "enabled": bool(args.global_affine_bias),
-                        "success": False,
-                        "flag_bits_50_50": 0,
-                        "cp_bits_total_50_50": 0,
-                    },
-
-                    "mae_y_active": 0.0,
-                    "mae_y_coded": 0.0,
-                    "psnr_y_active": "inf",
-                    "psnr_y_coded": "inf",
-                }, ensure_ascii=False) + "\n")
-
-                print(f"[{poc:04d}/{max_poc - 1:04d}] copy first frame, seq_idx={seq_idx}")
-                continue
-
-            if poc not in frames:
-                raise RuntimeError(f"POC {poc} not found in param jsonl")
-
-            frame = frames[poc]
-
-            if "intrinsic_delta" not in frame:
-                raise RuntimeError(
-                    f"POC {poc} has no intrinsic_delta. "
-                    f"Regenerate camParam JSONL with per-frame intrinsic_delta."
-                )
-
-            # ------------------------------------------------------------
-            # Intrinsic delta coding
-            # ------------------------------------------------------------
-            intr_delta_gt = np.array(frame["intrinsic_delta"], dtype=np.float32).reshape(4)
-
-            q_intr, d_intr, clip_intr = quantize_intrinsic_delta_4(
-                intr_delta_gt,
-                step=args.intr_step,
-                bits=args.intr_delta_bits,
-            )
-
-            q_intr_bits_each, q_intr_bits_total = q_residual_bits_signed_trunc_exp_golomb(
-                q_intr,
-                q_abs_max=q_abs_max_intr,
-            )
-
-            total_intr_delta_bits += q_intr_bits_total
-            total_intr_delta_bits_each += np.array(q_intr_bits_each, dtype=np.int64)
-            total_intr_delta_frames += 1
-
-            intrinsic_clipped = bool(np.any(clip_intr))
-            if intrinsic_clipped:
-                total_intr_clipped_frames += 1
-
-            intr_dec_cur = add_intrinsic_delta(
-                decoded_intrinsics[-1],
-                d_intr,
-            )
-
-            decoded_intrinsics.append(intr_dec_cur)
-
-            intr_dec_ref = decoded_intrinsics[poc - 1]
-            intr_dec_tar = decoded_intrinsics[poc]
-
-            # ------------------------------------------------------------
-            # Extrinsic coding
-            # ------------------------------------------------------------
-            p_gt = param6_from_frame(frame, depth_scale_real)
-
-            p_pred = predict_from_history(
-                decoded_hist,
-                pred_n=args.pred_n,
-                pred_degree=args.pred_degree,
-            )
-
-            residual = p_gt - p_pred
-
-            q_r, d_r, clip_r = quant_s(
-                residual[:3],
-                step=args.r_step,
-                bits=args.ext_bits,
-            )
-
-            q_t, d_t, clip_t = quant_s(
-                residual[3:],
-                step=args.t_step_norm,
-                bits=args.ext_bits,
-            )
-
-            q_residual = np.concatenate([q_r, q_t]).astype(np.int32)
-
-            q_bits_each, q_bits_total = q_residual_bits_signed_trunc_exp_golomb(
-                q_residual,
-                q_abs_max=q_abs_max_ext,
-            )
-
-            total_ext_bits += q_bits_total
-            total_ext_bits_r += sum(q_bits_each[:3])
-            total_ext_bits_t += sum(q_bits_each[3:])
-            total_ext_bits_each += np.array(q_bits_each, dtype=np.int64)
-
-            total_coded_frames += 1
-
-            p_dec = p_pred.copy()
-            p_dec[:3] += d_r
-            p_dec[3:] += d_t
-
-            decoded_hist.append(p_dec)
-
-            rt_dec = rt_from_param6(p_dec, depth_scale_real)
-
-            # ------------------------------------------------------------
-            # Depth
-            # ------------------------------------------------------------
-            depth_y, _, _ = read_yuv420(
-                depth_yuv,
-                poc,
-                src_w,
-                src_h,
-                10,
-            )
-
-            depth_linear = depth_y.astype(np.float32) * float(depth_scale_real)
-
-            depth_linear_pad = pad_2d_edge(
-                depth_linear,
-                coded_w,
-                coded_h,
-                pad_left,
-                pad_top,
-            ).astype(np.float32)
-
-            # ------------------------------------------------------------
-            # Projection with dual intrinsic
-            # target: current intrinsic
-            # ref   : previous intrinsic
-            # ------------------------------------------------------------
-            projection_precomp = make_projection_precompute_dual(
-                coded_w,
-                coded_h,
-                intr_tar=intr_dec_tar,
-                intr_ref=intr_dec_ref,
-            )
-
-            map_x, map_y = backward_map_fast_pixel_coord_dual(
-                depth_linear=depth_linear_pad,
-                precomp=projection_precomp,
-                rt=rt_dec,
-            )
-
-            prev_seq_idx = args.seq_start + poc - 1
-
-            prev_y, prev_u, prev_v = read_yuv420(
-                seq_yuv,
-                prev_seq_idx,
-                src_w,
-                src_h,
-                bit_depth,
-            )
-
-            prev_y_pad, prev_u_pad, prev_v_pad = pad_yuv420_edge(
-                prev_y,
-                prev_u,
-                prev_v,
-                coded_w,
-                coded_h,
-                pad_left,
-                pad_top,
-            )
-
-            # ------------------------------------------------------------
-            # Cam-proj only warp first. This is used both as baseline metric
-            # and as input for global affine residual estimation.
-            # ------------------------------------------------------------
-            if args.warp_filter == "bilinear":
-                wy_cam, wu_cam, wv_cam = backward_warp_yuv420_bilinear(
-                    prev_y_pad,
-                    prev_u_pad,
-                    prev_v_pad,
-                    map_x,
-                    map_y,
-                    bit_depth,
-                )
-            elif args.warp_filter == "subblk4_6tap_torch":
-                wy_cam, wu_cam, wv_cam = backward_warp_yuv420_subblk4_6tap_torch(
-                    prev_y_pad,
-                    prev_u_pad,
-                    prev_v_pad,
-                    map_x,
-                    map_y,
-                    bit_depth,
-                    torch_device=args.torch_device,
-                )
-            else:
-                raise ValueError(args.warp_filter)
-
-            psnr_y_active_cam_only = calc_psnr(
-                wy_cam[ys_active, xs_active],
-                cur_y_pad[ys_active, xs_active],
-                bit_depth,
-            )
-
-            if np.isfinite(psnr_y_active_cam_only):
-                sum_psnr_active_cam_only += psnr_y_active_cam_only
-                psnr_count_active_cam_only += 1
-
-            # ------------------------------------------------------------
-            # Optional global affine bias over cam-proj flow.
-            # ------------------------------------------------------------
-            affine_enabled = bool(args.global_affine_bias)
-            affine_success = False
-            affine_cc = None
-            affine_flag_bits = 0
-            affine_cp_bits_total = 0
-            affine_cp_bits_each = [0] * (args.affine_cp_num * 2)
-            affine_cp_q = np.zeros((args.affine_cp_num, 2), dtype=np.int32)
-            affine_cp_dec = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
-            affine_cp_clipped = False
-            affine_matrix_est = np.eye(2, 3, dtype=np.float32)
-            affine_matrix_dec = np.eye(2, 3, dtype=np.float32)
-
-            map_x_final = map_x
-            map_y_final = map_y
-
-            if affine_enabled:
-                # One flag per coded frame after POC0. 50:50 assumption => 1 bit.
-                affine_flag_bits = 1
-                total_affine_flag_bits += affine_flag_bits
-                total_affine_frames += 1
-
-                valid_mask_u8 = make_valid_u8_mask(
-                    map_x,
-                    map_y,
-                    coded_w,
-                    coded_h,
-                    erode=args.affine_valid_erode,
-                    active_region=(ys_active, xs_active),
-                )
-
-                if args.affine_estimator == "ecc":
-                    affine_matrix_est, affine_success, affine_cc = estimate_global_affine_bias_ecc(
-                        cur_y=cur_y_pad,
-                        cam_warp_y=wy_cam,
-                        valid_mask_u8=valid_mask_u8,
-                        bit_depth=bit_depth,
-                        max_iters=args.affine_ecc_iters,
-                        eps=args.affine_ecc_eps,
-                    )
-                elif args.affine_estimator == "lk":
-                    affine_matrix_est, affine_success, affine_cc = estimate_global_affine_bias_lk(
-                        cur_y=cur_y_pad,
-                        cam_warp_y=wy_cam,
-                        valid_mask_u8=valid_mask_u8,
-                        bit_depth=bit_depth,
-                        max_iters=args.affine_lk_iters,
-                        eps=args.affine_lk_eps,
-                        sample_step=args.affine_lk_sample_step,
-                        normalize=args.affine_lk_normalize,
-                        damping=args.affine_lk_damping,
-                        max_update=args.affine_lk_max_update,
-                    )
-                else:
-                    raise ValueError(args.affine_estimator)
-
-                if affine_success:
-                    total_affine_success_frames += 1
-
-                    cp_bias_est = affine_matrix_to_cp_bias(
-                        affine_matrix_est,
-                        coded_w,
-                        coded_h,
-                        cp_num=args.affine_cp_num,
-                    )
-
-                    (
-                        affine_cp_q,
-                        affine_cp_dec,
-                        affine_cp_clip_arr,
-                        affine_cp_bits_each,
-                        affine_cp_bits_total,
-                    ) = quantize_affine_cp_bias(
-                        cp_bias_est,
-                        step=args.affine_cp_step,
-                        bits=args.affine_cp_bits,
-                        cp_num=args.affine_cp_num,
-                    )
-
-                    affine_cp_clipped = bool(np.any(affine_cp_clip_arr))
-
-                    if affine_cp_clipped:
-                        total_affine_clipped_frames += 1
-
-                    total_affine_cp_bits += affine_cp_bits_total
-                    total_affine_bits_each += np.array(
-                        affine_cp_bits_each,
-                        dtype=np.int64,
-                    )
-
-                    affine_matrix_dec = cp_bias_to_affine_matrix(
-                        affine_cp_dec,
-                        coded_w,
-                        coded_h,
-                        cp_num=args.affine_cp_num,
-                    )
-
-                    map_x_final, map_y_final = apply_affine_bias_to_map(
-                        map_x,
-                        map_y,
-                        affine_matrix_dec,
-                    )
-
-            # ------------------------------------------------------------
-            # Final warp.
-            # ------------------------------------------------------------
-            if args.warp_filter == "bilinear":
-                wy, wu, wv = backward_warp_yuv420_bilinear(
-                    prev_y_pad,
-                    prev_u_pad,
-                    prev_v_pad,
-                    map_x_final,
-                    map_y_final,
-                    bit_depth,
-                )
-            elif args.warp_filter == "subblk4_6tap_torch":
-                wy, wu, wv = backward_warp_yuv420_subblk4_6tap_torch(
-                    prev_y_pad,
-                    prev_u_pad,
-                    prev_v_pad,
-                    map_x_final,
-                    map_y_final,
-                    bit_depth,
-                    torch_device=args.torch_device,
-                )
-            else:
-                raise ValueError(args.warp_filter)
-
-            write_yuv420(out_yuv, wy, wu, wv)
-
-            mae_y_coded = float(np.mean(np.abs(
-                wy.astype(np.float32) - cur_y_pad.astype(np.float32)
-            )))
-
-            mae_y_active = float(np.mean(np.abs(
-                wy[ys_active, xs_active].astype(np.float32)
-                - cur_y_pad[ys_active, xs_active].astype(np.float32)
-            )))
-
-            psnr_y_coded = calc_psnr(
-                wy,
-                cur_y_pad,
-                bit_depth,
-            )
-
-            psnr_y_active = calc_psnr(
-                wy[ys_active, xs_active],
-                cur_y_pad[ys_active, xs_active],
-                bit_depth,
-            )
-
-            clipped = bool(np.any(clip_r) or np.any(clip_t))
-            if clipped:
-                total_clipped_frames += 1
-
-            sum_mae_active += mae_y_active
-            sum_mae_coded += mae_y_coded
-
-            if np.isfinite(psnr_y_active):
-                sum_psnr_active += psnr_y_active
-                psnr_count_active += 1
-
-            if np.isfinite(psnr_y_coded):
-                sum_psnr_coded += psnr_y_coded
-                psnr_count_coded += 1
-
-            fq.write(json.dumps({
-                "poc": int(poc),
-                "seq_idx": int(seq_idx),
-
-                "q_residual": q_residual.astype(int).tolist(),
-                "q_residual_bits": q_bits_each,
-                "q_residual_total_bits": int(q_bits_total),
-                "param6_pred": p_pred.astype(float).tolist(),
-                "param6_dec": p_dec.astype(float).tolist(),
-                "param6_gt": p_gt.astype(float).tolist(),
-                "rt_dec": rt_dec,
-                "extrinsic_clipped": clipped,
-
-                "intrinsic_delta_gt": intr_delta_gt.astype(float).tolist(),
-                "q_intrinsic_delta": q_intr.astype(int).tolist(),
-                "intrinsic_delta_dec": d_intr.astype(float).tolist(),
-                "q_intrinsic_delta_bits": q_intr_bits_each,
-                "q_intrinsic_delta_total_bits": int(q_intr_bits_total),
-                "intrinsic_ref_dec": intr_dec_ref,
-                "intrinsic_tar_dec": intr_dec_tar,
-                "intrinsic_clipped": intrinsic_clipped,
-
-                "global_affine_bias": {
-                    "enabled": affine_enabled,
-                    "cp_num": int(args.affine_cp_num),
-                    "success": affine_success,
-                    "ecc_cc": json_safe_float(affine_cc),
-                    "flag_bits_50_50": int(affine_flag_bits),
-                    "cp_q": affine_cp_q.astype(int).tolist(),
-                    "cp_dec": affine_cp_dec.astype(float).tolist(),
-                    "cp_bits_each_50_50": affine_cp_bits_each,
-                    "cp_bits_total_50_50": int(affine_cp_bits_total),
-                    "cp_clipped": bool(affine_cp_clipped),
-                    "matrix_est": affine_matrix_est.astype(float).tolist(),
-                    "matrix_dec": affine_matrix_dec.astype(float).tolist(),
-                    "psnr_y_active_cam_only": json_safe_float(psnr_y_active_cam_only),
-                    "psnr_y_active_final": json_safe_float(psnr_y_active),
-                },
-
-                "mae_y_active": mae_y_active,
-                "mae_y_coded": mae_y_coded,
-                "psnr_y_active": json_safe_float(psnr_y_active),
-                "psnr_y_coded": json_safe_float(psnr_y_coded),
-            }, ensure_ascii=False) + "\n")
-
-            print(
-                f"[{poc:04d}/{max_poc - 1:04d}] "
-                f"seq_idx={seq_idx}, "
-                f"Y-PSNR-cam={psnr_y_active_cam_only:.3f} dB, "
-                f"Y-PSNR-active={psnr_y_active:.3f} dB, "
-                f"Y-PSNR-coded={psnr_y_coded:.3f} dB, "
-                f"Y-MAE-active={mae_y_active:.3f}, "
-                f"Y-MAE-coded={mae_y_coded:.3f}, "
-                f"ext_clip={clipped}, "
-                f"intr_clip={intrinsic_clipped}, "
-                f"affine={affine_success}, "
-                f"affine_bits={affine_flag_bits + affine_cp_bits_total}, "
-                f"ext_bits={q_bits_total}, "
-                f"intr_bits={q_intr_bits_total}"
-            )
-
-    total_bits = (
-        header_bits
-        + total_ext_bits
-        + total_intr_delta_bits
-        + total_affine_flag_bits
-        + total_affine_cp_bits
-    )
-
-    print("============================================================")
-    print("Padding / projection summary")
-    print("============================================================")
-    print(f"source size           : {src_w}x{src_h}")
-    print(f"coded size            : {coded_w}x{coded_h}")
-    print(
-        f"padding               : "
-        f"L={pad_left}, T={pad_top}, "
-        f"R={pad_right}, B={pad_bottom}"
-    )
-    print(f"seq_start             : {args.seq_start}")
-    print("projection            : fast pixel-coordinate, dual intrinsic, no NDC")
-    print(f"warp filter           : {args.warp_filter}")
-    print("image/depth padding   : edge")
-    print("------------------------------------------------------------")
-    print("Depth scale")
-    print("------------------------------------------------------------")
-    print(f"depth_scale header    : {header['depth_scale']}")
-    print(f"depth_scale precision : {depth_scale_precision}")
-    print(f"depth_scale real      : {depth_scale_real}")
-    print("decoder formula       : depth_linear = depth_y * depth_scale_real")
-    print("------------------------------------------------------------")
-    print("Intrinsic")
-    print("------------------------------------------------------------")
-    print(f"first intrinsic gt    : {intr_gt_original0}")
-    print(f"first intrinsic padded: {intr_gt_padded0}")
-    print(f"first intrinsic dec   : {intr_dec0}")
-    print(f"first intrinsic clip  : {intr_clip0}")
-    print(f"intrinsic delta step  : {args.intr_step}")
-    print(f"intrinsic delta bits  : {args.intr_delta_bits}")
-    print(f"intrinsic q range     : [-{q_abs_max_intr}, {q_abs_max_intr}]")
-    print("============================================================")
-    print("Metric summary")
-    print("============================================================")
-
-    if total_coded_frames > 0:
-        avg_mae_active = sum_mae_active / total_coded_frames
-        avg_mae_coded = sum_mae_coded / total_coded_frames
-        avg_psnr_active = (
-            sum_psnr_active / psnr_count_active
-            if psnr_count_active > 0
-            else float("inf")
+    ref_y, ref_u, ref_v = read_yuv420(seq_yuv, ref_seq_idx, src_w, src_h, bit_depth)
+    tar_y, tar_u, tar_v = read_yuv420(seq_yuv, tar_seq_idx, src_w, src_h, bit_depth)
+    ref_y_pad, ref_u_pad, ref_v_pad = pad_yuv420_edge(ref_y, ref_u, ref_v, coded_w, coded_h, pad_left, pad_top)
+    tar_y_pad, tar_u_pad, tar_v_pad = pad_yuv420_edge(tar_y, tar_u, tar_v, coded_w, coded_h, pad_left, pad_top)
+    if args.out_target_yuv is not None:
+        write_yuv420(Path(args.out_target_yuv), tar_y_pad, tar_u_pad, tar_v_pad)
+
+    depth_y, _, _ = read_yuv420(depth_yuv, args.tar_idx, src_w, src_h, 10)
+    depth_linear = depth_y.astype(np.float32) * float(depth_scale_real)
+    depth_linear_pad = pad_2d_edge(depth_linear, coded_w, coded_h, pad_left, pad_top).astype(np.float32)
+
+    projection_precomp = make_projection_precompute_dual(coded_w, coded_h, intr_tar=intr_tar, intr_ref=intr_ref)
+    map_x, map_y = backward_map_fast_pixel_coord_dual(depth_linear=depth_linear_pad, precomp=projection_precomp, rt=rt_tar_to_ref)
+    valid_mask_u8 = make_valid_u8_mask(map_x, map_y, coded_w, coded_h, erode=args.affine_valid_erode, active_region=(ys_active, xs_active))
+
+    wy_cam, wu_cam, wv_cam = backward_warp_yuv420_bilinear(ref_y_pad, ref_u_pad, ref_v_pad, map_x, map_y, bit_depth)
+    if args.out_cam_yuv is not None:
+        write_yuv420(Path(args.out_cam_yuv), wy_cam, wu_cam, wv_cam)
+
+    psnr_y_active_cam_only = calc_psnr(wy_cam[ys_active, xs_active], tar_y_pad[ys_active, xs_active], bit_depth)
+    psnr_y_coded_cam_only = calc_psnr(wy_cam, tar_y_pad, bit_depth)
+    mae_y_active_cam_only = float(np.mean(np.abs(wy_cam[ys_active, xs_active].astype(np.float32) - tar_y_pad[ys_active, xs_active].astype(np.float32))))
+
+    affine_enabled = bool(args.global_affine_bias)
+    affine_success = False
+    affine_score = None
+    affine_flag_bits = 0
+    affine_cp_bits_total = 0
+    affine_cp_bits_each = [0] * (args.affine_cp_num * 2)
+    affine_cp_q = np.zeros((args.affine_cp_num, 2), dtype=np.int32)
+    affine_cp_dec = np.zeros((args.affine_cp_num, 2), dtype=np.float32)
+    affine_cp_clipped = False
+    affine_matrix_est = identity_transform_matrix(args.affine_cp_num)
+    affine_matrix_dec = identity_transform_matrix(args.affine_cp_num)
+    fit_stats = {"fit_input": "none", "mask_count_valid": int(np.count_nonzero(valid_mask_u8)), "mask_count_used": int(np.count_nonzero(valid_mask_u8))}
+    fit_mask_u8 = valid_mask_u8.copy()
+    map_x_final, map_y_final = map_x, map_y
+
+    if affine_enabled:
+        affine_flag_bits = 1
+        affine_matrix_est, affine_success, affine_score, fit_stats, fit_mask_u8 = estimate_global_affine_bias_structure_lk(
+            cur_y=tar_y_pad,
+            cam_warp_y=wy_cam,
+            valid_mask_u8=valid_mask_u8,
+            bit_depth=bit_depth,
+            w=coded_w,
+            h=coded_h,
+            structure_mode=args.structure_mode,
+            structure_keep_percent=args.structure_keep_percent,
+            structure_mask_dilate=args.structure_mask_dilate,
+            structure_log_gain=args.structure_log_gain,
+            structure_pre_blur=args.structure_pre_blur,
+            lk_sample_step=args.affine_lk_sample_step,
+            lk_iters=args.affine_lk_iters,
+            lk_eps=args.affine_lk_eps,
+            lk_normalize=args.affine_lk_normalize,
+            lk_weight=args.affine_lk_weight,
+            lk_damping=args.affine_lk_damping,
         )
-        avg_psnr_coded = (
-            sum_psnr_coded / psnr_count_coded
-            if psnr_count_coded > 0
-            else float("inf")
-        )
-        avg_psnr_cam_only = (
-            sum_psnr_active_cam_only / psnr_count_active_cam_only
-            if psnr_count_active_cam_only > 0
-            else float("inf")
-        )
+        if affine_success:
+            cp_bias_est = transform_matrix_to_cp_bias(affine_matrix_est, coded_w, coded_h, cp_num=args.affine_cp_num)
+            affine_cp_q, affine_cp_dec, affine_cp_clip_arr, affine_cp_bits_each, affine_cp_bits_total = quantize_transform_cp_bias(
+                cp_bias_est, step=args.affine_cp_step, bits=args.affine_cp_bits, cp_num=args.affine_cp_num
+            )
+            affine_cp_clipped = bool(np.any(affine_cp_clip_arr))
+            affine_matrix_dec = cp_bias_to_transform_matrix(affine_cp_dec, coded_w, coded_h, cp_num=args.affine_cp_num)
+            map_x_final, map_y_final = apply_affine_bias_to_map(map_x, map_y, affine_matrix_dec)
 
-        print(f"avg MAE active        : {avg_mae_active:.3f}")
-        print(f"avg MAE coded         : {avg_mae_coded:.3f}")
-        print(f"avg PSNR cam-only act : {avg_psnr_cam_only:.3f} dB")
-        print(f"avg PSNR active       : {avg_psnr_active:.3f} dB")
-        print(f"avg PSNR coded        : {avg_psnr_coded:.3f} dB")
-        if np.isfinite(avg_psnr_cam_only) and np.isfinite(avg_psnr_active):
-            print(f"avg affine gain active: {avg_psnr_active - avg_psnr_cam_only:+.3f} dB")
+    if args.out_mask_yuv is not None:
+        write_mask_yuv420(Path(args.out_mask_yuv), fit_mask_u8, bit_depth)
+
+    wy_final, wu_final, wv_final = backward_warp_yuv420_bilinear(ref_y_pad, ref_u_pad, ref_v_pad, map_x_final, map_y_final, bit_depth)
+    write_yuv420(Path(args.out_yuv), wy_final, wu_final, wv_final)
+
+    psnr_y_active_final = calc_psnr(wy_final[ys_active, xs_active], tar_y_pad[ys_active, xs_active], bit_depth)
+    psnr_y_coded_final = calc_psnr(wy_final, tar_y_pad, bit_depth)
+    mae_y_active_final = float(np.mean(np.abs(wy_final[ys_active, xs_active].astype(np.float32) - tar_y_pad[ys_active, xs_active].astype(np.float32))))
+
+    valid_ratio_active = float(np.count_nonzero(valid_mask_u8[ys_active, xs_active]) / max(src_w * src_h, 1))
+    valid_ratio_coded = float(np.count_nonzero(valid_mask_u8) / max(coded_w * coded_h, 1))
+    fit_mask_ratio_active = float(np.count_nonzero(fit_mask_u8[ys_active, xs_active]) / max(src_w * src_h, 1))
+    fit_mask_ratio_coded = float(np.count_nonzero(fit_mask_u8) / max(coded_w * coded_h, 1))
+
+    result = {
+        "ref_idx": int(args.ref_idx),
+        "tar_idx": int(args.tar_idx),
+        "ref_seq_idx": int(ref_seq_idx),
+        "tar_seq_idx": int(tar_seq_idx),
+        "source_size": {"width": src_w, "height": src_h},
+        "coded_size": {"width": coded_w, "height": coded_h},
+        "padding": {"left": pad_left, "top": pad_top, "right": pad_right, "bottom": pad_bottom},
+        "depth_scale_header": header.get("depth_scale"),
+        "depth_scale_precision": depth_scale_precision,
+        "depth_scale_real": depth_scale_real,
+        "pose": {"target_to_reference_rt": {"R": rt_tar_to_ref["R"].astype(float).tolist(), "t": rt_tar_to_ref["t"].astype(float).tolist(), "source": rt_tar_to_ref.get("source")}},
+        "intrinsic_ref": intr_ref,
+        "intrinsic_tar": intr_tar,
+        "projection_mode": "target depth backward projection, ref->target warp",
+        "valid_ratio_active": valid_ratio_active,
+        "valid_ratio_coded": valid_ratio_coded,
+        "fit_mask_ratio_active": fit_mask_ratio_active,
+        "fit_mask_ratio_coded": fit_mask_ratio_coded,
+        "cam_proj_only": {
+            "psnr_y_active": json_safe_float(psnr_y_active_cam_only),
+            "psnr_y_coded": json_safe_float(psnr_y_coded_cam_only),
+            "mae_y_active": mae_y_active_cam_only,
+        },
+        "global_affine_bias": {
+            "enabled": affine_enabled,
+            "estimator": "structure_lk_noopencv",
+            "motion_type": "affine",
+            "success": affine_success,
+            "score": json_safe_float(affine_score),
+            "cp_num": int(args.affine_cp_num),
+            "cp_semantics": "3CP full affine" if int(args.affine_cp_num) == 3 else "2CP constrained affine",
+            "cp_step": float(args.affine_cp_step),
+            "cp_bits": int(args.affine_cp_bits),
+            "flag_bits_50_50": int(affine_flag_bits),
+            "cp_q": affine_cp_q.astype(int).tolist(),
+            "cp_dec": affine_cp_dec.astype(float).tolist(),
+            "cp_bits_each_50_50": affine_cp_bits_each,
+            "cp_bits_total_50_50": int(affine_cp_bits_total),
+            "total_bits_50_50": int(affine_flag_bits + affine_cp_bits_total),
+            "cp_clipped": bool(affine_cp_clipped),
+            "matrix_est": affine_matrix_est.astype(float).tolist(),
+            "matrix_dec": affine_matrix_dec.astype(float).tolist(),
+            "fit": fit_stats,
+        },
+        "final": {
+            "psnr_y_active": json_safe_float(psnr_y_active_final),
+            "psnr_y_coded": json_safe_float(psnr_y_coded_final),
+            "mae_y_active": mae_y_active_final,
+            "gain_y_active_vs_cam_only": json_safe_float(psnr_y_active_final - psnr_y_active_cam_only),
+        },
+        "outputs": {
+            "out_yuv": str(args.out_yuv),
+            "out_cam_yuv": args.out_cam_yuv,
+            "out_target_yuv": args.out_target_yuv,
+            "out_mask_yuv": args.out_mask_yuv,
+            "out_json": str(args.out_json),
+        },
+    }
+
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
     print("============================================================")
-    print("Bit summary")
+    print("Single-frame ref -> target warp, no OpenCV")
     print("============================================================")
-    print(f"header intrinsic bits : {header_intrinsic_bits} bits")
-    print(f"  fx, fy, cx, cy      : 16 bits each")
-    print(f"depth_scale bits      : {depth_scale_bits} bits")
-    print(f"z_sign bits           : {z_sign_bits} bits")
-    print(f"header bits           : {header_bits} bits")
+    print(f"ref -> tar             : {args.ref_idx} -> {args.tar_idx}")
+    print(f"ref_seq_idx/tar_seq_idx: {ref_seq_idx} / {tar_seq_idx}")
+    print(f"pose source            : {rt_tar_to_ref.get('source')}")
+    print(f"source size            : {src_w}x{src_h}")
+    print(f"coded size             : {coded_w}x{coded_h}")
+    print(f"valid ratio active     : {valid_ratio_active:.4f}")
+    print(f"fit mask ratio active  : {fit_mask_ratio_active:.4f}")
     print("------------------------------------------------------------")
-    print(f"extrinsic code        : signed truncated Exp-Golomb")
-    print(f"extrinsic q range     : [-{q_abs_max_ext}, {q_abs_max_ext}]")
-    print(f"extrinsic frames      : {total_coded_frames}")
-    print(f"extrinsic clipped     : {total_clipped_frames}")
-    print(f"extrinsic total bits  : {total_ext_bits} bits")
-
-    if total_coded_frames > 0:
-        avg_ext_bits = total_ext_bits / total_coded_frames
-        avg_r_bits = total_ext_bits_r / total_coded_frames
-        avg_t_bits = total_ext_bits_t / total_coded_frames
-        avg_bits_each = total_ext_bits_each.astype(np.float64) / total_coded_frames
-
-        print(f"avg ext bits/frame    : {avg_ext_bits:.3f}")
-        print(f"avg rotation bits     : {avg_r_bits:.3f} / frame")
-        print(f"avg translation bits  : {avg_t_bits:.3f} / frame")
-        print(
-            "avg ext bits each     : "
-            f"rx={avg_bits_each[0]:.3f}, "
-            f"ry={avg_bits_each[1]:.3f}, "
-            f"rz={avg_bits_each[2]:.3f}, "
-            f"tx={avg_bits_each[3]:.3f}, "
-            f"ty={avg_bits_each[4]:.3f}, "
-            f"tz={avg_bits_each[5]:.3f}"
-        )
-
+    print(f"cam-only PSNR active   : {psnr_y_active_cam_only:.3f} dB")
+    print(f"cam-only PSNR coded    : {psnr_y_coded_cam_only:.3f} dB")
+    print(f"final PSNR active      : {psnr_y_active_final:.3f} dB")
+    print(f"final PSNR coded       : {psnr_y_coded_final:.3f} dB")
+    print(f"active gain            : {psnr_y_active_final - psnr_y_active_cam_only:+.3f} dB")
     print("------------------------------------------------------------")
-    print(f"intrinsic delta code  : signed truncated Exp-Golomb")
-    print(f"intrinsic delta range : [-{q_abs_max_intr}, {q_abs_max_intr}]")
-    print(f"intrinsic delta frames: {total_intr_delta_frames}")
-    print(f"intrinsic clipped     : {total_intr_clipped_frames}")
-    print(f"intrinsic delta bits  : {total_intr_delta_bits} bits")
-
-    if total_intr_delta_frames > 0:
-        avg_intr_bits = total_intr_delta_bits / total_intr_delta_frames
-        avg_intr_each = total_intr_delta_bits_each.astype(np.float64) / total_intr_delta_frames
-
-        print(f"avg intr bits/frame   : {avg_intr_bits:.3f}")
-        print(
-            "avg intr bits each    : "
-            f"dfx={avg_intr_each[0]:.3f}, "
-            f"dfy={avg_intr_each[1]:.3f}, "
-            f"dcx={avg_intr_each[2]:.3f}, "
-            f"dcy={avg_intr_each[3]:.3f}"
-        )
-
+    print(f"affine enabled         : {affine_enabled}")
+    print(f"affine success         : {affine_success}")
+    print(f"affine cp num          : {args.affine_cp_num}")
+    print(f"affine cp step         : {args.affine_cp_step}")
+    print(f"structure mode         : {args.structure_mode}")
+    print(f"structure keep percent : {args.structure_keep_percent}")
+    print(f"LK sample step         : {args.affine_lk_sample_step}")
+    print(f"LK iters done          : {fit_stats.get('lk_iters_done')}")
+    print(f"affine cp q            : {affine_cp_q.astype(int).tolist()}")
+    print(f"affine cp dec          : {affine_cp_dec.astype(float).tolist()}")
+    print(f"affine bits            : {affine_flag_bits + affine_cp_bits_total}")
     print("------------------------------------------------------------")
-    print("Global affine bias")
-    print("------------------------------------------------------------")
-    print(f"affine enabled        : {args.global_affine_bias}")
-    print(f"affine estimator      : {args.affine_estimator}")
-    print(f"affine frames         : {total_affine_frames}")
-    print(f"affine success frames : {total_affine_success_frames}")
-    print(f"affine clipped frames : {total_affine_clipped_frames}")
-    print(f"affine flag bits      : {total_affine_flag_bits} bits")
-    print(f"affine CP bits        : {total_affine_cp_bits} bits")
-    print(f"affine total bits     : {total_affine_flag_bits + total_affine_cp_bits} bits")
-    print(f"affine cp num         : {args.affine_cp_num}")
-    print(f"affine cp step        : {args.affine_cp_step}")
-    print(f"affine cp bits range  : [-{q_abs_max_affine_cp}, {q_abs_max_affine_cp}]")
-    if args.affine_estimator == "lk":
-        print(f"affine lk sample step : {args.affine_lk_sample_step}")
-        print(f"affine lk iters       : {args.affine_lk_iters}")
-        print(f"affine lk normalize   : {args.affine_lk_normalize}")
-
-    if total_affine_success_frames > 0:
-        avg_affine_cp_bits = total_affine_cp_bits / total_affine_success_frames
-        avg_affine_total_bits = (
-            total_affine_flag_bits + total_affine_cp_bits
-        ) / max(total_affine_frames, 1)
-        avg_affine_each = total_affine_bits_each.astype(np.float64) / total_affine_success_frames
-
-        print(f"avg affine CP bits/frame    : {avg_affine_cp_bits:.3f}")
-        print(f"avg affine total bits/frame : {avg_affine_total_bits:.3f}")
-        avg_affine_parts = [
-            f"{name}={val:.3f}"
-            for name, val in zip(affine_cp_component_names(args.affine_cp_num), avg_affine_each)
-        ]
-        print("avg affine bits each        : " + ", ".join(avg_affine_parts))
-
-    print("------------------------------------------------------------")
-    print(f"total bits            : {total_bits} bits")
-    print("============================================================")
+    print(f"warped yuv             : {args.out_yuv}")
+    print(f"json                   : {args.out_json}")
     print("Done.")
-    print(f"warped yuv            : {out_yuv}")
-    print(f"q jsonl               : {out_q_jsonl}")
 
 
 if __name__ == "__main__":
