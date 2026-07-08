@@ -1,41 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gop_camera_refine_rf_from_structure_h.py
+batch_affine_cp_rf_refine_canonical_outputs.py
 
-Second-stage refinement for the output of:
-  optimize_fixedK_rt_depth_nn_gop_smooth_predloss.py
+Batch second-stage refinement for canonicalized fixedK GOP NN-depth outputs.
 
-Expected first-stage outputs from that script:
-  <prefix>_fixedK_gop_nn_geometry.npz
-    - K_fixed                         [3,3]
-    - rvec_abs_final                  [N,3]  camera_from_world / W2C
-    - tvec_abs_final                  [N,3]  camera_from_world / W2C
-    - depth_canonical                 [N,H,W] linear depth
-    - frame_indices                   [N]
-    - pairs_json                      optional JSON list of PairSpec dicts
+Input per sequence, recursively found under --src-root:
+  <base>_fixedK_gop_nn_geometry.npz
+  <base>_fixedK_gop_nn_cam.jsonl                         optional metadata source
+  <base>_fixedK_gop_nn_depth_linear_yuv420p10le.yuv       copied unchanged if found
+  <base>_fixedK_gop_nn_manifest.json                      optional metadata source
 
-  <prefix>_fixedK_gop_nn_cam.jsonl    optional, used only to copy metadata
-  <prefix>_fixedK_gop_nn_depth_linear_yuv420p10le.yuv  unchanged depth output
+Output per sequence under --dst-root, with the SAME canonical filename format:
+  <base>_fixedK_gop_nn_geometry.npz
+  <base>_fixedK_gop_nn_cam.jsonl
+  <base>_fixedK_gop_nn_depth_linear_yuv420p10le.yuv
+  <base>_fixedK_gop_nn_manifest.json
 
-What this script does:
-  1) Use fixed depth_canonical and final W2C poses from the first-stage NPZ.
-  2) For each target/ref pair, render the current camera projection.
-  3) Estimate a pair-wise global residual transform using OpenCV ECC on Scharr
-     structure images. This is preprocessing-only and may use OpenCV.
-  4) Build pseudo-GT correspondences:
-        q_gt(x,y) = base_cam_map(x,y) + alpha * clamp(H(x,y)-x,y)
-  5) Fit only GOP focal and frame-wise W2C R|t to q_gt, with depth fixed.
-     R and focal are the main variables; t is strongly regularized/tiny.
+What it does:
+  1) Loads canonicalized depth_canonical, K_fixed, rvec_abs_final, tvec_abs_final.
+  2) For selected target/ref pairs, renders target->ref camera projection.
+  3) Estimates pair-wise residual 3CP affine, or optional 4CP homography, using
+     OpenCV ECC on Scharr structure images.
+  4) Converts affine CP residual into pseudo-GT correspondences:
+       q_gt(x,y) = base_cam_map(x,y) + alpha * (A(x,y) - (x,y))
+  5) Fits GOP focal length and frame-wise W2C R|t to q_gt with depth fixed.
+     Default focal mode is --focal-mode single, i.e. fx=fy=f.
+  6) Writes canonical-compatible outputs so downstream cam-param conversion can
+     consume the dst folder without format changes.
 
-Pose convention in this script:
+Pose convention:
   Absolute pose is camera_from_world / W2C:
       X_cam_i = R_i X_world + t_i
-
   Relative target camera -> reference camera:
-      R_rel = R_ref R_tar^T
-      t_rel = t_ref - R_rel t_tar
-      X_ref = R_rel X_tar + t_rel
+      R_rel = R_ref @ R_target.T
+      t_rel = t_ref - R_rel @ t_target
+      X_ref = R_rel X_target + t_rel
 
 Coordinate convention:
   target pixel -> reference pixel
@@ -48,83 +48,71 @@ import json
 import math
 import os
 import re
+import shutil
+import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 import cv2
 import numpy as np
+import torch
 
-try:
-    import torch
-except ImportError as exc:
-    raise ImportError("This script requires PyTorch.") from exc
+
+GEOM_SUFFIX = "_fixedK_gop_nn_geometry.npz"
+CAM_SUFFIX = "_fixedK_gop_nn_cam.jsonl"
+DEPTH_SUFFIX = "_fixedK_gop_nn_depth_linear_yuv420p10le.yuv"
+MANIFEST_SUFFIX = "_fixedK_gop_nn_manifest.json"
 
 
 # ============================================================
-# Basic I/O
+# Logging / JSON helpers
 # ============================================================
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
 
 def ensure_dir(path: str | Path) -> None:
-    os.makedirs(path, exist_ok=True)
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def frame_size_yuv420(w: int, h: int, bitdepth: int) -> int:
-    bps = 1 if bitdepth <= 8 else 2
-    return (w * h + 2 * (w // 2) * (h // 2)) * bps
+def ensure_parent(path: str | Path) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-def read_y_frame(path: str | Path, w: int, h: int, bitdepth: int, idx: int) -> np.ndarray:
-    dtype = np.uint8 if bitdepth <= 8 else np.dtype("<u2")
-    fs = frame_size_yuv420(w, h, bitdepth)
-    y_samples = w * h
-    with open(path, "rb") as f:
-        f.seek(int(idx) * fs)
-        y = np.fromfile(f, dtype=dtype, count=y_samples)
-    if y.size != y_samples:
-        raise RuntimeError(f"Cannot read Y frame idx={idx} from {path}")
-    return y.reshape(h, w)
+def json_safe_float(x: Any) -> Any:
+    if x is None:
+        return None
+    x = float(x)
+    if np.isnan(x):
+        return None
+    if np.isinf(x):
+        return "inf"
+    return x
 
 
-def write_yuv420_y_only(path: str | Path, y: np.ndarray, bitdepth: int) -> None:
-    h, w = y.shape
-    with open(path, "wb") as f:
-        if bitdepth <= 8:
-            yy = np.clip(np.rint(y), 0, 255).astype(np.uint8)
-            uv = np.full((h // 2, w // 2), 128, dtype=np.uint8)
-        else:
-            yy = np.clip(np.rint(y), 0, (1 << bitdepth) - 1).astype("<u2")
-            uv = np.full((h // 2, w // 2), 1 << (bitdepth - 1), dtype="<u2")
-        f.write(yy.tobytes())
-        f.write(uv.tobytes())
-        f.write(uv.tobytes())
+def to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return json_safe_float(obj)
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    return obj
 
 
-def save_gray_png(path: str | Path, y: np.ndarray, bitdepth: int) -> None:
-    if bitdepth <= 8:
-        out = np.clip(y, 0, 255).astype(np.uint8)
-    else:
-        out = np.clip(y.astype(np.float32) / float(1 << (bitdepth - 8)), 0, 255).astype(np.uint8)
-    cv2.imwrite(str(path), out)
-
-
-def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, bitdepth: int) -> dict[str, Any]:
-    valid = valid.astype(bool)
-    valid_ratio = float(np.mean(valid))
-    if not np.any(valid):
-        return {"valid_ratio": valid_ratio, "mae": None, "mse": None, "psnr": None}
-    diff = target_y.astype(np.float32)[valid] - pred_y.astype(np.float32)[valid]
-    mae = float(np.mean(np.abs(diff)))
-    mse = float(np.mean(diff ** 2))
-    maxv = float((1 << bitdepth) - 1)
-    psnr = 999.0 if mse <= 1e-12 else float(10.0 * np.log10((maxv * maxv) / mse))
-    return {"valid_ratio": valid_ratio, "mae": mae, "mse": mse, "psnr": psnr}
-
-
-def _json_from_np_object(x: Any) -> Any:
+def npz_scalar_json(x: Any) -> Any:
     if isinstance(x, np.ndarray):
         if x.shape == ():
-            return _json_from_np_object(x.item())
-        return [_json_from_np_object(v) for v in x.tolist()]
+            return npz_scalar_json(x.item())
+        return [npz_scalar_json(v) for v in x.tolist()]
     if isinstance(x, bytes):
         x = x.decode("utf-8")
     if isinstance(x, str):
@@ -132,8 +120,8 @@ def _json_from_np_object(x: Any) -> Any:
     return x
 
 
-def load_first_jsonl_object(path: str | Path) -> Optional[dict[str, Any]]:
-    if path is None or not str(path):
+def load_first_jsonl_object(path: str | Path | None) -> Optional[dict[str, Any]]:
+    if not path:
         return None
     p = Path(path)
     if not p.is_file():
@@ -153,10 +141,158 @@ def load_first_jsonl_object(path: str | Path) -> Optional[dict[str, Any]]:
 
 
 # ============================================================
-# First-stage fixedK_gop_nn output loading
+# Batch discovery and canonical filenames
 # ============================================================
 
-def _npz_key(data: np.lib.npyio.NpzFile, candidates: list[str], required: bool = True) -> Optional[str]:
+def derive_base_from_geometry_npz(npz_path: Path) -> str:
+    name = npz_path.name
+    if name.endswith(GEOM_SUFFIX):
+        return name[: -len(GEOM_SUFFIX)]
+    return npz_path.stem
+
+
+def find_geometry_npz_files(src_root: Path, pattern: str) -> list[Path]:
+    return [p for p in sorted(src_root.rglob(pattern)) if p.is_file()]
+
+
+def make_out_prefix(npz_path: Path, src_root: Path, dst_root: Path, layout: str) -> Path:
+    base = derive_base_from_geometry_npz(npz_path)
+    if layout == "preserve":
+        rel_dir = npz_path.parent.relative_to(src_root)
+        out_dir = dst_root / rel_dir
+    elif layout == "flat":
+        out_dir = dst_root
+    else:
+        raise ValueError(layout)
+    return out_dir / base
+
+
+def canonical_paths_from_prefix(prefix: Path) -> dict[str, Path]:
+    base = prefix.name
+    parent = prefix.parent
+    return {
+        "geometry_npz": parent / f"{base}{GEOM_SUFFIX}",
+        "camera_jsonl": parent / f"{base}{CAM_SUFFIX}",
+        "depth_yuv": parent / f"{base}{DEPTH_SUFFIX}",
+        "manifest": parent / f"{base}{MANIFEST_SUFFIX}",
+    }
+
+
+def find_canonical_sidecars(geometry_npz: Path) -> dict[str, Optional[Path]]:
+    base = derive_base_from_geometry_npz(geometry_npz)
+    parent = geometry_npz.parent
+    paths = {
+        "camera_jsonl": parent / f"{base}{CAM_SUFFIX}",
+        "depth_yuv": parent / f"{base}{DEPTH_SUFFIX}",
+        "manifest": parent / f"{base}{MANIFEST_SUFFIX}",
+    }
+    return {k: (v if v.is_file() else None) for k, v in paths.items()}
+
+
+def already_done(out_prefix: Path) -> bool:
+    return canonical_paths_from_prefix(out_prefix)["manifest"].is_file()
+
+
+def validate_canonical_npz(npz_path: Path) -> bool:
+    required_any = {
+        "K": ["K_fixed", "K_refined", "K"],
+        "r": ["rvec_abs_final", "rvec_abs_stage4_smooth", "rvec_abs_stage3_joint", "rvec_abs_stage2_t_nn", "rvec_abs_stage1_rt"],
+        "t": ["tvec_abs_final", "tvec_abs_stage4_smooth", "tvec_abs_stage3_joint", "tvec_abs_stage2_t_nn", "tvec_abs_stage1_rt"],
+        "depth": ["depth_canonical", "depth_original"],
+    }
+    try:
+        with np.load(npz_path, allow_pickle=True) as data:
+            files = set(data.files)
+        missing = [name for name, keys in required_any.items() if not any(k in files for k in keys)]
+        if missing:
+            log(f"SKIP invalid canonical NPZ: {npz_path} / missing groups {missing}")
+            return False
+        return True
+    except Exception as e:
+        log(f"SKIP unreadable NPZ: {npz_path} / {e}")
+        return False
+
+
+# ============================================================
+# YUV helpers
+# ============================================================
+
+def frame_size_yuv420(w: int, h: int, bitdepth: int) -> int:
+    bps = 1 if bitdepth <= 8 else 2
+    return (w * h + 2 * (w // 2) * (h // 2)) * bps
+
+
+def count_frames_yuv420(path: str | Path, w: int, h: int, bitdepth: int) -> int:
+    return os.path.getsize(path) // frame_size_yuv420(w, h, bitdepth)
+
+
+def read_y_frame(path: str | Path, w: int, h: int, bitdepth: int, idx: int) -> np.ndarray:
+    dtype = np.uint8 if bitdepth <= 8 else np.dtype("<u2")
+    fs = frame_size_yuv420(w, h, bitdepth)
+    y_samples = int(w) * int(h)
+    with open(path, "rb") as f:
+        f.seek(int(idx) * fs)
+        y = np.fromfile(f, dtype=dtype, count=y_samples)
+    if y.size != y_samples:
+        raise RuntimeError(f"Cannot read Y frame idx={idx} from {path}")
+    return y.reshape(h, w)
+
+
+def write_depth_yuv420p10le_linear(path: Path, depth: np.ndarray, scale_meta: dict[str, Any]) -> dict[str, Any]:
+    n, h, w = depth.shape
+    if w % 2 or h % 2:
+        raise ValueError("YUV420 output requires even width/height")
+    ensure_parent(path)
+    max_code = int(scale_meta["max_code"])
+    scale = float(scale_meta["depth_scale_real"])
+    clipped_total = 0
+    with open(path, "wb") as f:
+        for i in range(n):
+            y = np.round(depth[i].astype(np.float64) / scale)
+            clipped = (y < 0) | (y > max_code) | ~np.isfinite(y)
+            clipped_total += int(np.count_nonzero(clipped))
+            y = np.nan_to_num(y, nan=0.0, posinf=max_code, neginf=0.0)
+            y = np.clip(y, 0, max_code).astype("<u2")
+            uv = np.full((h // 2, w // 2), 512, dtype="<u2")
+            f.write(y.tobytes())
+            f.write(uv.tobytes())
+            f.write(uv.tobytes())
+    return {
+        **scale_meta,
+        "depth_yuv": str(path),
+        "depth_yuv_format": "yuv420p10le",
+        "depth_yuv_semantics": "Y stores linear depth code = round(depth / depth_scale_real); U/V neutral 512",
+        "clipped_samples_total": int(clipped_total),
+        "total_samples": int(n * h * w),
+    }
+
+
+def choose_depth_scale_fixed_point(depth: np.ndarray, percentile: float, precision: int, bit_depth: int = 10) -> dict[str, Any]:
+    max_code = (1 << bit_depth) - 1
+    m = np.isfinite(depth) & (depth > 0)
+    if not np.any(m):
+        scale_real = 1.0 / max_code
+    else:
+        ref = float(np.percentile(depth[m], percentile))
+        ref = max(ref, 1e-12)
+        scale_real = ref / float(max_code)
+    scale_int = max(1, int(round(scale_real * precision)))
+    scale_real_q = scale_int / float(precision)
+    return {
+        "depth_scale": int(scale_int),
+        "depth_scale_precision": int(precision),
+        "depth_scale_real": float(scale_real_q),
+        "depth_scale_percentile": float(percentile),
+        "depth_bit_depth": int(bit_depth),
+        "max_code": int(max_code),
+    }
+
+
+# ============================================================
+# Canonical stage loading
+# ============================================================
+
+def npz_key(data: np.lib.npyio.NpzFile, candidates: list[str], required: bool = True) -> Optional[str]:
     for k in candidates:
         if k in data.files:
             return k
@@ -165,16 +301,13 @@ def _npz_key(data: np.lib.npyio.NpzFile, candidates: list[str], required: bool =
     return None
 
 
-def load_fixedk_stage1_npz(npz_path: str | Path) -> dict[str, Any]:
+def load_canonical_npz(npz_path: str | Path) -> dict[str, Any]:
     path = Path(npz_path)
-    if not path.is_file():
-        raise FileNotFoundError(path)
     data = np.load(path, allow_pickle=True)
-
-    k_key = _npz_key(data, ["K_fixed", "K_refined", "K"])
-    r_key = _npz_key(data, ["rvec_abs_final", "rvec_abs_stage4_smooth", "rvec_abs_stage3_joint", "rvec_abs_stage2_t_nn", "rvec_abs_stage1_rt"])
-    t_key = _npz_key(data, ["tvec_abs_final", "tvec_abs_stage4_smooth", "tvec_abs_stage3_joint", "tvec_abs_stage2_t_nn", "tvec_abs_stage1_rt"])
-    d_key = _npz_key(data, ["depth_canonical", "depth_original"])
+    k_key = npz_key(data, ["K_fixed", "K_refined", "K"])
+    r_key = npz_key(data, ["rvec_abs_final", "rvec_abs_stage4_smooth", "rvec_abs_stage3_joint", "rvec_abs_stage2_t_nn", "rvec_abs_stage1_rt"])
+    t_key = npz_key(data, ["tvec_abs_final", "tvec_abs_stage4_smooth", "tvec_abs_stage3_joint", "tvec_abs_stage2_t_nn", "tvec_abs_stage1_rt"])
+    d_key = npz_key(data, ["depth_canonical", "depth_original"])
 
     K = np.asarray(data[k_key], dtype=np.float64).reshape(3, 3)
     rvecs = np.asarray(data[r_key], dtype=np.float64).reshape(-1, 3)
@@ -185,7 +318,6 @@ def load_fixedk_stage1_npz(npz_path: str | Path) -> dict[str, Any]:
     n, h, w = depth.shape
     if rvecs.shape[0] != n or tvecs.shape[0] != n:
         raise ValueError(f"Pose count mismatch: depth N={n}, r={rvecs.shape}, t={tvecs.shape}")
-
     if "frame_indices" in data.files:
         frame_indices = np.asarray(data["frame_indices"], dtype=np.int32).reshape(-1)
         if frame_indices.shape[0] != n:
@@ -196,17 +328,18 @@ def load_fixedk_stage1_npz(npz_path: str | Path) -> dict[str, Any]:
     pairs = None
     if "pairs_json" in data.files:
         try:
-            pairs_obj = _json_from_np_object(data["pairs_json"])
-            if isinstance(pairs_obj, list):
+            obj = npz_scalar_json(data["pairs_json"])
+            if isinstance(obj, list):
                 pairs = []
-                for p in pairs_obj:
+                for p in obj:
                     if isinstance(p, dict) and "target" in p and "ref" in p:
-                        pairs.append((int(p["target"]), int(p["ref"]), float(p.get("weight", 1.0)), str(p.get("kind", "stage1"))))
+                        pairs.append((int(p["target"]), int(p["ref"]), float(p.get("weight", 1.0)), str(p.get("kind", "npz"))))
         except Exception:
             pairs = None
 
     return {
         "npz_path": str(path),
+        "data": data,
         "K": K,
         "rvecs": rvecs,
         "tvecs": tvecs,
@@ -216,6 +349,10 @@ def load_fixedk_stage1_npz(npz_path: str | Path) -> dict[str, Any]:
         "source_keys": {"K": k_key, "rvecs": r_key, "tvecs": t_key, "depth": d_key},
     }
 
+
+# ============================================================
+# Pair selection
+# ============================================================
 
 def parse_pairs(s: str, default_weight: float = 1.0) -> list[tuple[int, int, float, str]]:
     out: list[tuple[int, int, float, str]] = []
@@ -228,10 +365,19 @@ def parse_pairs(s: str, default_weight: float = 1.0) -> list[tuple[int, int, flo
         parts = tok.split(":")
         if len(parts) not in (2, 3):
             raise ValueError(f"Invalid pair token '{tok}'. Use target:ref[:weight].")
-        t = int(parts[0])
-        r = int(parts[1])
-        w = float(parts[2]) if len(parts) == 3 else float(default_weight)
-        out.append((t, r, w, "cli"))
+        target = int(parts[0])
+        ref = int(parts[1])
+        weight = float(parts[2]) if len(parts) == 3 else float(default_weight)
+        out.append((target, ref, weight, "cli"))
+    return out
+
+
+def generate_adjacent_pairs(n: int, bidirectional: bool, weight: float) -> list[tuple[int, int, float, str]]:
+    out = []
+    for i in range(1, n):
+        out.append((i, i - 1, float(weight), "adjacent"))
+        if bidirectional:
+            out.append((i - 1, i, float(weight), "adjacent_rev"))
     return out
 
 
@@ -268,9 +414,11 @@ def generate_dyadic_pairs(n: int, bidirectional: bool = True, weight: float = 1.
 def build_pair_list(args: argparse.Namespace, stage: dict[str, Any]) -> list[tuple[int, int, float, str]]:
     n = int(stage["depth"].shape[0])
     if args.pairs.strip():
-        pairs = parse_pairs(args.pairs)
+        pairs = parse_pairs(args.pairs, default_weight=args.pair_weight)
     elif args.pair_source == "npz" and stage.get("pairs"):
         pairs = list(stage["pairs"])
+    elif args.pair_source == "adjacent":
+        pairs = generate_adjacent_pairs(n, bidirectional=not args.no_bidirectional_pairs, weight=args.pair_weight)
     elif args.pair_source in ("dyadic", "npz"):
         pairs = generate_dyadic_pairs(n, bidirectional=not args.no_bidirectional_pairs, weight=args.pair_weight)
     elif args.pair_source == "all":
@@ -296,7 +444,7 @@ def build_pair_list(args: argparse.Namespace, stage: dict[str, Any]) -> list[tup
 
 
 # ============================================================
-# Geometry / projection, W2C convention
+# Geometry / projection
 # ============================================================
 
 def rodrigues_np(rvec: np.ndarray) -> np.ndarray:
@@ -346,10 +494,8 @@ def camera_map_w2c_np(
     R_ref = Rs[int(ref)]
     t_tar = tvecs[int(target)]
     t_ref = tvecs[int(ref)]
-
     R_rel = R_ref @ R_tar.T
     t_rel = t_ref - R_rel @ t_tar
-
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
@@ -364,7 +510,11 @@ def camera_map_w2c_np(
         xs, yy = np.meshgrid(xs_full, ys)
         ray_x = (xs - cx) / fx
         ray_y = (yy - cy) / fy
-        rays = np.stack([ray_x.reshape(-1), ray_y.reshape(-1), np.full((y1 - y0) * width, float(z_sign), dtype=np.float64)], axis=1)
+        rays = np.stack([
+            ray_x.reshape(-1),
+            ray_y.reshape(-1),
+            np.full((y1 - y0) * width, float(z_sign), dtype=np.float64),
+        ], axis=1)
         dep = depth_img[y0:y1, :].reshape(-1).astype(np.float64)
         X_tar = dep[:, None] * rays
         X_ref = X_tar @ R_rel.T + t_rel[None, :]
@@ -396,7 +546,19 @@ def remap_y(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarr
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
-    )
+    ).astype(np.float32)
+
+
+def calc_cost(target_y: np.ndarray, pred_y: np.ndarray, valid: np.ndarray, bitdepth: int) -> dict[str, Any]:
+    valid = valid.astype(bool)
+    if not np.any(valid):
+        return {"valid_ratio": float(np.mean(valid)), "mae": None, "mse": None, "psnr": None}
+    diff = target_y.astype(np.float32)[valid] - pred_y.astype(np.float32)[valid]
+    mse = float(np.mean(diff * diff))
+    mae = float(np.mean(np.abs(diff)))
+    maxv = float((1 << bitdepth) - 1)
+    psnr = 999.0 if mse <= 1e-12 else float(10.0 * np.log10((maxv * maxv) / mse))
+    return {"valid_ratio": float(np.mean(valid)), "mae": mae, "mse": mse, "psnr": psnr}
 
 
 # ============================================================
@@ -404,7 +566,7 @@ def remap_y(ref_y: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarr
 # ============================================================
 
 def normalize_for_ecc(img: np.ndarray, bitdepth: int) -> np.ndarray:
-    return np.clip(img.astype(np.float32) / float((1 << bitdepth) - 1), 0.0, 1.0)
+    return np.clip(img.astype(np.float32) / float((1 << bitdepth) - 1), 0.0, 1.0).astype(np.float32)
 
 
 def make_structure_image(img: np.ndarray, bitdepth: int, mode: str, log_gain: float, pre_blur: int) -> np.ndarray:
@@ -435,11 +597,10 @@ def make_structure_image(img: np.ndarray, bitdepth: int, mode: str, log_gain: fl
 
 
 def make_valid_mask_u8(valid: np.ndarray, erode: int = 2) -> np.ndarray:
-    mask = (valid.astype(np.uint8) * 255)
+    mask = valid.astype(np.uint8) * 255
     if int(erode) > 0:
         k = 2 * int(erode) + 1
-        kernel = np.ones((k, k), dtype=np.uint8)
-        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.erode(mask, np.ones((k, k), dtype=np.uint8), iterations=1)
     return mask
 
 
@@ -469,8 +630,88 @@ def make_structure_mask_u8(structure: np.ndarray, base_mask_u8: np.ndarray, keep
     return mask_u8, stats
 
 
+def apply_initial_static_residual_mask(
+    template: np.ndarray,
+    inp: np.ndarray,
+    mask_u8: np.ndarray,
+    keep_percent: float,
+    min_mask_count: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    keep_percent = float(keep_percent)
+    stats = {"enabled": keep_percent < 99.999, "keep_percent": keep_percent, "threshold": None, "input_count": int(np.count_nonzero(mask_u8)), "output_count": int(np.count_nonzero(mask_u8))}
+    if keep_percent >= 99.999:
+        return mask_u8, stats
+    use = mask_u8 > 0
+    if np.count_nonzero(use) < int(min_mask_count):
+        stats["reason"] = "too_few_input_pixels"
+        return mask_u8, stats
+    residual = np.abs(template.astype(np.float32) - inp.astype(np.float32))
+    vals = residual[use]
+    thr = float(np.percentile(vals, max(0.1, min(100.0, keep_percent))))
+    new_mask = use & (residual <= thr)
+    if np.count_nonzero(new_mask) < int(min_mask_count):
+        stats["reason"] = "too_few_after_filter"
+        stats["threshold"] = thr
+        return mask_u8, stats
+    out = new_mask.astype(np.uint8) * 255
+    stats["threshold"] = thr
+    stats["output_count"] = int(np.count_nonzero(out))
+    return out, stats
+
+
+def apply_depth_edge_rejection(depth_img: np.ndarray, mask_u8: np.ndarray, reject_percentile: float) -> tuple[np.ndarray, dict[str, Any]]:
+    # reject_percentile=100 disables rejection. 90 means reject top 10% depth-gradient pixels.
+    stats = {"enabled": float(reject_percentile) < 99.999, "reject_percentile": float(reject_percentile), "threshold": None, "input_count": int(np.count_nonzero(mask_u8)), "output_count": int(np.count_nonzero(mask_u8))}
+    if float(reject_percentile) >= 99.999:
+        return mask_u8, stats
+    base = mask_u8 > 0
+    if np.count_nonzero(base) < 100:
+        stats["reason"] = "too_few_input_pixels"
+        return mask_u8, stats
+    logd = np.log(np.maximum(depth_img.astype(np.float32), 1e-12))
+    gx = cv2.Scharr(logd, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(logd, cv2.CV_32F, 0, 1)
+    edge = np.sqrt(gx * gx + gy * gy)
+    vals = edge[base]
+    thr = float(np.percentile(vals, float(reject_percentile)))
+    keep = base & (edge <= thr)
+    out = keep.astype(np.uint8) * 255
+    stats["threshold"] = thr
+    stats["output_count"] = int(np.count_nonzero(out))
+    return out, stats
+
+
 def identity_transform(cp_num: int) -> np.ndarray:
     return np.eye(3, dtype=np.float32) if int(cp_num) == 4 else np.eye(2, 3, dtype=np.float32)
+
+
+def transform_to_full_resolution(M_s: np.ndarray, cp_num: int, scale: float) -> np.ndarray:
+    scale = float(scale)
+    if abs(scale - 1.0) < 1e-9:
+        return M_s.astype(np.float32)
+    S = np.array([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    if int(cp_num) == 4:
+        H_s = np.asarray(M_s, dtype=np.float32).reshape(3, 3)
+    else:
+        H_s = np.eye(3, dtype=np.float32)
+        H_s[:2, :] = np.asarray(M_s, dtype=np.float32).reshape(2, 3)
+    H = np.linalg.inv(S) @ H_s @ S
+    if int(cp_num) == 4:
+        H = H / max(abs(float(H[2, 2])), 1e-12) * np.sign(float(H[2, 2]) if abs(float(H[2, 2])) > 1e-12 else 1.0)
+        return H.astype(np.float32)
+    return H[:2, :].astype(np.float32)
+
+
+def resize_for_ecc(img: np.ndarray, mask_u8: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray]:
+    scale = float(scale)
+    if abs(scale - 1.0) < 1e-9:
+        return img.astype(np.float32), mask_u8.astype(np.uint8)
+    h, w = img.shape
+    sw = max(8, int(round(w * scale)))
+    sh = max(8, int(round(h * scale)))
+    img_s = cv2.resize(img.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+    mask_s = cv2.resize(mask_u8.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST)
+    return img_s.astype(np.float32), mask_s.astype(np.uint8)
 
 
 def warp_ecc_input_to_template_domain(inp: np.ndarray, M: np.ndarray, cp_num: int) -> np.ndarray:
@@ -479,12 +720,14 @@ def warp_ecc_input_to_template_domain(inp: np.ndarray, M: np.ndarray, cp_num: in
         return cv2.warpPerspective(
             inp.astype(np.float32), np.asarray(M, dtype=np.float32), (w, h),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
         ).astype(np.float32)
     return cv2.warpAffine(
         inp.astype(np.float32), np.asarray(M, dtype=np.float32), (w, h),
         flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
     ).astype(np.float32)
 
 
@@ -493,29 +736,45 @@ def run_find_transform_ecc_with_init(
     inp: np.ndarray,
     mask_u8: np.ndarray,
     cp_num: int,
-    init_matrix: np.ndarray,
+    init_matrix_full: np.ndarray,
     max_iters: int,
     eps: float,
     gauss_filt_size: int,
+    ecc_scale: float,
 ) -> tuple[np.ndarray, float]:
     cp_num = int(cp_num)
+    scale = float(ecc_scale)
+    template_s, mask_s = resize_for_ecc(template, mask_u8, scale)
+    inp_s, _ = resize_for_ecc(inp, mask_u8, scale)
+    init_s = init_matrix_full.copy()
+    if abs(scale - 1.0) >= 1e-9:
+        # Convert full-res init to scaled coordinate system: H_s = S @ H_full @ inv(S)
+        S = np.array([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        if cp_num == 4:
+            H_full = np.asarray(init_matrix_full, dtype=np.float32).reshape(3, 3)
+        else:
+            H_full = np.eye(3, dtype=np.float32)
+            H_full[:2, :] = np.asarray(init_matrix_full, dtype=np.float32).reshape(2, 3)
+        H_s = S @ H_full @ np.linalg.inv(S)
+        init_s = H_s if cp_num == 4 else H_s[:2, :]
+
     if cp_num == 4:
         motion_type = cv2.MOTION_HOMOGRAPHY
-        warp = np.asarray(init_matrix, dtype=np.float32).reshape(3, 3).copy()
+        warp = np.asarray(init_s, dtype=np.float32).reshape(3, 3).copy()
     else:
         motion_type = cv2.MOTION_AFFINE
-        warp = np.asarray(init_matrix, dtype=np.float32).reshape(2, 3).copy()
+        warp = np.asarray(init_s, dtype=np.float32).reshape(2, 3).copy()
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, int(max_iters), float(eps))
-    cc, warp = cv2.findTransformECC(
-        templateImage=template.astype(np.float32),
-        inputImage=inp.astype(np.float32),
+    cc, warp_s = cv2.findTransformECC(
+        templateImage=template_s.astype(np.float32),
+        inputImage=inp_s.astype(np.float32),
         warpMatrix=warp,
         motionType=motion_type,
         criteria=criteria,
-        inputMask=mask_u8.astype(np.uint8),
+        inputMask=mask_s.astype(np.uint8),
         gaussFiltSize=int(gauss_filt_size),
     )
-    return warp.astype(np.float32), float(cc)
+    return transform_to_full_resolution(warp_s, cp_num, scale), float(cc)
 
 
 def refine_mask_by_structure_residual(
@@ -559,46 +818,47 @@ def refine_mask_by_structure_residual(
         "median_residual": float(np.median(vals)),
         "p90_residual": float(np.percentile(vals, 90.0)),
     })
-    return (new_mask.astype(np.uint8) * 255), stats
+    return new_mask.astype(np.uint8) * 255, stats
 
 
 def estimate_pair_structure_ecc_stable(
     target_y: np.ndarray,
     cam_warp_y: np.ndarray,
     valid_mask_u8: np.ndarray,
+    depth_img: np.ndarray,
     bitdepth: int,
-    cp_num: int,
-    structure_mode: str,
-    keep_percent: float,
-    mask_dilate: int,
-    log_gain: float,
-    pre_blur: int,
-    ecc_iters: int,
-    ecc_eps: float,
-    ecc_gauss: int,
-    ecc_rounds: int,
-    residual_keep_percent: float,
-    min_mask_count: int,
+    args: argparse.Namespace,
 ) -> tuple[np.ndarray, bool, Optional[float], np.ndarray, dict[str, Any], np.ndarray]:
-    template = make_structure_image(target_y, bitdepth, structure_mode, log_gain, pre_blur)
-    inp = make_structure_image(cam_warp_y, bitdepth, structure_mode, log_gain, pre_blur)
-    mask_u8, mask_stats = make_structure_mask_u8(template, valid_mask_u8, keep_percent, mask_dilate)
+    cp_num = int(args.ecc_cp_num)
+    template = make_structure_image(target_y, bitdepth, args.structure_mode, args.structure_log_gain, args.structure_pre_blur)
+    inp = make_structure_image(cam_warp_y, bitdepth, args.structure_mode, args.structure_log_gain, args.structure_pre_blur)
+    mask_u8, mask_stats = make_structure_mask_u8(template, valid_mask_u8, args.structure_keep_percent, args.structure_mask_dilate)
+    mask_u8, depth_edge_stats = apply_depth_edge_rejection(depth_img, mask_u8, args.depth_edge_keep_percentile)
+    mask_u8, static_stats = apply_initial_static_residual_mask(template, inp, mask_u8, args.static_residual_keep_percent, args.ecc_min_mask_count)
 
     stats: dict[str, Any] = {
-        "structure_mode": structure_mode,
-        "keep_percent": float(keep_percent),
-        "mask_dilate": int(mask_dilate),
-        "mask": mask_stats,
+        "motion_type": "homography" if cp_num == 4 else "affine",
+        "ecc_cp_num": cp_num,
+        "ecc_scale": float(args.ecc_scale),
+        "structure_mode": args.structure_mode,
+        "structure_keep_percent": float(args.structure_keep_percent),
+        "mask_dilate": int(args.structure_mask_dilate),
+        "structure_mask": mask_stats,
+        "depth_edge_rejection": depth_edge_stats,
+        "static_residual_mask": static_stats,
         "rounds": [],
     }
-    if np.count_nonzero(mask_u8) < int(min_mask_count):
+    if np.count_nonzero(mask_u8) < int(args.ecc_min_mask_count):
+        stats["success"] = False
+        stats["reason"] = "too_few_mask_pixels_before_ecc"
         return identity_transform(cp_num), False, None, mask_u8, stats, template
 
     M = identity_transform(cp_num)
     score: Optional[float] = None
     success = False
     base_mask_u8 = mask_u8.copy()
-    for r in range(max(1, int(ecc_rounds))):
+    rounds = max(1, int(args.structure_ecc_rounds))
+    for r in range(rounds):
         round_stats: dict[str, Any] = {"round": int(r), "mask_count_before": int(np.count_nonzero(mask_u8)), "success": False}
         try:
             M, score = run_find_transform_ecc_with_init(
@@ -606,10 +866,11 @@ def estimate_pair_structure_ecc_stable(
                 inp=inp,
                 mask_u8=mask_u8,
                 cp_num=cp_num,
-                init_matrix=M,
-                max_iters=ecc_iters,
-                eps=ecc_eps,
-                gauss_filt_size=ecc_gauss,
+                init_matrix_full=M,
+                max_iters=args.ecc_iters,
+                eps=args.ecc_eps,
+                gauss_filt_size=args.ecc_gauss,
+                ecc_scale=args.ecc_scale,
             )
             success = True
             round_stats["success"] = True
@@ -619,7 +880,7 @@ def estimate_pair_structure_ecc_stable(
             stats["rounds"].append(round_stats)
             break
 
-        if r < max(1, int(ecc_rounds)) - 1:
+        if r < rounds - 1:
             mask_u8, res_stats = refine_mask_by_structure_residual(
                 template=template,
                 inp=inp,
@@ -627,8 +888,8 @@ def estimate_pair_structure_ecc_stable(
                 current_mask_u8=mask_u8,
                 base_mask_u8=base_mask_u8,
                 cp_num=cp_num,
-                keep_percent=residual_keep_percent,
-                min_mask_count=min_mask_count,
+                keep_percent=args.structure_residual_keep_percent,
+                min_mask_count=args.ecc_min_mask_count,
             )
             round_stats["residual_refine"] = res_stats
             round_stats["mask_count_after"] = int(np.count_nonzero(mask_u8))
@@ -654,7 +915,7 @@ def apply_transform_points(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
         den = q[:, 2:3]
         den = np.where(np.abs(den) < 1e-8, 1e-8, den)
         return (q[:, :2] / den).astype(np.float32)
-    raise ValueError(f"bad transform shape: {M.shape}")
+    raise ValueError(f"Bad transform shape: {M.shape}")
 
 
 def transform_cp_bias(M: np.ndarray, w: int, h: int, cp_num: int) -> np.ndarray:
@@ -663,7 +924,7 @@ def transform_cp_bias(M: np.ndarray, w: int, h: int, cp_num: int) -> np.ndarray:
     elif int(cp_num) == 3:
         src = np.asarray([[0, 0], [w, 0], [0, h]], dtype=np.float32)
     else:
-        src = np.asarray([[0, 0], [w, 0]], dtype=np.float32)
+        raise ValueError("This batch refiner supports only 3CP affine or 4CP homography supervision.")
     return apply_transform_points(M, src) - src
 
 
@@ -679,7 +940,7 @@ def yuv_frame_index_for_poc(poc: int, frame_indices: np.ndarray, args: argparse.
 
 def collect_pair_observations(
     pair: tuple[int, int, float, str],
-    seq_yuv: str,
+    seq_yuv: str | Path,
     width: int,
     height: int,
     bitdepth: int,
@@ -690,7 +951,6 @@ def collect_pair_observations(
     depth: np.ndarray,
     args: argparse.Namespace,
     rng: np.random.Generator,
-    pair_out_dir: Optional[str] = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     target, ref, pair_weight, kind = pair
     target = int(target)
@@ -720,26 +980,17 @@ def collect_pair_observations(
         target_y=target_y,
         cam_warp_y=cam_warp,
         valid_mask_u8=base_mask_u8,
+        depth_img=depth_img,
         bitdepth=bitdepth,
-        cp_num=args.ecc_cp_num,
-        structure_mode=args.structure_mode,
-        keep_percent=args.structure_keep_percent,
-        mask_dilate=args.structure_mask_dilate,
-        log_gain=args.structure_log_gain,
-        pre_blur=args.structure_pre_blur,
-        ecc_iters=args.ecc_iters,
-        ecc_eps=args.ecc_eps,
-        ecc_gauss=args.ecc_gauss,
-        ecc_rounds=args.structure_ecc_rounds,
-        residual_keep_percent=args.structure_residual_keep_percent,
-        min_mask_count=args.ecc_min_mask_count,
+        args=args,
     )
 
     ys, xs = np.where(ecc_mask_u8 > 0)
     n_mask = int(xs.size)
     cp_bias = transform_cp_bias(M, width, height, args.ecc_cp_num).astype(np.float32)
+    cost_cam = calc_cost(target_y, cam_warp, valid, bitdepth)
 
-    if (not success) or n_mask < args.min_obs_per_pair:
+    if (not success) or n_mask < int(args.min_obs_per_pair):
         info = {
             "target": target,
             "ref": ref,
@@ -752,21 +1003,21 @@ def collect_pair_observations(
             "num_mask_pixels": n_mask,
             "num_observations": 0,
             "cp_bias_raw": cp_bias.astype(float).tolist(),
+            "base_cam_cost": cost_cam,
             "ecc_stats": ecc_stats,
         }
         return {"target": np.empty(0, np.int32)}, info
 
-    if args.max_obs_per_pair > 0 and xs.size > args.max_obs_per_pair:
+    if args.max_obs_per_pair > 0 and xs.size > int(args.max_obs_per_pair):
         sel = rng.choice(xs.size, size=int(args.max_obs_per_pair), replace=False)
         xs = xs[sel]
         ys = ys[sel]
 
     pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
     dst = apply_transform_points(M, pts)
-    bias = dst - pts
-    bias *= float(args.ecc_alpha)
+    bias = (dst - pts) * float(args.ecc_alpha)
     if float(args.ecc_bias_max_abs) > 0.0:
-        bias = np.clip(bias, -float(args.ecc_bias_max_abs), float(args.ecc_bias_max_abs))
+        bias = np.clip(bias, -float(args.ecc_bias_max_abs), float(args.ecc_bias_max_abs)).astype(np.float32)
 
     qx = map_x[ys, xs].astype(np.float32) + bias[:, 0]
     qy = map_y[ys, xs].astype(np.float32) + bias[:, 1]
@@ -778,16 +1029,33 @@ def collect_pair_observations(
         & (qx >= 0.0) & (qx <= width - 1.0)
         & (qy >= 0.0) & (qy <= height - 1.0)
     )
-
     xs = xs[ok]
     ys = ys[ok]
     qx = qx[ok]
     qy = qy[ok]
     dep = dep[ok]
+    if xs.size < int(args.min_obs_per_pair):
+        info = {
+            "target": target,
+            "ref": ref,
+            "target_yuv_idx": int(tar_yuv_idx),
+            "ref_yuv_idx": int(ref_yuv_idx),
+            "pair_weight": float(pair_weight),
+            "kind": kind,
+            "success": bool(success),
+            "ecc_cc": None if cc is None else float(cc),
+            "num_mask_pixels": n_mask,
+            "num_observations": int(xs.size),
+            "reason": "too_few_after_filter",
+            "cp_bias_raw": cp_bias.astype(float).tolist(),
+            "base_cam_cost": cost_cam,
+            "ecc_stats": ecc_stats,
+        }
+        return {"target": np.empty(0, np.int32)}, info
+
     structure_w = 0.25 + structure[ys, xs].astype(np.float32)
     cc_w = 1.0 if cc is None or not np.isfinite(cc) else float(max(0.05, min(2.0, cc + 1.0)))
     weights = structure_w * cc_w * float(pair_weight)
-
     obs = {
         "target": np.full(xs.shape[0], target, dtype=np.int32),
         "ref": np.full(xs.shape[0], ref, dtype=np.int32),
@@ -798,17 +1066,6 @@ def collect_pair_observations(
         "depth": dep.astype(np.float32),
         "weight": weights.astype(np.float32),
     }
-
-    cost_cam = calc_cost(target_y, cam_warp, valid, bitdepth)
-    if pair_out_dir is not None:
-        ensure_dir(pair_out_dir)
-        tag = f"t{target:03d}_r{ref:03d}"
-        if not args.no_pair_debug_yuv:
-            write_yuv420_y_only(os.path.join(pair_out_dir, f"cam_base_{tag}.yuv"), cam_warp, bitdepth)
-        save_gray_png(os.path.join(pair_out_dir, f"cam_base_{tag}.png"), cam_warp, bitdepth)
-        mask_vis = np.where(ecc_mask_u8 > 0, (1 << bitdepth) - 1, 0).astype(np.float32)
-        save_gray_png(os.path.join(pair_out_dir, f"ecc_mask_{tag}.png"), mask_vis, bitdepth)
-
     info = {
         "target": target,
         "ref": ref,
@@ -861,6 +1118,7 @@ def robust_loss_from_err2(err2: torch.Tensor, loss_name: str, f_scale: float) ->
         return torch.where(err <= f, 0.5 * err * err, f * (err - 0.5 * f))
     if loss_name == "cauchy":
         return (f * f) * torch.log1p(err2 / (f * f))
+    # soft_l1
     return 2.0 * (f * f) * (torch.sqrt(1.0 + err2 / (f * f)) - 1.0)
 
 
@@ -895,9 +1153,7 @@ def fit_rf_tiny_t_w2c(
     t_base = torch.tensor(tvecs_base, device=device, dtype=dtype)
     r_delta = torch.nn.Parameter(torch.zeros_like(r_base))
     t_delta = torch.nn.Parameter(torch.zeros_like(t_base))
-    anchor = int(args.anchor_poc)
-    if anchor < 0:
-        anchor = 0
+    anchor = int(args.anchor_poc if args.anchor_poc >= 0 else 0)
     if not (0 <= anchor < n_frames):
         raise ValueError(f"--anchor-poc {anchor} out of range N={n_frames}")
 
@@ -913,38 +1169,26 @@ def fit_rf_tiny_t_w2c(
         f0 = 0.5 * (f_base_x + f_base_y)
 
     focal_mode = str(args.focal_mode)
-    log_f_delta: Optional[torch.nn.Parameter]
     if focal_mode == "single":
-        log_f_delta = torch.nn.Parameter(torch.zeros(1, device=device, dtype=dtype))
-        params = [
-            {"params": [r_delta], "lr": float(args.lr_rot)},
-            {"params": [t_delta], "lr": float(args.lr_trans)},
-            {"params": [log_f_delta], "lr": float(args.lr_focal)},
-        ]
+        log_f_delta: Optional[torch.nn.Parameter] = torch.nn.Parameter(torch.zeros(1, device=device, dtype=dtype))
     elif focal_mode == "separate":
         log_f_delta = torch.nn.Parameter(torch.zeros(2, device=device, dtype=dtype))
-        params = [
-            {"params": [r_delta], "lr": float(args.lr_rot)},
-            {"params": [t_delta], "lr": float(args.lr_trans)},
-            {"params": [log_f_delta], "lr": float(args.lr_focal)},
-        ]
     elif focal_mode == "fixed":
         log_f_delta = None
-        params = [
-            {"params": [r_delta], "lr": float(args.lr_rot)},
-            {"params": [t_delta], "lr": float(args.lr_trans)},
-        ]
     else:
         raise ValueError(focal_mode)
 
-    if args.freeze_t:
-        t_delta.requires_grad_(False)
-        params = [{"params": [r_delta], "lr": float(args.lr_rot)}]
-        if log_f_delta is not None:
-            params.append({"params": [log_f_delta], "lr": float(args.lr_focal)})
-    if args.freeze_r:
+    params: list[dict[str, Any]] = []
+    if not args.freeze_r:
+        params.append({"params": [r_delta], "lr": float(args.lr_rot)})
+    else:
         r_delta.requires_grad_(False)
-        params = [g for g in params if g["params"][0] is not r_delta]
+    if not args.freeze_t:
+        params.append({"params": [t_delta], "lr": float(args.lr_trans)})
+    else:
+        t_delta.requires_grad_(False)
+    if log_f_delta is not None:
+        params.append({"params": [log_f_delta], "lr": float(args.lr_focal)})
     if not params:
         raise RuntimeError("No trainable parameters: check --freeze-r/--freeze-t/--focal-mode fixed.")
 
@@ -1023,18 +1267,26 @@ def fit_rf_tiny_t_w2c(
         return torch.sum(ww * pix) / (torch.sum(ww) + 1e-12) + regularization()
 
     @torch.no_grad()
-    def eval_all(batch: int) -> np.ndarray:
-        out = np.full(n_obs, np.inf, dtype=np.float64)
+    def eval_all(batch: int) -> dict[str, Any]:
+        errs: list[np.ndarray] = []
         for s in range(0, n_obs, int(batch)):
             e = min(n_obs, s + int(batch))
             idx_np = np.arange(s, e, dtype=np.int64)
-            u, v, z = project_indices(idx_np)
             idx = torch.tensor(idx_np, device=device, dtype=torch.long)
+            u, v, z = project_indices(idx_np)
             err = torch.sqrt((u - qx[idx]) ** 2 + (v - qy[idx]) ** 2).detach().cpu().numpy()
             zz = z.detach().cpu().numpy()
             err[zz * float(args.z_sign) <= args.z_min] = np.inf
-            out[s:e] = err
-        return out
+            errs.append(err)
+        err_all = np.concatenate(errs, axis=0)
+        finite = np.isfinite(err_all)
+        return {
+            "count": int(np.count_nonzero(finite)),
+            "mean": float(np.mean(err_all[finite])) if np.any(finite) else None,
+            "median": float(np.median(err_all[finite])) if np.any(finite) else None,
+            "p90": float(np.percentile(err_all[finite], 90)) if np.any(finite) else None,
+            "p95": float(np.percentile(err_all[finite], 95)) if np.any(finite) else None,
+        }
 
     report: dict[str, Any] = {
         "device": str(device),
@@ -1042,16 +1294,26 @@ def fit_rf_tiny_t_w2c(
         "num_observations": int(n_obs),
         "anchor_poc": int(anchor),
         "focal_mode": focal_mode,
-        "f_init": args.f_init,
+        "f_init": str(args.f_init),
         "f0": float(f0),
         "iterations": [],
     }
 
     for step in range(int(args.steps)):
-        idx = choose_batch_indices(n_obs, int(args.batch_size), rng)
+        idx_np = choose_batch_indices(n_obs, int(args.batch_size), rng)
         opt.zero_grad(set_to_none=True)
-        loss = loss_for_batch(idx)
+        
+
+        loss = loss_for_batch(idx_np)
+        if not torch.isfinite(loss):
+            log(f"RF step {step:04d}/{args.steps}: non-finite loss={float(loss.detach().cpu())}; stop fitting and keep current parameters")
+            break
+        
         loss.backward()
+
+
+
+      
         if args.grad_clip > 0:
             train_params = [p for g in params for p in g["params"] if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(train_params, float(args.grad_clip))
@@ -1065,15 +1327,7 @@ def fit_rf_tiny_t_w2c(
                 log_f_delta.clamp_(-float(args.f_log_max_delta), float(args.f_log_max_delta))
 
         if step % max(1, int(args.log_every)) == 0 or step == int(args.steps) - 1:
-            err = eval_all(batch=int(args.eval_batch_size))
-            finite = np.isfinite(err)
-            stat = {
-                "count": int(np.count_nonzero(finite)),
-                "mean": float(np.mean(err[finite])) if np.any(finite) else None,
-                "median": float(np.median(err[finite])) if np.any(finite) else None,
-                "p90": float(np.percentile(err[finite], 90)) if np.any(finite) else None,
-                "p95": float(np.percentile(err[finite], 95)) if np.any(finite) else None,
-            }
+            stat = eval_all(batch=int(args.eval_batch_size))
             _, _, fx_cur, fy_cur = current_params()
             info = {
                 "step": int(step),
@@ -1085,19 +1339,9 @@ def fit_rf_tiny_t_w2c(
                 "max_abs_t_delta": float(torch.max(torch.abs(t_delta)).detach().cpu()),
             }
             report["iterations"].append(info)
-            print("[RF REFINE]")
-            print(json.dumps(info, indent=2))
+            log(f"RF step {step:04d}/{args.steps}: loss={info['loss']:.6f}, mean={stat['mean']}, p95={stat['p95']}, fx={info['fx']:.4f}, fy={info['fy']:.4f}")
 
-    final_err = eval_all(batch=int(args.eval_batch_size))
-    finite = np.isfinite(final_err)
-    report["final_residual_px"] = {
-        "count": int(np.count_nonzero(finite)),
-        "mean": float(np.mean(final_err[finite])) if np.any(finite) else None,
-        "median": float(np.median(final_err[finite])) if np.any(finite) else None,
-        "p90": float(np.percentile(final_err[finite], 90)) if np.any(finite) else None,
-        "p95": float(np.percentile(final_err[finite], 95)) if np.any(finite) else None,
-    }
-
+    report["final_residual_px"] = eval_all(batch=int(args.eval_batch_size))
     with torch.no_grad():
         r_final, t_final, fx_final, fy_final = current_params()
         K_final = np.array([
@@ -1109,84 +1353,36 @@ def fit_rf_tiny_t_w2c(
 
 
 # ============================================================
-# Rendering and final outputs
+# Output writing
 # ============================================================
 
-def render_refined_pairs(
-    pairs: list[tuple[int, int, float, str]],
-    seq_yuv: str,
-    width: int,
-    height: int,
-    bitdepth: int,
-    frame_indices: np.ndarray,
-    K_base: np.ndarray,
-    r_base: np.ndarray,
-    t_base: np.ndarray,
-    K_final: np.ndarray,
-    r_final: np.ndarray,
-    t_final: np.ndarray,
-    depth: np.ndarray,
-    out_dir: str,
-    args: argparse.Namespace,
-) -> list[dict[str, Any]]:
-    ensure_dir(out_dir)
-    costs = []
-    for target, ref, pair_weight, kind in pairs:
-        tar_yuv_idx = yuv_frame_index_for_poc(target, frame_indices, args)
-        ref_yuv_idx = yuv_frame_index_for_poc(ref, frame_indices, args)
-        target_y = read_y_frame(seq_yuv, width, height, bitdepth, tar_yuv_idx)
-        ref_y = read_y_frame(seq_yuv, width, height, bitdepth, ref_yuv_idx)
-        depth_img = depth[int(target)]
-        bx, by, bvalid = camera_map_w2c_np(target, ref, width, height, K_base, r_base, t_base, depth_img, args.z_sign, args.z_min, args.render_row_batch)
-        fx, fy, fvalid = camera_map_w2c_np(target, ref, width, height, K_final, r_final, t_final, depth_img, args.z_sign, args.z_min, args.render_row_batch)
-        pred_base = remap_y(ref_y, bx, by)
-        pred_final = remap_y(ref_y, fx, fy)
-        cost_base = calc_cost(target_y, pred_base, bvalid, bitdepth)
-        cost_final = calc_cost(target_y, pred_final, fvalid, bitdepth)
-        tag = f"t{target:03d}_r{ref:03d}"
-        if not args.no_render_yuv:
-            write_yuv420_y_only(os.path.join(out_dir, f"pred_refined_{tag}.yuv"), pred_final, bitdepth)
-        save_gray_png(os.path.join(out_dir, f"pred_refined_{tag}.png"), pred_final, bitdepth)
-        costs.append({
-            "target": int(target),
-            "ref": int(ref),
-            "target_yuv_idx": int(tar_yuv_idx),
-            "ref_yuv_idx": int(ref_yuv_idx),
-            "pair_weight": float(pair_weight),
-            "kind": kind,
-            "base_cost": cost_base,
-            "refined_cost": cost_final,
-            "psnr_gain_vs_base": None if (cost_base["psnr"] is None or cost_final["psnr"] is None) else float(cost_final["psnr"] - cost_base["psnr"]),
-        })
-        print("[PAIR RENDER COST]")
-        print(json.dumps(costs[-1], indent=2))
-    return costs
-
-
-def write_refined_camera_jsonl(
-    path: str | Path,
-    source_npz: str,
-    source_camera_jsonl: Optional[str],
+def write_camera_jsonl_canonical(
+    path: Path,
+    source_npz: Path,
+    source_camera_jsonl: Optional[Path],
     frame_indices: np.ndarray,
     K_final: np.ndarray,
     r_final: np.ndarray,
     t_final: np.ndarray,
     z_sign: float,
     copied_header: Optional[dict[str, Any]],
-    args: argparse.Namespace,
+    depth_yuv_meta: Optional[dict[str, Any]],
+    refine_report_summary: dict[str, Any],
 ) -> None:
+    ensure_parent(path)
     R_all = all_rotation_matrices_np(r_final)
-    depth_output = None
+    copied_depth = None
     if copied_header is not None:
-        depth_output = copied_header.get("depth_output") or copied_header.get("depth_yuv")
+        copied_depth = copied_header.get("depth_output") or copied_header.get("depth_yuv")
+    depth_output = depth_yuv_meta if depth_yuv_meta is not None else copied_depth
     header = {
         "type": "header",
-        "format": "fixedK_gop_nn_rf_refine_v1",
+        "format": "fixedK_gop_nn_affine_cp_rf_refine_v1",
         "source_npz": os.path.abspath(source_npz),
         "source_camera_jsonl": os.path.abspath(source_camera_jsonl) if source_camera_jsonl else None,
         "frame_count": int(len(frame_indices)),
         "frame_indices": frame_indices.astype(int).tolist(),
-        "intrinsic_mode": "rap_fixed_rf_refined",
+        "intrinsic_mode": "rap_fixed_affine_cp_rf_refined",
         "intrinsic": {
             "fx": float(K_final[0, 0]),
             "fy": float(K_final[1, 1]),
@@ -1202,13 +1398,10 @@ def write_refined_camera_jsonl(
             "adjacent_current_to_previous_fields": "also written for compatibility",
         },
         "depth_output": depth_output,
-        "refinement": {
-            "description": "R/focal/tiny-t refinement from structure-ECC pair homography pseudo-GT; depth unchanged.",
-            "options": {k: v for k, v in vars(args).items() if k not in ("input",)},
-        },
+        "refinement": refine_report_summary,
     }
     with open(path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(header, ensure_ascii=False) + "\n")
+        f.write(json.dumps(to_jsonable(header), ensure_ascii=False) + "\n")
         for i in range(len(frame_indices)):
             rec: dict[str, Any] = {
                 "poc": int(i),
@@ -1226,54 +1419,327 @@ def write_refined_camera_jsonl(
                 rv, _ = cv2.Rodrigues(R_rel.astype(np.float64))
                 rec["rvec_current_to_previous"] = rv.reshape(3).astype(float).tolist()
                 rec["tvec_current_to_previous"] = t_rel.astype(float).tolist()
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.write(json.dumps(to_jsonable(rec), ensure_ascii=False) + "\n")
 
 
-def write_minimal_npz(path: str | Path, stage: dict[str, Any], K_final: np.ndarray, r_final: np.ndarray, t_final: np.ndarray, args: argparse.Namespace) -> None:
-    payload: dict[str, Any] = {
-        "frame_indices": stage["frame_indices"].astype(np.int32),
-        "K_base": stage["K"].astype(np.float32),
-        "K_refined": K_final.astype(np.float32),
-        "K_fixed": K_final.astype(np.float32),
-        "rvec_abs_base": stage["rvecs"].astype(np.float32),
-        "tvec_abs_base": stage["tvecs"].astype(np.float32),
-        "rvec_abs_refined": r_final.astype(np.float32),
-        "tvec_abs_refined": t_final.astype(np.float32),
-        "rvec_abs_final": r_final.astype(np.float32),
-        "tvec_abs_final": t_final.astype(np.float32),
-        "source_stage1_npz": np.asarray(stage["npz_path"], dtype=object),
+def copy_or_write_depth_yuv(stage: dict[str, Any], src_depth_yuv: Optional[Path], out_depth_yuv: Path, copied_header: Optional[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+    ensure_parent(out_depth_yuv)
+    if src_depth_yuv is not None and src_depth_yuv.is_file():
+        if src_depth_yuv.resolve() != out_depth_yuv.resolve():
+            shutil.copy2(src_depth_yuv, out_depth_yuv)
+        meta = None
+        if copied_header is not None:
+            meta = copied_header.get("depth_output") or copied_header.get("depth_yuv")
+        if isinstance(meta, dict):
+            out = dict(meta)
+            out["depth_yuv"] = str(out_depth_yuv)
+            out["copied_from"] = str(src_depth_yuv)
+            return out
+        return {
+            "depth_yuv": str(out_depth_yuv),
+            "depth_yuv_format": "yuv420p10le",
+            "depth_yuv_semantics": "copied unchanged from source canonicalize output",
+            "copied_from": str(src_depth_yuv),
+        }
+    # Fallback if canonical depth YUV is missing.
+    scale_meta = choose_depth_scale_fixed_point(stage["depth"], args.depth_scale_percentile, args.depth_scale_precision, 10)
+    return write_depth_yuv420p10le_linear(out_depth_yuv, stage["depth"], scale_meta)
+
+
+def write_refined_geometry_npz(out_npz: Path, stage: dict[str, Any], K_final: np.ndarray, r_final: np.ndarray, t_final: np.ndarray, result: dict[str, Any], args: argparse.Namespace) -> None:
+    ensure_parent(out_npz)
+    data = stage["data"]
+    payload: dict[str, Any] = {}
+    for k in data.files:
+        payload[k] = data[k]
+    # Preserve canonical key names, but replace final geometry with refined values.
+    payload["K_before_affine_cp_rf"] = stage["K"].astype(np.float32)
+    payload["rvec_abs_before_affine_cp_rf"] = stage["rvecs"].astype(np.float32)
+    payload["tvec_abs_before_affine_cp_rf"] = stage["tvecs"].astype(np.float32)
+    payload["K_fixed"] = K_final.astype(np.float32)
+    payload["K_refined"] = K_final.astype(np.float32)
+    payload["rvec_abs_refined"] = r_final.astype(np.float32)
+    payload["tvec_abs_refined"] = t_final.astype(np.float32)
+    payload["rvec_abs_final"] = r_final.astype(np.float32)
+    payload["tvec_abs_final"] = t_final.astype(np.float32)
+    payload["affine_cp_rf_refine_result_json"] = np.asarray(json.dumps(to_jsonable(result), ensure_ascii=False), dtype=object)
+    if args.compressed_npz:
+        np.savez_compressed(out_npz, **payload)
+    else:
+        np.savez(out_npz, **payload)
+
+
+def write_manifest(out_manifest: Path, source_npz: Path, sidecars: dict[str, Optional[Path]], out_paths: dict[str, Path], stage: dict[str, Any], K_final: np.ndarray, result: dict[str, Any], depth_meta: dict[str, Any], args: argparse.Namespace) -> None:
+    ensure_parent(out_manifest)
+    manifest = {
+        "source_npz": os.path.abspath(source_npz),
+        "source_camera_jsonl": os.path.abspath(sidecars["camera_jsonl"]) if sidecars.get("camera_jsonl") else None,
+        "source_depth_yuv": os.path.abspath(sidecars["depth_yuv"]) if sidecars.get("depth_yuv") else None,
+        "outputs": {k: os.path.abspath(v) for k, v in out_paths.items()},
+        "frame_count": int(stage["depth"].shape[0]),
+        "size": {"width": int(stage["depth"].shape[2]), "height": int(stage["depth"].shape[1])},
+        "K_before_affine_cp_rf": stage["K"].astype(float).tolist(),
+        "K_final": K_final.astype(float).tolist(),
+        "depth_yuv": depth_meta,
+        "affine_cp_rf_refine": result,
+        "options": vars(args),
     }
-    if args.save_depth_in_npz:
-        payload["depth_canonical"] = stage["depth"].astype(np.float32)
-    np.savez(path, **payload)
+    with open(out_manifest, "w", encoding="utf-8") as f:
+        json.dump(to_jsonable(manifest), f, indent=2, ensure_ascii=False)
+        f.write("\n")
 
 
 # ============================================================
-# Main
+# Sequence YUV resolution
 # ============================================================
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Source YUV420 sequence")
-    ap.add_argument("--width", type=int, required=True)
-    ap.add_argument("--height", type=int, required=True)
-    ap.add_argument("--bitdepth", type=int, choices=[8, 10], required=True)
-    ap.add_argument("--stage1-npz", "--geometry-npz", required=True, help="*_fixedK_gop_nn_geometry.npz from optimize_fixedK_rt_depth_nn_gop_smooth_predloss.py")
-    ap.add_argument("--stage1-camera-jsonl", default="", help="Optional *_fixedK_gop_nn_cam.jsonl, only for metadata copy")
-    ap.add_argument("--output-dir", required=True)
-    ap.add_argument("--pairs", default="", help="Optional pair list: target:ref[:weight], e.g. 8:0:2,8:16:2")
-    ap.add_argument("--pair-source", choices=["npz", "dyadic", "all"], default="npz", help="Default uses pairs_json from NPZ, fallback to dyadic if absent")
+def resolve_seq_yuv_for_npz(geometry_npz: Path, src_root: Path, args: argparse.Namespace) -> Optional[Path]:
+    base = derive_base_from_geometry_npz(geometry_npz)
+    if args.seq_yuv:
+        p = Path(args.seq_yuv).expanduser().resolve()
+        return p if p.is_file() else None
+    rel_key = str(geometry_npz.relative_to(src_root)) if src_root in geometry_npz.parents or geometry_npz == src_root else str(geometry_npz)
+    if args.seq_yuv_map_json:
+        with open(args.seq_yuv_map_json, "r", encoding="utf-8") as f:
+            mp = json.load(f)
+        for k in [str(geometry_npz), rel_key, base, geometry_npz.stem]:
+            if k in mp:
+                p = Path(mp[k]).expanduser().resolve()
+                return p if p.is_file() else None
+    if args.seq_yuv_root:
+        root = Path(args.seq_yuv_root).expanduser().resolve()
+        candidates: list[Path] = []
+        try:
+            rel_dir = geometry_npz.parent.relative_to(src_root)
+            candidates.extend([
+                root / rel_dir / f"{base}.yuv",
+                root / rel_dir / f"{base}{args.seq_yuv_suffix}",
+            ])
+        except Exception:
+            pass
+        candidates.extend([root / f"{base}.yuv", root / f"{base}{args.seq_yuv_suffix}"])
+        for c in candidates:
+            if c.is_file():
+                return c.resolve()
+        hits = sorted(root.rglob(f"*{base}*.yuv"))
+        if hits:
+            return hits[0].resolve()
+    return None
+
+
+# ============================================================
+# Main per-file pipeline
+# ============================================================
+
+def run_one(geometry_npz: Path, src_root: Path, out_prefix: Path, args: argparse.Namespace) -> int:
+    out_paths = canonical_paths_from_prefix(out_prefix)
+    for p in out_paths.values():
+        if p.exists():
+            if args.force:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+            else:
+                raise RuntimeError(f"Output exists: {p}. Use --force.")
+        ensure_parent(p)
+
+    sidecars = find_canonical_sidecars(geometry_npz)
+    seq_yuv = resolve_seq_yuv_for_npz(geometry_npz, src_root, args)
+    if seq_yuv is None:
+        raise RuntimeError("Sequence YUV not found. Provide --seq-yuv, --seq-yuv-root, or --seq-yuv-map-json.")
+
+    stage = load_canonical_npz(geometry_npz)
+    K_base = stage["K"]
+    r_base = stage["rvecs"]
+    t_base = stage["tvecs"]
+    depth = stage["depth"]
+    frame_indices = stage["frame_indices"]
+    n, h, w = depth.shape
+
+    if args.width is not None and int(args.width) != w:
+        raise ValueError(f"--width {args.width} != NPZ width {w}")
+    if args.height is not None and int(args.height) != h:
+        raise ValueError(f"--height {args.height} != NPZ height {h}")
+
+    seq_count = count_frames_yuv420(seq_yuv, w, h, args.bitdepth)
+    if seq_count <= 0:
+        raise RuntimeError(f"Sequence YUV has no full frames: {seq_yuv}")
+
+    copied_header = load_first_jsonl_object(sidecars.get("camera_jsonl"))
+    pairs = build_pair_list(args, stage)
+    rng = np.random.default_rng(int(args.seed))
+    log(f"Loaded canonical NPZ: frames={n}, size={w}x{h}, pairs={len(pairs)}, seq_yuv={seq_yuv}")
+    log(f"K base: fx={K_base[0,0]:.6f}, fy={K_base[1,1]:.6f}, focal_mode={args.focal_mode}")
+
+    pair_info: list[dict[str, Any]] = []
+    obs_list: list[dict[str, np.ndarray]] = []
+    for idx, pair in enumerate(pairs, start=1):
+        target, ref, weight, kind = pair
+        tar_yuv_idx = yuv_frame_index_for_poc(target, frame_indices, args)
+        ref_yuv_idx = yuv_frame_index_for_poc(ref, frame_indices, args)
+        if tar_yuv_idx < 0 or tar_yuv_idx >= seq_count or ref_yuv_idx < 0 or ref_yuv_idx >= seq_count:
+            info = {
+                "target": int(target),
+                "ref": int(ref),
+                "success": False,
+                "reason": "yuv_index_out_of_range",
+                "target_yuv_idx": int(tar_yuv_idx),
+                "ref_yuv_idx": int(ref_yuv_idx),
+            }
+            pair_info.append(info)
+            log(f"PAIR {idx:03d}/{len(pairs):03d} {target}->{ref}: skip yuv index out of range")
+            continue
+        log(f"PAIR ECC {idx:03d}/{len(pairs):03d}: target={target}, ref={ref}, weight={weight:.4g}, kind={kind}")
+        obs, info = collect_pair_observations(
+            pair=pair,
+            seq_yuv=seq_yuv,
+            width=w,
+            height=h,
+            bitdepth=args.bitdepth,
+            frame_indices=frame_indices,
+            K_base=K_base,
+            rvecs_base=r_base,
+            tvecs_base=t_base,
+            depth=depth,
+            args=args,
+            rng=rng,
+        )
+        pair_info.append(info)
+        if obs.get("target", np.empty(0)).size > 0:
+            obs_list.append(obs)
+        log(f"PAIR result {target}->{ref}: success={info.get('success')}, cc={info.get('ecc_cc')}, obs={info.get('num_observations')}, base_psnr={None if info.get('base_cam_cost') is None else info['base_cam_cost'].get('psnr')}")
+
+    if not obs_list:
+        raise RuntimeError("No valid pair ECC observations were generated.")
+    observations = concat_observations(obs_list)
+    log(f"Total observations: {observations['px'].shape[0]}")
+
+    K_final, r_final, t_final, fit_report = fit_rf_tiny_t_w2c(observations, r_base, t_base, K_base, args)
+
+    result = {
+        "method": {
+            "description": "Batch affine-CP RF refinement from canonicalized fixedK GOP NN-depth NPZ. Depth is unchanged; fits focal and W2C R|t from pair-wise structure-ECC affine CP pseudo-GT.",
+            "depth": "fixed depth_canonical from input canonical NPZ",
+            "supervision": "q_gt = base_camera_map + alpha * ECC_affine_bias(x,y)",
+            "pose_convention": "camera_from_world / W2C: X_cam=R X_world+t",
+            "relative_formula": "R_rel=R_ref@R_target.T; t_rel=t_ref-R_rel@t_target",
+            "coordinate": "target pixel -> ref pixel",
+        },
+        "input": {
+            "geometry_npz": str(geometry_npz),
+            "camera_jsonl": str(sidecars["camera_jsonl"]) if sidecars.get("camera_jsonl") else None,
+            "depth_yuv": str(sidecars["depth_yuv"]) if sidecars.get("depth_yuv") else None,
+            "seq_yuv": str(seq_yuv),
+        },
+        "size": {"width": int(w), "height": int(h)},
+        "frame_indices": frame_indices.astype(int).tolist(),
+        "stage_source_keys": stage["source_keys"],
+        "options": vars(args),
+        "K_base": K_base.astype(float).tolist(),
+        "K_refined": K_final.astype(float).tolist(),
+        "focal_delta": {
+            "fx_base": float(K_base[0, 0]),
+            "fy_base": float(K_base[1, 1]),
+            "fx_refined": float(K_final[0, 0]),
+            "fy_refined": float(K_final[1, 1]),
+            "fx_ratio": float(K_final[0, 0] / K_base[0, 0]),
+            "fy_ratio": float(K_final[1, 1] / K_base[1, 1]),
+            "fxfy_base_ratio": float(K_base[0, 0] / K_base[1, 1]),
+            "fxfy_refined_ratio": float(K_final[0, 0] / K_final[1, 1]),
+        },
+        "pairs": pair_info,
+        "fit_report": fit_report,
+    }
+
+    depth_meta = copy_or_write_depth_yuv(stage, sidecars.get("depth_yuv"), out_paths["depth_yuv"], copied_header, args)
+    summary = {
+        "description": "affine CP R|t/focal refinement; canonical output naming preserved",
+        "focal_mode": args.focal_mode,
+        "ecc_cp_num": int(args.ecc_cp_num),
+        "pair_source": args.pair_source,
+        "num_pairs": len(pairs),
+        "num_valid_pair_observation_sets": len(obs_list),
+        "total_observations": int(observations["px"].shape[0]),
+        "K_base": K_base.astype(float).tolist(),
+        "K_refined": K_final.astype(float).tolist(),
+    }
+    write_camera_jsonl_canonical(
+        out_paths["camera_jsonl"],
+        source_npz=geometry_npz,
+        source_camera_jsonl=sidecars.get("camera_jsonl"),
+        frame_indices=frame_indices,
+        K_final=K_final,
+        r_final=r_final,
+        t_final=t_final,
+        z_sign=args.z_sign,
+        copied_header=copied_header,
+        depth_yuv_meta=depth_meta,
+        refine_report_summary=summary,
+    )
+    result["outputs"] = {k: str(v) for k, v in out_paths.items()}
+    result["depth_yuv"] = depth_meta
+    write_refined_geometry_npz(out_paths["geometry_npz"], stage, K_final, r_final, t_final, result, args)
+    write_manifest(out_paths["manifest"], geometry_npz, sidecars, out_paths, stage, K_final, result, depth_meta, args)
+
+    print("============================================================")
+    print("Affine-CP RF refine done")
+    print("============================================================")
+    print(f"input geometry : {geometry_npz}")
+    print(f"seq yuv        : {seq_yuv}")
+    print(f"frames         : {n}")
+    print(f"size           : {w}x{h}")
+    print(f"focal mode     : {args.focal_mode}")
+    print(f"K base         : fx={K_base[0,0]:.6f}, fy={K_base[1,1]:.6f}")
+    print(f"K refined      : fx={K_final[0,0]:.6f}, fy={K_final[1,1]:.6f}")
+    print(f"geometry npz   : {out_paths['geometry_npz']}")
+    print(f"camera jsonl   : {out_paths['camera_jsonl']}")
+    print(f"depth yuv      : {out_paths['depth_yuv']}")
+    print(f"manifest       : {out_paths['manifest']}")
+    print("============================================================")
+    return 0
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Batch affine-CP R|t/focal refinement for canonical fixedK GOP NN-depth outputs.")
+
+    # Batch I/O
+    ap.add_argument("--src-root", required=True, help="Folder containing canonicalize outputs")
+    ap.add_argument("--dst-root", required=True, help="Output root. Canonical filenames are preserved under this root.")
+    ap.add_argument("--pattern", default=f"*{GEOM_SUFFIX}", help=f"Input geometry NPZ pattern. Default: *{GEOM_SUFFIX}")
+    ap.add_argument("--layout", choices=["preserve", "flat"], default="preserve")
+    ap.add_argument("--force", action="store_true", help="Overwrite dst outputs")
+    ap.add_argument("--skip-invalid", action="store_true")
+    ap.add_argument("--continue-on-error", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--compressed-npz", action="store_true")
+
+    # Original sequence YUV resolution.
+    ap.add_argument("--seq-yuv", default="", help="Use one source YUV for all NPZs. Good for single-sequence run.")
+    ap.add_argument("--seq-yuv-root", default="", help="Root to auto-search source YUV for each NPZ.")
+    ap.add_argument("--seq-yuv-map-json", default="", help="JSON dict mapping full path / relative path / base name to source YUV path.")
+    ap.add_argument("--seq-yuv-suffix", default=".yuv")
+    ap.add_argument("--bitdepth", type=int, choices=[8, 10], default=10)
+    ap.add_argument("--width", type=int, default=None, help="Optional sanity check against NPZ depth width")
+    ap.add_argument("--height", type=int, default=None, help="Optional sanity check against NPZ depth height")
+    ap.add_argument("--seq-start", type=int, default=0)
+    ap.add_argument("--frame-index-mode", choices=["local", "frame_indices"], default="local", help="local: YUV idx=seq_start+poc. frame_indices: YUV idx=seq_start+frame_indices[poc]")
+
+    # Pair selection.
+    ap.add_argument("--pairs", default="", help="Optional pair list: target:ref[:weight], e.g. 16:0:2,16:32:2")
+    ap.add_argument("--pair-source", choices=["npz", "adjacent", "dyadic", "all"], default="npz")
     ap.add_argument("--pair-weight", type=float, default=1.0)
     ap.add_argument("--no-bidirectional-pairs", action="store_true")
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1234)
 
-    # YUV frame indexing.
-    ap.add_argument("--seq-start", type=int, default=0)
-    ap.add_argument("--frame-index-mode", choices=["local", "frame_indices"], default="local", help="local: YUV idx=seq_start+poc. frame_indices: YUV idx=seq_start+frame_indices[poc]")
-
     # ECC pair residual extraction.
-    ap.add_argument("--ecc-cp-num", type=int, choices=[3, 4], default=4, help="4=homography, 3=affine")
+    ap.add_argument("--ecc-cp-num", type=int, choices=[3, 4], default=3, help="3=affine CP, 4=homography supervision")
+    ap.add_argument("--ecc-scale", type=float, default=1.0, help="Run ECC at scaled resolution, then convert transform back to full resolution. 1.0 matches full-res behavior.")
     ap.add_argument("--structure-mode", choices=["scharr_mag", "scharr_l1", "scharr_x", "scharr_y", "scharr_x_weighted"], default="scharr_mag")
     ap.add_argument("--structure-keep-percent", type=float, default=35.0)
     ap.add_argument("--structure-mask-dilate", type=int, default=1)
@@ -1281,16 +1747,17 @@ def main() -> None:
     ap.add_argument("--structure-pre-blur", type=int, default=0)
     ap.add_argument("--structure-ecc-rounds", type=int, default=2)
     ap.add_argument("--structure-residual-keep-percent", type=float, default=80.0)
+    ap.add_argument("--static-residual-keep-percent", type=float, default=100.0, help="Pre-ECC low residual static mask. 100 disables; 70 keeps lowest 70%% residual among structure pixels.")
+    ap.add_argument("--depth-edge-keep-percentile", type=float, default=100.0, help="Reject target depth-edge pixels above this percentile. 100 disables; 90 rejects top 10%%.")
     ap.add_argument("--ecc-valid-erode", type=int, default=2)
     ap.add_argument("--ecc-iters", type=int, default=80)
     ap.add_argument("--ecc-eps", type=float, default=1e-5)
     ap.add_argument("--ecc-gauss", type=int, default=5)
     ap.add_argument("--ecc-min-mask-count", type=int, default=100)
-    ap.add_argument("--ecc-alpha", type=float, default=1.0, help="Pseudo-GT damping: q_gt = base_map + alpha * H_bias")
-    ap.add_argument("--ecc-bias-max-abs", type=float, default=0.0, help="Clamp H bias per sampled pixel. <=0 disables")
+    ap.add_argument("--ecc-alpha", type=float, default=1.0)
+    ap.add_argument("--ecc-bias-max-abs", type=float, default=16.0, help="Clamp affine/homography bias per sampled pixel. <=0 disables")
     ap.add_argument("--max-obs-per-pair", type=int, default=25000)
     ap.add_argument("--min-obs-per-pair", type=int, default=500)
-    ap.add_argument("--no-pair-debug-yuv", action="store_true")
 
     # Fitting.
     ap.add_argument("--device", default="auto")
@@ -1301,7 +1768,7 @@ def main() -> None:
     ap.add_argument("--lr-rot", type=float, default=5e-4)
     ap.add_argument("--lr-trans", type=float, default=5e-5)
     ap.add_argument("--lr-focal", type=float, default=2e-4)
-    ap.add_argument("--focal-mode", choices=["single", "separate", "fixed"], default="single", help="single => fx=fy=f, separate => fx/fy free, fixed => K fixed")
+    ap.add_argument("--focal-mode", choices=["single", "separate", "fixed"], default="single", help="single forces fx=fy=f. This is the 1:1 focal option.")
     ap.add_argument("--f-init", choices=["avg", "geom", "fx", "fy"], default="avg")
     ap.add_argument("--f-log-max-delta", type=float, default=0.05)
     ap.add_argument("--f-prior-weight", type=float, default=10.0)
@@ -1320,213 +1787,87 @@ def main() -> None:
     ap.add_argument("--z-penalty", type=float, default=100.0)
     ap.add_argument("--render-row-batch", type=int, default=64)
     ap.add_argument("--log-every", type=int, default=100)
-    ap.add_argument("--skip-render", action="store_true")
-    ap.add_argument("--no-render-yuv", action="store_true")
-    ap.add_argument("--save-depth-in-npz", action="store_true")
-    ap.add_argument("--overwrite", action="store_true")
+
+    # Depth YUV fallback only. Normally copied from source canonical output.
+    ap.add_argument("--depth-scale-precision", type=int, default=100000)
+    ap.add_argument("--depth-scale-percentile", type=float, default=99.9)
 
     args = ap.parse_args()
+
     if args.ecc_gauss <= 0 or args.ecc_gauss % 2 == 0:
         raise ValueError("--ecc-gauss must be a positive odd integer")
-    if args.structure_keep_percent <= 0 or args.structure_keep_percent > 100:
+    if not (0.0 < args.structure_keep_percent <= 100.0):
         raise ValueError("--structure-keep-percent must be in (0,100]")
     if args.structure_ecc_rounds < 1:
         raise ValueError("--structure-ecc-rounds must be >=1")
-    if args.structure_residual_keep_percent <= 0 or args.structure_residual_keep_percent > 100:
+    if not (0.0 < args.structure_residual_keep_percent <= 100.0):
         raise ValueError("--structure-residual-keep-percent must be in (0,100]")
+    if not (0.0 < args.static_residual_keep_percent <= 100.0):
+        raise ValueError("--static-residual-keep-percent must be in (0,100]")
+    if not (0.0 < args.depth_edge_keep_percentile <= 100.0):
+        raise ValueError("--depth-edge-keep-percentile must be in (0,100]")
+    if args.ecc_scale <= 0.0 or args.ecc_scale > 1.0:
+        raise ValueError("--ecc-scale must be in (0,1]")
     if args.steps < 0:
         raise ValueError("--steps must be non-negative")
+    if args.render_row_batch <= 0:
+        raise ValueError("--render-row-batch must be positive")
+    return args
 
-    ensure_dir(args.output_dir)
-    out_json = Path(args.output_dir) / "gop_camera_refine_rf_result.json"
-    out_jsonl = Path(args.output_dir) / "gop_camera_refine_rf_cam.jsonl"
-    out_npz = Path(args.output_dir) / "gop_camera_refine_rf_geometry.npz"
-    for p in [out_json, out_jsonl, out_npz]:
-        if p.exists():
-            if args.overwrite:
-                p.unlink()
-            else:
-                raise RuntimeError(f"Output exists: {p}. Use --overwrite.")
 
-    stage = load_fixedk_stage1_npz(args.stage1_npz)
-    K_base = stage["K"]
-    r_base = stage["rvecs"]
-    t_base = stage["tvecs"]
-    depth = stage["depth"]
-    frame_indices = stage["frame_indices"]
-    n, h, w = depth.shape
-    if int(args.width) != w or int(args.height) != h:
-        raise ValueError(f"Size mismatch: args={args.width}x{args.height}, NPZ depth={w}x{h}")
+def main() -> None:
+    args = parse_args()
+    src_root = Path(args.src_root).resolve()
+    dst_root = Path(args.dst_root).resolve()
+    if not src_root.is_dir():
+        raise FileNotFoundError(f"src-root not found: {src_root}")
+    ensure_dir(dst_root)
 
-    copied_header = load_first_jsonl_object(args.stage1_camera_jsonl) if args.stage1_camera_jsonl else None
-    pairs = build_pair_list(args, stage)
+    npz_files = find_geometry_npz_files(src_root, args.pattern)
+    log(f"Source root : {src_root}")
+    log(f"Dest root   : {dst_root}")
+    log(f"Pattern     : {args.pattern}")
+    log(f"Found NPZ   : {len(npz_files)}")
+    if not npz_files:
+        return
 
-    print("[INFO] Loaded fixedK_gop_nn geometry NPZ")
-    print(f"  npz         : {args.stage1_npz}")
-    print(f"  source keys : {stage['source_keys']}")
-    print(f"  frames      : {n}")
-    print(f"  size        : {w}x{h}")
-    print("[INFO] K_base:")
-    print(K_base)
-    print(f"[INFO] frame_index_mode={args.frame_index_mode}, seq_start={args.seq_start}")
-    print(f"[INFO] pairs={len(pairs)}")
-    for p in pairs[:80]:
-        print(f"  target={p[0]} ref={p[1]} weight={p[2]:.4g} kind={p[3]}")
-    if len(pairs) > 80:
-        print(f"  ... {len(pairs)-80} more")
-
-    rng = np.random.default_rng(int(args.seed))
-    pair_info: list[dict[str, Any]] = []
-    obs_list: list[dict[str, np.ndarray]] = []
-    pair_extract_dir = os.path.join(args.output_dir, "pair_ecc")
-    ensure_dir(pair_extract_dir)
-
-    for target, ref, weight, kind in pairs:
-        print(f"[PAIR ECC] target={target}, ref={ref}, weight={weight:.4g}, kind={kind}")
-        obs, info = collect_pair_observations(
-            pair=(target, ref, weight, kind),
-            seq_yuv=args.input,
-            width=w,
-            height=h,
-            bitdepth=args.bitdepth,
-            frame_indices=frame_indices,
-            K_base=K_base,
-            rvecs_base=r_base,
-            tvecs_base=t_base,
-            depth=depth,
-            args=args,
-            rng=rng,
-            pair_out_dir=pair_extract_dir,
-        )
-        pair_info.append(info)
-        if obs.get("target", np.empty(0)).size > 0:
-            obs_list.append(obs)
-        print(json.dumps({
-            "target": info["target"],
-            "ref": info["ref"],
-            "success": info["success"],
-            "ecc_cc": info["ecc_cc"],
-            "num_observations": info["num_observations"],
-            "cp_bias_raw": info["cp_bias_raw"],
-        }, indent=2))
-
-    if not obs_list:
-        raise RuntimeError("No valid pair ECC observations were generated.")
-    observations = concat_observations(obs_list)
-    print(f"[INFO] total observations = {observations['px'].shape[0]}")
-
-    K_final, r_final, t_final, fit_report = fit_rf_tiny_t_w2c(
-        observations=observations,
-        rvecs_base=r_base,
-        tvecs_base=t_base,
-        K_base=K_base,
-        args=args,
-    )
-
-    render_costs: list[dict[str, Any]] = []
-    if not args.skip_render:
-        render_costs = render_refined_pairs(
-            pairs=pairs,
-            seq_yuv=args.input,
-            width=w,
-            height=h,
-            bitdepth=args.bitdepth,
-            frame_indices=frame_indices,
-            K_base=K_base,
-            r_base=r_base,
-            t_base=t_base,
-            K_final=K_final,
-            r_final=r_final,
-            t_final=t_final,
-            depth=depth,
-            out_dir=os.path.join(args.output_dir, "refined_pairs"),
-            args=args,
-        )
-
-    pose_json = []
-    for i in range(n):
-        pose_json.append({
-            "poc": int(i),
-            "frame_idx": int(frame_indices[i]),
-            "is_anchor": bool(i == int(args.anchor_poc)),
-            "rvec_base": r_base[i].astype(float).tolist(),
-            "t_base": t_base[i].astype(float).tolist(),
-            "rvec_refined": r_final[i].astype(float).tolist(),
-            "t_refined": t_final[i].astype(float).tolist(),
-            "rvec_delta": (r_final[i] - r_base[i]).astype(float).tolist(),
-            "t_delta": (t_final[i] - t_base[i]).astype(float).tolist(),
-            "R_refined": rodrigues_np(r_final[i]).astype(float).tolist(),
-        })
-
-    result = {
-        "input": args.input,
-        "width": int(w),
-        "height": int(h),
-        "bitdepth": int(args.bitdepth),
-        "stage1_npz": str(args.stage1_npz),
-        "stage1_camera_jsonl": str(args.stage1_camera_jsonl) if args.stage1_camera_jsonl else None,
-        "stage1_source_keys": stage["source_keys"],
-        "frame_indices": frame_indices.astype(int).tolist(),
-        "method": {
-            "description": "Second-stage fixed-depth fitting from pair-wise structure-ECC homography/affine residual transforms. Fits GOP focal and frame-wise W2C R|t; t is strongly regularized.",
-            "depth": "fixed depth_canonical from first-stage NPZ",
-            "supervision": "q_gt = base_camera_map + ECC_transform_bias(x,y)",
-            "pose_convention": "camera_from_world / W2C: X_cam=R X_world+t",
-            "relative_formula": "R_rel=R_ref@R_target.T; t_rel=t_ref-R_rel@t_target",
-            "coordinate": "target pixel -> ref pixel",
-        },
-        "options": vars(args),
-        "K_base": K_base.astype(float).tolist(),
-        "K_refined": K_final.astype(float).tolist(),
-        "focal_delta": {
-            "fx_base": float(K_base[0, 0]),
-            "fy_base": float(K_base[1, 1]),
-            "fx_refined": float(K_final[0, 0]),
-            "fy_refined": float(K_final[1, 1]),
-            "fx_ratio": float(K_final[0, 0] / K_base[0, 0]),
-            "fy_ratio": float(K_final[1, 1] / K_base[1, 1]),
-            "fxfy_base_ratio": float(K_base[0, 0] / K_base[1, 1]),
-            "fxfy_refined_ratio": float(K_final[0, 0] / K_final[1, 1]),
-        },
-        "pairs": pair_info,
-        "fit_report": fit_report,
-        "poses": pose_json,
-        "render_costs": render_costs,
-        "outputs": {
-            "pair_ecc_dir": pair_extract_dir,
-            "refined_pair_dir": os.path.join(args.output_dir, "refined_pairs"),
-            "result_json": str(out_json),
-            "camera_jsonl": str(out_jsonl),
-            "geometry_npz": str(out_npz),
-        },
-    }
-
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-    write_refined_camera_jsonl(
-        path=out_jsonl,
-        source_npz=str(args.stage1_npz),
-        source_camera_jsonl=str(args.stage1_camera_jsonl) if args.stage1_camera_jsonl else None,
-        frame_indices=frame_indices,
-        K_final=K_final,
-        r_final=r_final,
-        t_final=t_final,
-        z_sign=args.z_sign,
-        copied_header=copied_header,
-        args=args,
-    )
-    write_minimal_npz(out_npz, stage, K_final, r_final, t_final, args)
-
-    print("[DONE]")
-    print(f"  result JSON  : {out_json}")
-    print(f"  camera JSONL : {out_jsonl}")
-    print(f"  geometry NPZ : {out_npz}")
-    print("  K_base:")
-    print(K_base)
-    print("  K_refined:")
-    print(K_final)
+    success = 0
+    skipped = 0
+    failed = 0
+    for idx, geometry_npz in enumerate(npz_files, start=1):
+        rel = geometry_npz.relative_to(src_root)
+        log("=" * 72)
+        log(f"[{idx}/{len(npz_files)}] {rel}")
+        if args.skip_invalid and not validate_canonical_npz(geometry_npz):
+            skipped += 1
+            continue
+        out_prefix = make_out_prefix(geometry_npz, src_root, dst_root, args.layout)
+        if already_done(out_prefix) and not args.force:
+            log(f"SKIP already done: {canonical_paths_from_prefix(out_prefix)['manifest']}")
+            skipped += 1
+            continue
+        if args.dry_run:
+            log(f"DRY RUN output prefix: {out_prefix}")
+            skipped += 1
+            continue
+        try:
+            ret = run_one(geometry_npz, src_root, out_prefix, args)
+        except Exception as exc:
+            failed += 1
+            log(f"FAILED: {exc}")
+            if not args.continue_on_error:
+                raise
+            continue
+        if ret == 0:
+            success += 1
+            log("OK")
+        else:
+            failed += 1
+            log(f"FAILED returncode={ret}")
+            if not args.continue_on_error:
+                raise RuntimeError(f"Failed on {geometry_npz}")
+    log("=" * 72)
+    log(f"Done. success={success}, skipped={skipped}, failed={failed}")
 
 
 if __name__ == "__main__":
