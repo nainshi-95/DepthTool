@@ -17,6 +17,7 @@ For each target/ref pair inside one GOP:
   4) project into ref image
   5) backward-remap original ref Y into target domain
   6) compare with original target Y on valid projection mask
+  7) report average projected MV magnitude and normalized value
 
 Supported camParam pose modes:
   - current_to_previous: X_prev = T_i X_cur, poc0 identity
@@ -25,6 +26,13 @@ Supported camParam pose modes:
 
 Coordinate convention:
   target pixel -> reference pixel
+
+MV definition:
+  mv_x = projected_ref_x - current_x
+  mv_y = projected_ref_y - current_y
+
+Normalized average MV:
+  norm_avg_mv_4096 = avg_mv_px / ((width + height) / 2) * 4096
 """
 
 from __future__ import annotations
@@ -153,6 +161,88 @@ def calc_psnr_metrics(
         "mse": mse,
         "rmse": rmse,
         "psnr": psnr,
+    }
+
+
+def calc_projected_mv_metrics(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    valid: np.ndarray,
+    width: int,
+    height: int,
+    row_batch: int = 256,
+) -> dict[str, Any]:
+    """
+    Compute projected MV statistics on valid pixels.
+
+    MV direction:
+      mv_x = projected_ref_x - current_x
+      mv_y = projected_ref_y - current_y
+
+    Normalized average MV:
+      norm_avg_mv_4096 = avg_mv_px / ((width + height) / 2) * 4096
+    """
+    valid = valid.astype(bool)
+    valid_count = int(np.count_nonzero(valid))
+
+    if valid_count <= 0:
+        return {
+            "avg_mv_px": None,
+            "avg_abs_mvx_px": None,
+            "avg_abs_mvy_px": None,
+            "mean_mvx_px": None,
+            "mean_mvy_px": None,
+            "norm_avg_mv_4096": None,
+        }
+
+    xs_full = np.arange(width, dtype=np.float32)[None, :]
+    sum_mv_len = 0.0
+    sum_abs_mvx = 0.0
+    sum_abs_mvy = 0.0
+    sum_mvx = 0.0
+    sum_mvy = 0.0
+
+    rb = max(1, int(row_batch))
+
+    for y0 in range(0, height, rb):
+        y1 = min(height, y0 + rb)
+
+        m = valid[y0:y1, :]
+        if not np.any(m):
+            continue
+
+        ys = np.arange(y0, y1, dtype=np.float32)[:, None]
+
+        mvx = map_x[y0:y1, :].astype(np.float32) - xs_full
+        mvy = map_y[y0:y1, :].astype(np.float32) - ys
+
+        mvx_v = mvx[m]
+        mvy_v = mvy[m]
+
+        mv_len = np.sqrt(mvx_v * mvx_v + mvy_v * mvy_v)
+
+        sum_mv_len += float(np.sum(mv_len, dtype=np.float64))
+        sum_abs_mvx += float(np.sum(np.abs(mvx_v), dtype=np.float64))
+        sum_abs_mvy += float(np.sum(np.abs(mvy_v), dtype=np.float64))
+        sum_mvx += float(np.sum(mvx_v, dtype=np.float64))
+        sum_mvy += float(np.sum(mvy_v, dtype=np.float64))
+
+    avg_mv_px = sum_mv_len / float(valid_count)
+    avg_abs_mvx_px = sum_abs_mvx / float(valid_count)
+    avg_abs_mvy_px = sum_abs_mvy / float(valid_count)
+    mean_mvx_px = sum_mvx / float(valid_count)
+    mean_mvy_px = sum_mvy / float(valid_count)
+
+    normalizer = (float(width) + float(height)) * 0.5
+    norm_avg_mv_4096 = avg_mv_px / normalizer * 4096.0
+
+    return {
+        "avg_mv_px": float(avg_mv_px),
+        "avg_abs_mvx_px": float(avg_abs_mvx_px),
+        "avg_abs_mvy_px": float(avg_abs_mvy_px),
+        "mean_mvx_px": float(mean_mvx_px),
+        "mean_mvy_px": float(mean_mvy_px),
+        "norm_avg_mv_4096": float(norm_avg_mv_4096),
     }
 
 
@@ -686,6 +776,7 @@ def evaluate(args: argparse.Namespace) -> None:
     print("[INFO] z_sign       :", cam["z_sign"])
     print("[INFO] depth_scale  :", cam["depth_scale_real"])
     print("[INFO] pairs        :", len(pairs))
+    print("[INFO] mv_norm      : norm_avg_mv_4096 = avg_mv_px / ((W + H) / 2) * 4096")
 
     rows: list[dict[str, Any]] = []
 
@@ -722,6 +813,15 @@ def evaluate(args: argparse.Namespace) -> None:
             row_batch=args.row_batch,
         )
 
+        mv_metrics = calc_projected_mv_metrics(
+            map_x=map_x,
+            map_y=map_y,
+            valid=valid,
+            width=width,
+            height=height,
+            row_batch=args.row_batch,
+        )
+
         pred = remap_ref_to_target(
             ref_y,
             map_x,
@@ -745,11 +845,14 @@ def evaluate(args: argparse.Namespace) -> None:
             "kind": kind,
             "weight": float(weight),
             **metrics,
+            **mv_metrics,
         }
 
         rows.append(row)
 
         psnr_str = "None" if row["psnr"] is None else f"{row['psnr']:.4f}"
+        avg_mv_str = "None" if row["avg_mv_px"] is None else f"{row['avg_mv_px']:.4f}"
+        norm_mv_str = "None" if row["norm_avg_mv_4096"] is None else f"{row['norm_avg_mv_4096']:.4f}"
 
         print(
             f"[PAIR {idx:03d}/{len(pairs):03d}] "
@@ -757,6 +860,8 @@ def evaluate(args: argparse.Namespace) -> None:
             f"valid={row['valid_ratio']:.4f} "
             f"psnr={psnr_str} "
             f"mae={row['mae']} "
+            f"avgMVpx={avg_mv_str} "
+            f"normMV4096={norm_mv_str} "
             f"kind={kind}"
         )
 
@@ -792,6 +897,16 @@ def evaluate(args: argparse.Namespace) -> None:
         dtype=np.float64,
     )
 
+    avg_mvs = np.array(
+        [r["avg_mv_px"] for r in rows if r["avg_mv_px"] is not None],
+        dtype=np.float64,
+    )
+
+    norm_mvs = np.array(
+        [r["norm_avg_mv_4096"] for r in rows if r["norm_avg_mv_4096"] is not None],
+        dtype=np.float64,
+    )
+
     summary = {
         "camparam": str(camparam_path),
         "depth_yuv": str(depth_yuv),
@@ -808,6 +923,14 @@ def evaluate(args: argparse.Namespace) -> None:
         "psnr_min": float(np.min(psnrs)) if psnrs.size else None,
         "psnr_max": float(np.max(psnrs)) if psnrs.size else None,
         "valid_ratio_mean": float(np.mean(valid_ratios)) if valid_ratios.size else None,
+        "avg_mv_px_mean": float(np.mean(avg_mvs)) if avg_mvs.size else None,
+        "avg_mv_px_median": float(np.median(avg_mvs)) if avg_mvs.size else None,
+        "avg_mv_px_min": float(np.min(avg_mvs)) if avg_mvs.size else None,
+        "avg_mv_px_max": float(np.max(avg_mvs)) if avg_mvs.size else None,
+        "norm_avg_mv_4096_mean": float(np.mean(norm_mvs)) if norm_mvs.size else None,
+        "norm_avg_mv_4096_median": float(np.median(norm_mvs)) if norm_mvs.size else None,
+        "norm_avg_mv_4096_min": float(np.min(norm_mvs)) if norm_mvs.size else None,
+        "norm_avg_mv_4096_max": float(np.max(norm_mvs)) if norm_mvs.size else None,
         "rows": rows,
     }
 
