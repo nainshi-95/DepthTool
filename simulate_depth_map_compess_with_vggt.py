@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Inverse-depth plane compression simulation + camera-plane candidate
-+ backward projection predictor using camparam_v2 JSONL.
+Inverse-depth plane compression simulation with hierarchical RA coding,
+VGGT/canonical camparam_v2 JSONL, camera-projected depth candidates, and
+bidirectional video prediction.
 
-Changes from the previous matrix-based version:
-  1) The plain temporal plane candidate has been removed completely.
-     Previous-frame reconstructed leaves are used only by the optional
-     camera-based plane_warp candidate.
-  2) Camera parameters are read from camparam_v2_vggt_or_canonical JSONL.
-     Per-frame K and absolute W2C/C2W poses are reconstructed from the header,
-     rvec/tvec, intrinsic_delta, and pose_mode.
-  3) The stored depth scale is fixed-point. Real camera depth is always:
-         depth_real = depth_y * depth_scale / depth_scale_precision
-  4) Frames are processed in hierarchical random-access order. With a
-     32-frame RA interval, the order begins:
-         0, 32, 16, 8, 4, 2, 1, 3, ...
-  5) RA interval endpoints such as POC 0 and 32 are intra/anchor frames.
-     Every hierarchical midpoint from POC 16 onward uses both already-coded
-     interval endpoints as L0/L1 camera-warp references. Pixels valid in both
-     predictions are averaged; pixels valid in only one prediction use that
-     prediction, and the configured invalid-fill policy is used only when
-     neither prediction is valid.
+Important behavior:
+  1) POC 0 and each RA endpoint (for example POC 32) are coded as anchors.
+  2) From POC 16 onward, already reconstructed L0/L1 depth frames are
+     forward-projected into the current camera. Their projected depths are
+     combined and fitted as the block-level ``plane_warp`` candidate.
+     Therefore RA temporal prediction now affects depth bits and mode ratios.
+  3) Video prediction separately uses the reconstructed current depth to
+     backward-project current pixels into L0/L1 reference pictures.
+  4) Projection follows the VGGT pixel-coordinate convention directly:
+       X = [(x-cx)/fx*z, (y-cy)/fy*z, z_sign*z]
+       X_ref = R * X_cur + t
+       u_ref = fx_ref * X_ref.x / abs(X_ref.z) + cx_ref
+       v_ref = fy_ref * X_ref.y / abs(X_ref.z) + cy_ref
+  5) Fixed-point depth is decoded as:
+       depth_linear = depth_y * depth_scale / depth_scale_precision
+     JSONL tvec values are already in this real depth unit. The divide/multiply
+     shown in parameter-quantization scripts only normalizes t for coding and
+     must not be applied a second time during projection.
 """
 
 import argparse
@@ -100,11 +101,11 @@ class CSNode:
 
 @dataclass
 class PlaneWarpContext:
-    prev_store: List[LeafRecord]
-    cam_prev: Dict[str, Any]
-    cam_cur: Dict[str, Any]
-    frame_w: int
-    frame_h: int
+    # Full-frame camera-projected depth predictor in stored depth-sample units.
+    # Only valid samples are used to fit the candidate plane.
+    pred_depth_y: np.ndarray
+    pred_valid: np.ndarray
+    source_type: str = ""
 
 
 # ============================================================
@@ -449,6 +450,47 @@ def fit_inv_depth_plane_from_depth_block(block_y, pinv, cx, cy, args):
     inv = 1.0 / y
     a, b, c = (pinv @ inv.reshape(-1)).tolist()
     return Plane(a, b, c, cx, cy)
+
+
+def fit_inv_depth_plane_from_depth_block_masked(
+    block_y,
+    valid_mask,
+    xx,
+    yy,
+    cx,
+    cy,
+    args,
+):
+    """Fit an inverse-depth plane using only projected valid samples."""
+    block_y = np.asarray(block_y, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    valid &= np.isfinite(block_y)
+    valid &= block_y >= args.depth_eps
+    valid &= block_y <= args.max_value
+
+    if np.count_nonzero(valid) < 3:
+        return None
+
+    y = np.clip(block_y[valid], args.depth_eps, args.max_value)
+    inv = 1.0 / y
+    A = np.stack(
+        [
+            np.asarray(xx, dtype=np.float64)[valid],
+            np.asarray(yy, dtype=np.float64)[valid],
+            np.ones(np.count_nonzero(valid), dtype=np.float64),
+        ],
+        axis=1,
+    )
+
+    try:
+        coeff, _, rank, _ = np.linalg.lstsq(A, inv, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    if rank < 3 or not np.isfinite(coeff).all():
+        return None
+
+    return Plane(float(coeff[0]), float(coeff[1]), float(coeff[2]), cx, cy)
 
 
 def plane_to_center(p, cx, cy):
@@ -1039,51 +1081,42 @@ def render_3d_plane_to_depth_block(
 
 
 def make_plane_warp_candidate(ctx, x, y, w, h, cx, cy, args, grid):
+    """Fit a block plane from the decoded-reference depth projection.
+
+    No current/ground-truth depth sample is used to create this candidate.
+    Invalid projection holes are excluded from the least-squares fit.
+    """
     if ctx is None:
         return None
 
-    r = leaf_covering_point(ctx.prev_store, cx, cy)
+    pred = np.asarray(ctx.pred_depth_y, dtype=np.float64)
+    valid = np.asarray(ctx.pred_valid, dtype=bool)
 
-    if r is None:
+    if pred.shape != valid.shape:
+        raise ValueError(
+            f"plane-warp predictor shape mismatch: {pred.shape} vs {valid.shape}"
+        )
+
+    if y + h > pred.shape[0] or x + w > pred.shape[1]:
         return None
 
-    plane3d_src = image_inv_plane_to_3d_plane(
-        r,
-        ctx.cam_prev,
-        ctx.frame_w,
-        ctx.frame_h,
+    block = pred[y : y + h, x : x + w]
+    block_valid = valid[y : y + h, x : x + w]
+
+    valid_ratio = float(np.mean(block_valid))
+    if valid_ratio < args.plane_warp_min_valid_ratio:
+        return None
+
+    xx, yy, _ = grid.get(w, h)
+    return fit_inv_depth_plane_from_depth_block_masked(
+        block,
+        block_valid,
+        xx,
+        yy,
+        cx,
+        cy,
         args,
     )
-
-    if plane3d_src is None:
-        return None
-
-    plane3d_cur = transform_plane_src_to_tgt(
-        plane3d_src,
-        ctx.cam_prev,
-        ctx.cam_cur,
-    )
-
-    if plane3d_cur is None:
-        return None
-
-    depth_block = render_3d_plane_to_depth_block(
-        plane3d_cur,
-        ctx.cam_cur,
-        x,
-        y,
-        w,
-        h,
-        ctx.frame_w,
-        ctx.frame_h,
-        args,
-    )
-
-    if depth_block is None:
-        return None
-
-    _, _, pinv = grid.get(w, h)
-    return fit_inv_depth_plane_from_depth_block(depth_block, pinv, cx, cy, args)
 
 
 def make_candidates(
@@ -1832,49 +1865,205 @@ def bilinear_sample(img, map_x, map_y, valid, fill):
     return np.clip(np.rint(out), 0, np.iinfo(np.uint16).max).astype(np.float64), valid2
 
 
-def make_backward_map_cur_to_prev(depth_y_cur, cam_cur, cam_prev, width, height):
-    """Build current-to-previous pixel map using decoded real depth.
+def relative_camera_transform(cam_source, cam_target):
+    """Return target_from_source in camera coordinates.
 
-    Critical fixed-point conversion:
-      depth_real = depth_y * depth_scale / depth_scale_precision
+    For current_to_previous JSONL, the adjacent transforms were accumulated
+    when the camera lookup was built. This relative transform also supports
+    arbitrary RA references such as current 16 -> reference 0 or 32.
     """
-    yy, xx = np.indices((height, width), dtype=np.float64)
-    rays_cur = pixel_rays_camera(xx, yy, cam_cur)
+    w2c_target = np.asarray(cam_target["W2C"], dtype=np.float64)
+    c2w_source = np.asarray(cam_source["C2W"], dtype=np.float64)
+    m = w2c_target @ c2w_source
+    return m[:3, :3], m[:3, 3]
 
-    depth_real = depth_y_cur.astype(np.float64) * get_depth_scale_real(cam_cur)
-    p_cur = rays_cur * depth_real[..., None]
 
-    ones = np.ones((height, width, 1), dtype=np.float64)
-    p_cur_h = np.concatenate([p_cur, ones], axis=-1)
+def make_projection_precompute_dual(width, height, cam_source, cam_target):
+    """VGGT pixel-coordinate precompute.
 
-    p_world = p_cur_h @ np.asarray(cam_cur["C2W"], dtype=np.float64).T
-    p_prev_cam = p_world @ np.asarray(cam_prev["W2C"], dtype=np.float64).T
+    ``source`` is unprojected with its own intrinsic and ``target`` is
+    projected with its own intrinsic. There is no NDC/projection matrix.
+    """
+    ks = np.asarray(cam_source["K"], dtype=np.float64)
+    kt = np.asarray(cam_target["K"], dtype=np.float64)
 
-    map_x, map_y, depth_prev, front = project_camera_points(
-        p_prev_cam[..., :3],
-        cam_prev,
+    xs, ys = np.meshgrid(
+        np.arange(width, dtype=np.float64),
+        np.arange(height, dtype=np.float64),
     )
 
-    coord_eps = 1e-7
+    return {
+        "width": int(width),
+        "height": int(height),
+        "x_norm": (xs - float(ks[0, 2])) / float(ks[0, 0]),
+        "y_norm": (ys - float(ks[1, 2])) / float(ks[1, 1]),
+        "fx_target": float(kt[0, 0]),
+        "fy_target": float(kt[1, 1]),
+        "cx_target": float(kt[0, 2]),
+        "cy_target": float(kt[1, 2]),
+        "z_sign": float(cam_source["z_sign"]),
+    }
+
+
+def backward_map_fast_pixel_coord_dual(depth_linear, precomp, r, t):
+    """Exact pixel-coordinate mapping used by the supplied VGGT script."""
+    z = np.asarray(depth_linear, dtype=np.float64)
+    x_norm = precomp["x_norm"]
+    y_norm = precomp["y_norm"]
+    z_sign = float(precomp["z_sign"])
+
+    r = np.asarray(r, dtype=np.float64).reshape(3, 3)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+
+    kx = r[0, 0] * x_norm + r[0, 1] * y_norm + r[0, 2] * z_sign
+    ky = r[1, 0] * x_norm + r[1, 1] * y_norm + r[1, 2] * z_sign
+    kz = r[2, 0] * x_norm + r[2, 1] * y_norm + r[2, 2] * z_sign
+
+    xp = z * kx + float(t[0])
+    yp = z * ky + float(t[1])
+    zp = z * kz + float(t[2])
+
+    denom = np.maximum(np.abs(zp), 1e-8)
+    map_x = precomp["fx_target"] * (xp / denom) + precomp["cx_target"]
+    map_y = precomp["fy_target"] * (yp / denom) + precomp["cy_target"]
+
+    width = int(precomp["width"])
+    height = int(precomp["height"])
     valid = (
-        front
-        & np.isfinite(map_x)
+        np.isfinite(map_x)
         & np.isfinite(map_y)
-        & np.isfinite(depth_real)
-        & np.isfinite(depth_prev)
-        & (depth_real > 0.0)
-        & (map_x >= -coord_eps)
-        & (map_y >= -coord_eps)
-        & (map_x <= width - 1.0 + coord_eps)
-        & (map_y <= height - 1.0 + coord_eps)
+        & np.isfinite(z)
+        & np.isfinite(zp)
+        & (zp * z_sign > 0.0)
+        & (map_x >= 0.0)
+        & (map_x <= width - 1.0)
+        & (map_y >= 0.0)
+        & (map_y <= height - 1.0)
+        & (z > 0.0)
     )
 
-    # Avoid losing the first row/column because of tiny projection roundoff
-    # such as -2e-16 under an identity transform.
-    map_x = np.clip(map_x, 0.0, width - 1.0)
-    map_y = np.clip(map_y, 0.0, height - 1.0)
+    map_x = map_x.astype(np.float64)
+    map_y = map_y.astype(np.float64)
+    map_x[~valid] = -1.0
+    map_y[~valid] = -1.0
+    return map_x, map_y, valid, zp
 
+
+def make_backward_map_cur_to_prev(depth_y_cur, cam_cur, cam_prev, width, height):
+    """Current-depth backward map to an arbitrary RA reference camera."""
+    depth_linear = (
+        np.asarray(depth_y_cur, dtype=np.float64)
+        * get_depth_scale_real(cam_cur)
+    )
+    precomp = make_projection_precompute_dual(
+        width,
+        height,
+        cam_source=cam_cur,
+        cam_target=cam_prev,
+    )
+    r, t = relative_camera_transform(cam_cur, cam_prev)
+    map_x, map_y, valid, _ = backward_map_fast_pixel_coord_dual(
+        depth_linear,
+        precomp,
+        r,
+        t,
+    )
     return map_x, map_y, valid
+
+
+def forward_project_recon_depth_to_target(
+    ref_depth_y,
+    cam_ref,
+    cam_target,
+    width,
+    height,
+):
+    """Forward-project a decoded reference depth frame into the target view.
+
+    A z-buffer keeps the nearest projected surface. The resulting depth is
+    returned in the target frame's stored depth-sample domain.
+    """
+    depth_linear = (
+        np.asarray(ref_depth_y, dtype=np.float64)
+        * get_depth_scale_real(cam_ref)
+    )
+    precomp = make_projection_precompute_dual(
+        width,
+        height,
+        cam_source=cam_ref,
+        cam_target=cam_target,
+    )
+    r, t = relative_camera_transform(cam_ref, cam_target)
+    map_x, map_y, valid, z_target_signed = backward_map_fast_pixel_coord_dual(
+        depth_linear,
+        precomp,
+        r,
+        t,
+    )
+
+    # Linear depth follows the supplied projection convention: abs(camera Z).
+    z_target = np.abs(z_target_signed)
+    valid &= np.isfinite(z_target) & (z_target > 0.0)
+
+    zbuf = np.full(height * width, np.inf, dtype=np.float64)
+    if np.any(valid):
+        mx = map_x[valid]
+        my = map_y[valid]
+        zz = z_target[valid]
+        x0 = np.floor(mx).astype(np.int64)
+        y0 = np.floor(my).astype(np.int64)
+
+        # Bilinear footprint with a nearest-depth z-buffer. The interpolation
+        # weights are intentionally not used for depth: each source surface
+        # contributes its actual transformed camera depth to covered samples.
+        for dy in (0, 1):
+            for dx in (0, 1):
+                xi = x0 + dx
+                yi = y0 + dy
+                ok = (
+                    (xi >= 0)
+                    & (xi < width)
+                    & (yi >= 0)
+                    & (yi < height)
+                )
+                if np.any(ok):
+                    flat = yi[ok] * width + xi[ok]
+                    np.minimum.at(zbuf, flat, zz[ok])
+
+    depth_target_linear = zbuf.reshape(height, width)
+    target_valid = np.isfinite(depth_target_linear)
+    depth_target_y = np.zeros((height, width), dtype=np.float64)
+    depth_target_y[target_valid] = (
+        depth_target_linear[target_valid]
+        / get_depth_scale_real(cam_target)
+    )
+    depth_target_y[target_valid] = np.clip(
+        depth_target_y[target_valid],
+        0.0,
+        1023.0,
+    )
+    return depth_target_y, target_valid
+
+
+def combine_projected_depths(pred0, valid0, pred1=None, valid1=None):
+    """Combine one or two projected reference depths without using GT depth."""
+    pred0 = np.asarray(pred0, dtype=np.float64)
+    valid0 = np.asarray(valid0, dtype=bool)
+
+    if pred1 is None or valid1 is None:
+        return pred0.copy(), valid0.copy(), np.zeros_like(valid0)
+
+    pred1 = np.asarray(pred1, dtype=np.float64)
+    valid1 = np.asarray(valid1, dtype=bool)
+    both = valid0 & valid1
+    only0 = valid0 & ~valid1
+    only1 = valid1 & ~valid0
+
+    out = np.zeros_like(pred0, dtype=np.float64)
+    out[only0] = pred0[only0]
+    out[only1] = pred1[only1]
+    out[both] = 0.5 * (pred0[both] + pred1[both])
+    return out, valid0 | valid1, both
 
 
 def downsample_map_for_chroma(map_x, map_y, valid):
@@ -2490,8 +2679,21 @@ def parse_args():
     p.add_argument("--max-value", type=int, default=1023)
     p.add_argument("--depth-eps", type=float, default=1.0)
 
-    # Plain temporal candidate intentionally removed.
-    p.add_argument("--plane-warp-candidate", action="store_true")
+    # Camera-projected reconstructed-depth candidate. Enabled by default so
+    # RA B pictures actually use temporal depth prediction from POC 16 onward.
+    p.add_argument(
+        "--plane-warp-candidate",
+        dest="plane_warp_candidate",
+        action="store_true",
+        help="enable camera-projected reference-depth plane candidate (default)",
+    )
+    p.add_argument(
+        "--no-plane-warp-candidate",
+        dest="plane_warp_candidate",
+        action="store_false",
+        help="disable camera-projected reference-depth candidate",
+    )
+    p.set_defaults(plane_warp_candidate=True)
     p.add_argument("--plane-warp-samples", type=int, default=5)
     p.add_argument("--plane-warp-min-valid-ratio", type=float, default=0.5)
 
@@ -2647,6 +2849,7 @@ def main():
 
     summaries = []
     frame_store = {}
+    frame_recon_depth = {}
 
     depth_recon_fp = open(args.out_depth_recon_yuv, "wb+") if args.out_depth_recon_yuv else None
     pred_fp = open(args.out_pred_yuv, "wb+") if args.out_pred_yuv else None
@@ -2712,26 +2915,75 @@ def main():
                     if depth_ref_idx is not None
                     else None
                 )
-                plane_warp_ctx = None
 
-                if (
-                    args.plane_warp_candidate
-                    and depth_ref_idx is not None
-                    and ref_store is not None
-                ):
-                    cam_ref_for_depth = ensure_camera_or_raise(
-                        camera_lookup,
-                        depth_ref_idx,
-                        "depth-reference",
+                # --------------------------------------------------------
+                # RA temporal depth prediction used by depth plane coding.
+                # Anchors have no temporal candidate. B pictures use both
+                # already reconstructed reference depths; sequential P uses L0.
+                # --------------------------------------------------------
+                plane_warp_ctx = None
+                depth_pred_stats = {
+                    "depth_pred_valid_ratio": 0.0,
+                    "depth_pred_l0_valid_ratio": 0.0,
+                    "depth_pred_l1_valid_ratio": 0.0,
+                    "depth_pred_both_valid_ratio": 0.0,
+                }
+
+                if args.plane_warp_candidate and prediction_type in ("P", "B"):
+                    if ref_l0 is None or ref_l0 not in frame_recon_depth:
+                        raise RuntimeError(
+                            f"POC {fi}: reconstructed L0 depth {ref_l0} is unavailable"
+                        )
+
+                    cam_l0_depth = ensure_camera_or_raise(
+                        camera_lookup, ref_l0, "depth-L0-reference"
                     )
+                    pred_depth_l0, valid_depth_l0 = forward_project_recon_depth_to_target(
+                        frame_recon_depth[ref_l0],
+                        cam_l0_depth,
+                        cam_cur,
+                        args.width,
+                        args.height,
+                    )
+
+                    pred_depth = pred_depth_l0
+                    valid_depth = valid_depth_l0
+                    both_depth = np.zeros_like(valid_depth_l0, dtype=bool)
+                    valid_depth_l1 = np.zeros_like(valid_depth_l0, dtype=bool)
+
+                    if prediction_type == "B":
+                        if ref_l1 is None or ref_l1 not in frame_recon_depth:
+                            raise RuntimeError(
+                                f"POC {fi}: reconstructed L1 depth {ref_l1} is unavailable"
+                            )
+                        cam_l1_depth = ensure_camera_or_raise(
+                            camera_lookup, ref_l1, "depth-L1-reference"
+                        )
+                        pred_depth_l1, valid_depth_l1 = forward_project_recon_depth_to_target(
+                            frame_recon_depth[ref_l1],
+                            cam_l1_depth,
+                            cam_cur,
+                            args.width,
+                            args.height,
+                        )
+                        pred_depth, valid_depth, both_depth = combine_projected_depths(
+                            pred_depth_l0,
+                            valid_depth_l0,
+                            pred_depth_l1,
+                            valid_depth_l1,
+                        )
 
                     plane_warp_ctx = PlaneWarpContext(
-                        prev_store=ref_store,
-                        cam_prev=cam_ref_for_depth,
-                        cam_cur=cam_cur,
-                        frame_w=args.width,
-                        frame_h=args.height,
+                        pred_depth_y=pred_depth,
+                        pred_valid=valid_depth,
+                        source_type=("bi" if prediction_type == "B" else "l0"),
                     )
+                    depth_pred_stats = {
+                        "depth_pred_valid_ratio": float(np.mean(valid_depth)),
+                        "depth_pred_l0_valid_ratio": float(np.mean(valid_depth_l0)),
+                        "depth_pred_l1_valid_ratio": float(np.mean(valid_depth_l1)),
+                        "depth_pred_both_valid_ratio": float(np.mean(both_depth)),
+                    }
 
                 rec_depth_y, sm, cur_store = simulate_one_depth_frame(
                     depth_y,
@@ -2745,6 +2997,8 @@ def main():
                 )
 
                 frame_store[fi] = cur_store
+                frame_recon_depth[fi] = np.asarray(rec_depth_y, dtype=np.float64).copy()
+                sm.update(depth_pred_stats)
 
                 if depth_recon_fp:
                     write_depth_as_yuv420p10le_at(
@@ -2835,6 +3089,9 @@ def main():
                 sm["plane_reference_frame"] = (
                     -1 if depth_ref_idx is None else int(depth_ref_idx)
                 )
+                sm["depth_prediction_type"] = (
+                    "none" if plane_warp_ctx is None else plane_warp_ctx.source_type
+                )
                 # Backward-compatible single-reference column.
                 sm["reference_frame"] = -1 if ref_l0 is None else int(ref_l0)
                 sm["temporal_layer"] = temporal_layer
@@ -2854,6 +3111,7 @@ def main():
                     f"warpYPSNR={sm['warp_y_psnr']:.3f} | "
                     f"warpYPSNRValid={sm['warp_y_psnr_valid']:.3f} | "
                     f"valid={sm['warp_valid_y_ratio']:.3f} | "
+                    f"depthPredValid={sm['depth_pred_valid_ratio']:.3f} | "
                     f"leaf={sm['leaf_blocks']} | "
                     f"QT={sm['qt_nodes']} | "
                     f"BH/BV={sm['bin_h_nodes']}/{sm['bin_v_nodes']} | "
@@ -2906,6 +3164,8 @@ def main():
         "input_video_resolved": video_path,
         "camera_format": cam_header.get("format"),
         "camera_pose_mode": cam_header["pose_mode"],
+        "projection_mode": "vggt_fast_pixel_coordinate_dual_intrinsic_no_ndc",
+        "ra_depth_prediction": "forward_project_reconstructed_L0_L1_depth_then_fit_plane",
         "depth_scale": cam_header["depth_scale"],
         "depth_scale_precision": cam_header["depth_scale_precision"],
         "depth_scale_real_used": depth_scale_real,
