@@ -1,1592 +1,3743 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Inverse-depth plane compression simulation with hierarchical RA coding,
+VGGT/canonical camparam_v2 JSONL, analytic temporal plane transformation, and
+bidirectional video prediction.
+
+Important behavior:
+  1) POC 0 and each RA endpoint (for example POC 32) are coded as anchors.
+  2) From POC 16 onward, every L0/L1 reconstructed leaf is projected into
+     the current camera once. For each current block, the reference leaf whose
+     projected polygon has the largest overlap with the current block is used.
+     Its camera-space 3D plane is transformed analytically and rendered directly
+     over the current block. No full-frame depth splatting is used for these
+     depth-plane candidates.
+  3) The following candidates are independently tested by copy/delta RDO:
+       plane_warp_avg, plane_warp_l0, plane_warp_l1,
+       temporal_avg, temporal_l0, temporal_l1.
+  4) Video prediction separately uses the reconstructed current depth to
+     backward-project current pixels into L0/L1 reference pictures.
+  5) Projection follows the VGGT pixel-coordinate convention directly, and
+     fixed-point depth is decoded as:
+       depth_linear = depth_y * depth_scale / depth_scale_precision
+     JSONL tvec values are already in the same real-depth unit.
+  6) With --c-only-plane, every coded block is represented by a constant
+     inverse-depth plane invY(x,y)=c. Slopes a/b are forced to zero and are
+     neither quantized nor counted in direct/delta residual bits.
+"""
 
 import argparse
+import csv
 import json
+import math
 import os
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 
 # ============================================================
-# Utility
+# Data classes
 # ============================================================
 
-def align_to(x, a):
-    return ((x + a - 1) // a) * a
+@dataclass
+class Plane:
+    # Inverse-depth plane in the stored depth-sample domain:
+    #   invY(x,y) = a * (x - cx) + b * (y - cy) + c
+    # Real camera depth is reconstructed separately using depth_scale_real.
+    a: float
+    b: float
+    c: float
+    cx: float
+    cy: float
 
 
-def calc_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top):
-    pad_right = coded_w - src_w - pad_left
-    pad_bottom = coded_h - src_h - pad_top
-
-    if pad_right < 0 or pad_bottom < 0:
-        raise ValueError(
-            f"Invalid padding: src=({src_w}x{src_h}), "
-            f"coded=({coded_w}x{coded_h}), "
-            f"pad_left={pad_left}, pad_top={pad_top}"
-        )
-
-    return pad_right, pad_bottom
+@dataclass
+class ModeResult:
+    mode: str
+    candidate_name: str
+    plane: Plane
+    recon_block: np.ndarray
+    bits: float
+    sse: float
+    cost: float
+    q_values: Tuple[int, ...]
 
 
-def validate_yuv420_padding(
-    src_w,
-    src_h,
-    coded_w,
-    coded_h,
-    pad_left,
-    pad_top,
-    pad_right,
-    pad_bottom,
-):
-    vals = {
-        "src_w": src_w,
-        "src_h": src_h,
-        "coded_w": coded_w,
-        "coded_h": coded_h,
-        "pad_left": pad_left,
-        "pad_top": pad_top,
-        "pad_right": pad_right,
-        "pad_bottom": pad_bottom,
+@dataclass
+class LeafRecord:
+    x: int
+    y: int
+    w: int
+    h: int
+    plane: Plane
+
+
+@dataclass
+class CSNode:
+    x: int
+    y: int
+    w: int
+    h: int
+    depth: int
+    parent: Optional["CSNode"] = None
+    split: str = "leaf"  # leaf, qt, bh, bv
+    children: List["CSNode"] = field(default_factory=list)
+
+    best: Optional[ModeResult] = None
+    actual: Optional[Plane] = None
+    avail_modes: List[str] = field(default_factory=list)
+    avail_cands: List[str] = field(default_factory=list)
+
+    bits: float = 0.0
+    sse: float = 0.0
+    cost: float = 0.0
+    split_bits: float = 0.0
+    qt_flag_present: bool = False
+
+    def is_leaf(self):
+        return self.split == "leaf"
+
+
+@dataclass
+class PlaneWarpContext:
+    # Reconstructed reference-plane stores and cameras used for analytic
+    # per-block 3D plane transformation. L1 is absent for sequential P frames.
+    l0_store: List[LeafRecord]
+    cam_l0: Dict[str, Any]
+    cam_cur: Dict[str, Any]
+    frame_w: int
+    frame_h: int
+    l1_store: Optional[List[LeafRecord]] = None
+    cam_l1: Optional[Dict[str, Any]] = None
+    source_type: str = ""
+
+    # Built lazily once per reference/current camera pair. Each cached record
+    # contains the reference leaf, its current-view projected polygon, and its
+    # already transformed current-camera 3D plane.
+    projected_leaf_cache: Dict[str, List[Dict[str, Any]]] = field(
+        default_factory=dict
+    )
+
+
+# ============================================================
+# Adaptive probability model
+# ============================================================
+
+class AdaptiveProbTable:
+    def __init__(
+        self,
+        symbols,
+        init_probs=None,
+        update_rate=0.05,
+        p_min=0.02,
+        p_max=0.95,
+        name="",
+    ):
+        self.symbols = list(symbols)
+        self.n = len(self.symbols)
+        self.update_rate = float(update_rate)
+        self.p_min = float(p_min)
+        self.p_max = float(p_max)
+        self.name = name
+
+        if self.n <= 0:
+            raise ValueError("AdaptiveProbTable needs symbols")
+        if self.p_min * self.n > 1.0:
+            raise ValueError(f"{name}: p_min too large")
+        if self.p_max * self.n < 1.0:
+            raise ValueError(f"{name}: p_max too small")
+
+        if init_probs is None:
+            self.probs = {s: 1.0 / self.n for s in self.symbols}
+        else:
+            total = sum(float(init_probs.get(s, 0.0)) for s in self.symbols)
+            if total <= 0:
+                raise ValueError("init_probs sum must be positive")
+            self.probs = {
+                s: float(init_probs.get(s, 0.0)) / total for s in self.symbols
+            }
+
+        self._project()
+
+    def bits(self, symbol, available_symbols=None):
+        if symbol not in self.probs:
+            raise KeyError(f"unknown symbol {symbol} in {self.name}")
+
+        if available_symbols is None:
+            return -math.log2(max(self.probs[symbol], 1e-12))
+
+        av = [s for s in available_symbols if s in self.probs]
+
+        if symbol not in av:
+            raise KeyError(f"{symbol} not available in {self.name}")
+
+        if len(av) <= 1:
+            return 0.0
+
+        norm = sum(self.probs[s] for s in av)
+        p = self.probs[symbol] / norm if norm > 0 else 1.0 / len(av)
+        return -math.log2(max(p, 1e-12))
+
+    def update(self, selected):
+        if selected not in self.probs:
+            raise KeyError(f"unknown selected {selected} in {self.name}")
+
+        psel = min(self.p_max, 1.0 - (self.n - 1) * self.p_min)
+        others = [s for s in self.symbols if s != selected]
+        target = {selected: psel}
+
+        for s in others:
+            target[s] = (1.0 - psel) / len(others) if others else 0.0
+
+        lr = self.update_rate
+
+        for s in self.symbols:
+            self.probs[s] = (1.0 - lr) * self.probs[s] + lr * target[s]
+
+        self._project()
+
+    def _project(self):
+        for s in self.symbols:
+            self.probs[s] = min(max(self.probs[s], self.p_min), self.p_max)
+
+        for _ in range(64):
+            diff = 1.0 - sum(self.probs.values())
+
+            if abs(diff) < 1e-12:
+                break
+
+            if diff > 0:
+                adj = [
+                    s for s in self.symbols
+                    if self.probs[s] < self.p_max - 1e-12
+                ]
+            else:
+                adj = [
+                    s for s in self.symbols
+                    if self.probs[s] > self.p_min + 1e-12
+                ]
+
+            if not adj:
+                break
+
+            add = diff / len(adj)
+
+            for s in adj:
+                self.probs[s] = min(max(self.probs[s] + add, self.p_min), self.p_max)
+
+    def snapshot(self, prefix):
+        return {f"{prefix}_{s}_prob": self.probs[s] for s in self.symbols}
+
+
+class BinaryAdaptiveProb:
+    def __init__(
+        self,
+        init_p1=0.5,
+        update_rate=0.05,
+        p_min=0.02,
+        p_max=0.98,
+        name="",
+    ):
+        self.p1 = float(init_p1)
+        self.update_rate = float(update_rate)
+        self.p_min = float(p_min)
+        self.p_max = float(p_max)
+        self.name = name
+        self._clip()
+
+    def _clip(self):
+        self.p1 = min(max(self.p1, self.p_min), self.p_max)
+
+    def bits(self, b):
+        if b not in (0, 1):
+            raise ValueError("bin must be 0/1")
+
+        p = self.p1 if b else 1.0 - self.p1
+        return -math.log2(max(p, 1e-12))
+
+    def update(self, b):
+        if b not in (0, 1):
+            raise ValueError("bin must be 0/1")
+
+        target = self.p_max if b else self.p_min
+        self.p1 = (1.0 - self.update_rate) * self.p1 + self.update_rate * target
+        self._clip()
+
+
+def unary_candidate_bits(idx, n, ctx, truncated=True):
+    if n <= 1:
+        return 0.0
+
+    if idx < 0 or idx >= n or n > len(ctx):
+        raise ValueError("bad unary candidate")
+
+    bits = sum(ctx[i].bits(0) for i in range(idx))
+
+    if not (truncated and idx == n - 1):
+        bits += ctx[idx].bits(1)
+
+    return bits
+
+
+def unary_candidate_update(idx, n, ctx, truncated=True):
+    if n <= 1:
+        return
+
+    if idx < 0 or idx >= n or n > len(ctx):
+        raise ValueError("bad unary candidate")
+
+    for i in range(idx):
+        ctx[i].update(0)
+
+    if not (truncated and idx == n - 1):
+        ctx[idx].update(1)
+
+
+def qt_split_flag_bits(adaptive, depth, flag):
+    if adaptive is not None and "qt_split" in adaptive and depth < len(adaptive["qt_split"]):
+        return adaptive["qt_split"][depth].bits(flag)
+
+    return 1.0
+
+
+def qt_split_flag_update(adaptive, node):
+    if adaptive is None or "qt_split" not in adaptive:
+        return
+
+    if not node.qt_flag_present:
+        return
+
+    if node.depth >= len(adaptive["qt_split"]):
+        return
+
+    flag = 1 if node.split == "qt" else 0
+    adaptive["qt_split"][node.depth].update(flag)
+
+
+def ceil_log2(x):
+    return 0 if x <= 1 else int(math.ceil(math.log2(x)))
+
+
+def exp_golomb_len_unsigned(u):
+    if u < 0:
+        raise ValueError("ue input negative")
+
+    return 2 * int(math.floor(math.log2(u + 1))) + 1
+
+
+def signed_to_code_num(v):
+    if v == 0:
+        return 0
+
+    return 2 * v - 1 if v > 0 else -2 * v
+
+
+def exp_golomb_len_signed(v):
+    return exp_golomb_len_unsigned(signed_to_code_num(v))
+
+
+def quantize(x, q):
+    return int(np.rint(x / q))
+
+
+def dequantize(v, q):
+    return float(v) * q
+
+
+def adaptive_signed_residual_bits(q, model, abs_max):
+    a = abs(q)
+
+    if a <= abs_max:
+        bits = model.bits(a)
+    else:
+        bits = model.bits("esc")
+        bits += exp_golomb_len_unsigned(a - (abs_max + 1))
+
+    if a > 0:
+        bits += 1.0
+
+    return bits
+
+
+def adaptive_signed_residual_update(q, model, abs_max):
+    model.update(abs(q) if abs(q) <= abs_max else "esc")
+
+
+def create_adaptive_models(args):
+    # Analytic camera-plane candidates and same-position temporal candidates
+    # are kept separate for L0, L1, and their bidirectional average.
+    cand_symbols = [
+        "plane_warp_avg",
+        "plane_warp_l0",
+        "plane_warp_l1",
+        "temporal_avg",
+        "temporal_l0",
+        "temporal_l1",
+        "left",
+        "top",
+        "top_left",
+        "top_right",
+        "avg_left_top",
+    ]
+
+    models = {
+        "mode": AdaptiveProbTable(
+            ["direct", "copy", "delta"],
+            update_rate=args.prob_lr,
+            p_min=args.prob_min,
+            p_max=args.prob_max,
+            name="mode",
+        ),
+        "candidate": AdaptiveProbTable(
+            cand_symbols,
+            update_rate=args.prob_lr,
+            p_min=args.prob_min,
+            p_max=args.prob_max,
+            name="candidate",
+        ),
+        "delta_abs_max": args.delta_abs_max,
     }
 
-    for name, v in vals.items():
-        if v < 0:
-            raise ValueError(f"{name} must be non-negative: {v}")
+    if args.copy_candidate_unary:
+        models["copy_candidate_unary"] = [
+            BinaryAdaptiveProb(
+                update_rate=args.prob_lr,
+                p_min=args.prob_min,
+                p_max=args.prob_max,
+                name=f"copy_ctx{i}",
+            )
+            for i in range(args.max_candidates)
+        ]
 
-    for name, v in vals.items():
-        if v % 2 != 0:
-            raise ValueError(f"{name} must be even for YUV420: {v}")
+    if args.qt_split_adaptive:
+        models["qt_split"] = [
+            BinaryAdaptiveProb(
+                init_p1=0.5,
+                update_rate=args.prob_lr,
+                p_min=args.prob_min,
+                p_max=args.prob_max,
+                name=f"qt_split_depth{i}",
+            )
+            for i in range(args.max_qt_depth)
+        ]
 
+    if args.delta_residual_adaptive:
+        syms = list(range(args.delta_abs_max + 1)) + ["esc"]
 
-def pad_2d_edge(arr, coded_w, coded_h, pad_left, pad_top):
-    h, w = arr.shape
-    pad_right = coded_w - w - pad_left
-    pad_bottom = coded_h - h - pad_top
+        for k in "abc":
+            models[f"delta_res_abs_{k}"] = AdaptiveProbTable(
+                syms,
+                update_rate=args.prob_lr,
+                p_min=args.prob_min,
+                p_max=args.prob_max,
+                name=f"delta_res_abs_{k}",
+            )
 
-    return np.pad(
-        arr,
-        ((pad_top, pad_bottom), (pad_left, pad_right)),
-        mode="edge",
-    )
-
-
-def pad_yuv420_edge(y, u, v, coded_w, coded_h, pad_left, pad_top):
-    y_pad = pad_2d_edge(y, coded_w, coded_h, pad_left, pad_top)
-
-    u_pad = pad_2d_edge(
-        u,
-        coded_w // 2,
-        coded_h // 2,
-        pad_left // 2,
-        pad_top // 2,
-    )
-
-    v_pad = pad_2d_edge(
-        v,
-        coded_w // 2,
-        coded_h // 2,
-        pad_left // 2,
-        pad_top // 2,
-    )
-
-    return y_pad, u_pad, v_pad
+    return models
 
 
-def active_slice(src_w, src_h, pad_left, pad_top):
-    return (
-        slice(pad_top, pad_top + src_h),
-        slice(pad_left, pad_left + src_w),
-    )
+# ============================================================
+# Inverse-depth plane fitting/rendering
+# ============================================================
+
+class GridCache:
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, w, h):
+        key = (w, h)
+
+        if key not in self.cache:
+            xs = np.arange(w, dtype=np.float64) - (w - 1) / 2.0
+            ys = np.arange(h, dtype=np.float64) - (h - 1) / 2.0
+            xx, yy = np.meshgrid(xs, ys)
+
+            A = np.stack(
+                [xx.reshape(-1), yy.reshape(-1), np.ones(w * h)],
+                axis=1,
+            )
+
+            self.cache[key] = (xx, yy, np.linalg.pinv(A))
+
+        return self.cache[key]
 
 
-def calc_psnr(a, b, bit_depth):
-    a = a.astype(np.float64)
-    b = b.astype(np.float64)
+def fit_inv_depth_plane_from_depth_block(block_y, pinv, cx, cy, args):
+    y = np.clip(block_y.astype(np.float64), args.depth_eps, args.max_value)
+    inv = 1.0 / y
 
-    mse = np.mean((a - b) ** 2)
+    if args.c_only_plane:
+        # Least-squares constant inverse-depth model:
+        #   invY(x,y) = c,  c = mean(1 / Y).
+        return Plane(0.0, 0.0, float(np.mean(inv)), cx, cy)
 
-    if mse == 0:
-        return float("inf")
-
-    maxv = (1 << bit_depth) - 1
-    return 10.0 * np.log10((maxv * maxv) / mse)
+    a, b, c = (pinv @ inv.reshape(-1)).tolist()
+    return Plane(a, b, c, cx, cy)
 
 
-def json_safe_float(x):
-    if x is None:
+def fit_inv_depth_plane_from_depth_block_masked(
+    block_y,
+    valid_mask,
+    xx,
+    yy,
+    cx,
+    cy,
+    args,
+):
+    """Fit an inverse-depth plane using only projected valid samples."""
+    block_y = np.asarray(block_y, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    valid &= np.isfinite(block_y)
+    valid &= block_y >= args.depth_eps
+    valid &= block_y <= args.max_value
+
+    if np.count_nonzero(valid) < 3:
         return None
-    x = float(x)
-    if np.isinf(x):
-        return "inf"
-    if np.isnan(x):
+
+    y = np.clip(block_y[valid], args.depth_eps, args.max_value)
+    inv = 1.0 / y
+
+    if args.c_only_plane:
+        c = float(np.mean(inv))
+        if not np.isfinite(c):
+            return None
+        return Plane(0.0, 0.0, c, cx, cy)
+
+    A = np.stack(
+        [
+            np.asarray(xx, dtype=np.float64)[valid],
+            np.asarray(yy, dtype=np.float64)[valid],
+            np.ones(np.count_nonzero(valid), dtype=np.float64),
+        ],
+        axis=1,
+    )
+
+    try:
+        coeff, _, rank, _ = np.linalg.lstsq(A, inv, rcond=None)
+    except np.linalg.LinAlgError:
         return None
-    return x
+
+    if rank < 3 or not np.isfinite(coeff).all():
+        return None
+
+    return Plane(float(coeff[0]), float(coeff[1]), float(coeff[2]), cx, cy)
 
 
-# ============================================================
-# YUV
-# ============================================================
-
-def frame_size_yuv420(w, h, bit_depth):
-    bps = 1 if bit_depth <= 8 else 2
-    return (w * h + 2 * (w // 2) * (h // 2)) * bps
-
-
-def count_frames(path, w, h, bit_depth):
-    return os.path.getsize(path) // frame_size_yuv420(w, h, bit_depth)
-
-
-def yuv_dtype(bit_depth):
-    return np.uint8 if bit_depth <= 8 else np.dtype("<u2")
-
-
-def read_yuv420(path, idx, w, h, bit_depth):
-    dtype = yuv_dtype(bit_depth)
-
-    y_size = w * h
-    uv_size = (w // 2) * (h // 2)
-    fs = frame_size_yuv420(w, h, bit_depth)
-
-    with open(path, "rb") as f:
-        f.seek(idx * fs)
-        y = np.fromfile(f, dtype=dtype, count=y_size)
-        u = np.fromfile(f, dtype=dtype, count=uv_size)
-        v = np.fromfile(f, dtype=dtype, count=uv_size)
-
-    if y.size != y_size or u.size != uv_size or v.size != uv_size:
-        raise RuntimeError(f"Cannot read frame {idx}: {path}")
-
-    return (
-        y.reshape(h, w),
-        u.reshape(h // 2, w // 2),
-        v.reshape(h // 2, w // 2),
+def plane_to_center(p, cx, cy):
+    return Plane(
+        p.a,
+        p.b,
+        p.c + p.a * (cx - p.cx) + p.b * (cy - p.cy),
+        cx,
+        cy,
     )
 
 
-def write_yuv420(path, y, u, v):
-    with open(path, "ab") as f:
-        f.write(np.ascontiguousarray(y).tobytes())
-        f.write(np.ascontiguousarray(u).tobytes())
-        f.write(np.ascontiguousarray(v).tobytes())
+def eval_inv_plane_value(p, gx, gy):
+    return p.a * (gx - p.cx) + p.b * (gy - p.cy) + p.c
+
+
+def inv_plane_to_depth_value(p, gx, gy, args):
+    inv = eval_inv_plane_value(p, gx, gy)
+    inv_min = 1.0 / max(float(args.max_value), 1.0)
+    inv_max = 1.0 / max(float(args.depth_eps), 1e-12)
+    inv = np.clip(inv, inv_min, inv_max)
+    return np.clip(1.0 / inv, 0.0, args.max_value)
+
+
+def render_inv_depth_plane(p, xx, yy, args):
+    inv = p.a * xx + p.b * yy + p.c
+    inv_min = 1.0 / max(float(args.max_value), 1.0)
+    inv_max = 1.0 / max(float(args.depth_eps), 1e-12)
+    inv = np.clip(inv, inv_min, inv_max)
+    y = 1.0 / inv
+    return np.clip(np.rint(y), 0, args.max_value).astype(np.float64)
+
+
+def block_sse(orig, recon):
+    d = orig.astype(np.float64) - recon.astype(np.float64)
+    return float(np.sum(d * d))
 
 
 # ============================================================
-# Param JSONL
+# Spatial candidates / previous-frame leaf lookup
 # ============================================================
 
-def load_param_jsonl(path):
-    header = None
-    frames = {}
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-
-            obj = json.loads(line)
-
-            if obj.get("type") in ["header", "intrinsic"]:
-                header = obj
-            elif "poc" in obj:
-                frames[int(obj["poc"])] = obj
-
-    if header is None:
-        raise RuntimeError("header line not found in param jsonl")
-
-    if "depth_scale" not in header:
-        raise RuntimeError("depth_scale not found in header")
-
-    if "intrinsic" not in header:
-        raise RuntimeError("intrinsic not found in header")
-
-    if not frames:
-        raise RuntimeError("no frame lines found in param jsonl")
-
-    return header, frames
+def overlap(a0, a1, b0, b1):
+    return max(0, min(a1, b1) - max(a0, b0))
 
 
-def get_depth_scale_real_from_header(header):
-    if "depth_scale_precision" in header:
-        precision = float(header["depth_scale_precision"])
-        if precision <= 0:
-            raise ValueError("depth_scale_precision must be positive")
-        return float(header["depth_scale"]) / precision
+def best_left(store, x, y, w, h):
+    best = None
+    bo = 0
 
-    if "depth_scale_real" in header:
-        return float(header["depth_scale_real"])
+    for r in store:
+        if r.x + r.w == x:
+            o = overlap(r.y, r.y + r.h, y, y + h)
 
-    return float(header["depth_scale"])
+            if o > bo:
+                best = r
+                bo = o
+
+    return best
 
 
-def get_depth_scale_precision_from_header(header):
-    if "depth_scale_precision" in header:
-        return int(header["depth_scale_precision"])
+def best_top(store, x, y, w, h):
+    best = None
+    bo = 0
+
+    for r in store:
+        if r.y + r.h == y:
+            o = overlap(r.x, r.x + r.w, x, x + w)
+
+            if o > bo:
+                best = r
+                bo = o
+
+    return best
+
+
+def top_left(store, x, y):
+    for r in store:
+        if r.x + r.w == x and r.y + r.h == y:
+            return r
+
+    return None
+
+
+def top_right(store, x, y, w):
+    for r in store:
+        if r.x == x + w and r.y + r.h == y:
+            return r
+
+    return None
+
+
+def leaf_covering_point(store, cx, cy):
+    """Find a previous-frame leaf only for the camera plane-warp candidate."""
+    if not store:
+        return None
+
+    for r in store:
+        if r.x <= cx < r.x + r.w and r.y <= cy < r.y + r.h:
+            return r
+
     return None
 
 
 # ============================================================
-# Quantization
+# Camera JSONL v2 / pose reconstruction
 # ============================================================
 
-def quant_u(value, lo, hi, bits):
-    qmax = (1 << bits) - 1
+def rodrigues_to_matrix(rvec):
+    r = np.asarray(rvec, dtype=np.float64).reshape(3)
+    theta = float(np.linalg.norm(r))
 
-    q = np.round((value - lo) / (hi - lo) * qmax)
-    q = np.clip(q, 0, qmax).astype(np.int32)
+    if theta < 1e-12:
+        x, y, z = r
+        k = np.array(
+            [
+                [0.0, -z, y],
+                [z, 0.0, -x],
+                [-y, x, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        return np.eye(3, dtype=np.float64) + k
 
-    dec = q.astype(np.float32) / qmax * (hi - lo) + lo
-    clipped = (value < lo) | (value > hi)
+    axis = r / theta
+    x, y, z = axis
+    k = np.array(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=np.float64,
+    )
 
-    return q, dec, clipped
-
-
-def signed_q_abs_max(bits):
-    if bits < 2:
-        raise ValueError("bits must be >= 2")
-    return (1 << (bits - 1)) - 1
-
-
-def quant_s(value, step, bits):
-    q_abs_max = signed_q_abs_max(bits)
-    qmin = -q_abs_max
-    qmax = q_abs_max
-
-    q = np.round(value / step)
-    clipped = (q < qmin) | (q > qmax)
-
-    q = np.clip(q, qmin, qmax).astype(np.int32)
-    dec = q.astype(np.float32) * step
-
-    return q, dec, clipped
-
-
-def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
-    return {
-        "fx": float(intr["fx"]),
-        "fy": float(intr["fy"]),
-        "cx": float(intr["cx"]) + float(pad_left),
-        "cy": float(intr["cy"]) + float(pad_top),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
+    return (
+        np.eye(3, dtype=np.float64)
+        + math.sin(theta) * k
+        + (1.0 - math.cos(theta)) * (k @ k)
+    )
 
 
-def add_intrinsic_delta(intr, delta):
-    return {
-        "fx": float(intr["fx"]) + float(delta[0]),
-        "fy": float(intr["fy"]) + float(delta[1]),
-        "cx": float(intr["cx"]) + float(delta[2]),
-        "cy": float(intr["cy"]) + float(delta[3]),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
+def rt_to_4x4(rvec, tvec):
+    t = np.eye(4, dtype=np.float64)
+    t[:3, :3] = rodrigues_to_matrix(rvec)
+    t[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+    return t
 
 
-def intrinsic_to_vec4(intr):
+def intrinsic_vec_to_matrix(v):
+    fx, fy, cx, cy = [float(x) for x in v]
+
+    if not np.isfinite([fx, fy, cx, cy]).all():
+        raise ValueError(f"non-finite intrinsic: {v}")
+
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError(f"fx/fy must be positive: fx={fx}, fy={fy}")
+
     return np.array(
         [
-            float(intr["fx"]),
-            float(intr["fy"]),
-            float(intr["cx"]),
-            float(intr["cy"]),
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
 
 
-def quantize_intrinsic_16(intr, w, h, f_max=4.0, c_min=-1.0, c_max=2.0):
-    fx_n = intr["fx"] / w
-    fy_n = intr["fy"] / h
-    cx_n = intr["cx"] / w
-    cy_n = intr["cy"] / h
+def load_camera_json(path):
+    """Read camparam_v2_vggt_or_canonical JSONL."""
+    header = None
+    frames = []
 
-    q_fx, d_fx, c_fx = quant_u(fx_n, -f_max, f_max, 16)
-    q_fy, d_fy, c_fy = quant_u(fy_n, -f_max, f_max, 16)
-    q_cx, d_cx, c_cx = quant_u(cx_n, c_min, c_max, 16)
-    q_cy, d_cy, c_cy = quant_u(cy_n, c_min, c_max, 16)
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
 
-    intr_dec = {
-        "fx": float(d_fx * w),
-        "fy": float(d_fy * h),
-        "cx": float(d_cx * w),
-        "cy": float(d_cy * h),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
+            if not line:
+                continue
 
-    intr_q = {
-        "fx": int(q_fx),
-        "fy": int(q_fy),
-        "cx": int(q_cx),
-        "cy": int(q_cy),
-    }
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Failed to parse camera JSONL at line {line_no}: {path}: {exc}"
+                ) from exc
 
-    clipped = bool(c_fx or c_fy or c_cx or c_cy)
+            if not isinstance(obj, dict):
+                raise ValueError(
+                    f"Camera JSONL line {line_no} must be an object, got {type(obj)}"
+                )
 
-    return intr_q, intr_dec, clipped
+            if obj.get("type") == "header":
+                if header is not None:
+                    raise ValueError(f"Multiple camera headers found: {path}")
+                header = obj
+            else:
+                frames.append(obj)
 
+    if header is None:
+        raise ValueError(f"Camera JSONL header not found: {path}")
 
-def quantize_intrinsic_delta_4(delta, step, bits):
-    """
-    delta order:
-      [dfx, dfy, dcx, dcy]
-
-    q = round(delta / step)
-    dec_delta = q * step
-    """
-    delta = np.asarray(delta, dtype=np.float32).reshape(4)
-    q, dec, clipped = quant_s(delta, step=step, bits=bits)
-    return q.astype(np.int32), dec.astype(np.float32), clipped
-
-
-def param6_from_frame(frame, depth_scale_real):
-    r = np.array(frame["rvec"], dtype=np.float32)
-    t = np.array(frame["tvec"], dtype=np.float32) / float(depth_scale_real)
-
-    return np.concatenate([r, t], axis=0)
-
-
-def rt_from_param6(p, depth_scale_real):
-    return {
-        "rvec": p[:3].astype(float).tolist(),
-        "tvec": (p[3:] * float(depth_scale_real)).astype(float).tolist(),
-    }
-
-
-# ============================================================
-# Signed truncated Exp-Golomb bit count
-# ============================================================
-
-def signed_to_code_num(x):
-    x = int(x)
-
-    if x == 0:
-        return 0
-
-    if x > 0:
-        return 2 * x - 1
-
-    return -2 * x
-
-
-def ue_exp_golomb_bits(code_num):
-    code_num = int(code_num)
-
-    if code_num < 0:
-        raise ValueError("code_num must be non-negative")
-
-    k = (code_num + 1).bit_length() - 1
-    return 2 * k + 1
-
-
-def signed_truncated_exp_golomb_bits(x, q_abs_max):
-    x = int(x)
-
-    if x < -q_abs_max or x > q_abs_max:
-        raise ValueError(
-            f"x={x} outside signed truncated range "
-            f"[-{q_abs_max}, {q_abs_max}]"
-        )
-
-    code_num = signed_to_code_num(x)
-    max_code_num = 2 * q_abs_max
-
-    if code_num > max_code_num:
-        raise ValueError(
-            f"code_num={code_num} outside truncated range [0, {max_code_num}]"
-        )
-
-    return ue_exp_golomb_bits(code_num)
-
-
-def q_residual_bits_signed_trunc_exp_golomb(q_residual, q_abs_max):
-    bits_each = [
-        signed_truncated_exp_golomb_bits(int(v), q_abs_max)
-        for v in q_residual
+    required_header = [
+        "width",
+        "height",
+        "depth_scale",
+        "depth_scale_precision",
+        "intrinsic",
+        "pose_mode",
     ]
 
-    return bits_each, int(sum(bits_each))
+    for k in required_header:
+        if k not in header:
+            raise KeyError(f"Camera JSONL header is missing '{k}': {path}")
+
+    if not frames:
+        raise ValueError(f"Camera JSONL has no frame records: {path}")
+
+    required_frame = ["poc", "rvec", "tvec", "intrinsic_delta"]
+
+    for i, rec in enumerate(frames):
+        for k in required_frame:
+            if k not in rec:
+                raise KeyError(f"Camera frame record {i} is missing '{k}': {path}")
+
+    return {"header": header, "frames": frames}
 
 
-# ============================================================
-# Predictor
-# ============================================================
+def get_depth_scale_real_from_header(header):
+    """Decode the fixed-point depth scale stored in the JSONL header."""
+    scale_int = float(header["depth_scale"])
+    precision = float(header["depth_scale_precision"])
 
-def predict_from_history(decoded_hist, pred_n, pred_degree):
-    if not decoded_hist:
-        return np.zeros(6, dtype=np.float32)
+    if precision <= 0.0:
+        raise ValueError("depth_scale_precision must be positive")
 
-    m = min(len(decoded_hist), pred_n)
-    y = np.stack(decoded_hist[-m:], axis=0).astype(np.float32)
+    # Critical conversion:
+    #   depth_real = depth_y * (depth_scale / depth_scale_precision)
+    scale_real = scale_int / precision
 
-    if m == 1:
-        return y[-1].copy()
+    if not np.isfinite(scale_real) or scale_real <= 0.0:
+        raise ValueError(
+            f"invalid real depth scale: {scale_int} / {precision} = {scale_real}"
+        )
 
-    deg = min(pred_degree, m - 1)
+    stored = header.get("depth_scale_real")
 
-    x = np.arange(m, dtype=np.float32)
-    x_next = np.array([m], dtype=np.float32)
+    if stored is not None:
+        stored = float(stored)
+        tol = max(1e-12, abs(scale_real) * 1e-7)
 
-    A = np.vander(x, N=deg + 1, increasing=True)
-    b = np.vander(x_next, N=deg + 1, increasing=True)
+        if not math.isclose(stored, scale_real, rel_tol=1e-7, abs_tol=tol):
+            print(
+                "[WARN] header depth_scale_real differs from "
+                "depth_scale/depth_scale_precision; using integer ratio: "
+                f"stored={stored}, derived={scale_real}"
+            )
 
-    coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-    pred = b @ coef
-
-    return pred.reshape(6).astype(np.float32)
+    return scale_real
 
 
-# ============================================================
-# Fast Pixel-coordinate Projection
-# ============================================================
+def build_camera_lookup(camera_json):
+    header = camera_json["header"]
+    frame_records = sorted(camera_json["frames"], key=lambda r: int(r["poc"]))
 
-def make_projection_precompute_dual(w, h, intr_tar, intr_ref):
-    """
-    target unprojection uses intr_tar.
-    reference projection uses intr_ref.
+    pocs = [int(r["poc"]) for r in frame_records]
 
-      X_tar = [(x-cx_tar)/fx_tar*z,
-               (y-cy_tar)/fy_tar*z,
-               z_sign*z]
+    if len(set(pocs)) != len(pocs):
+        raise ValueError("duplicate POC in camera JSONL")
 
-      X_ref = R * X_tar + t
+    pose_mode = str(header["pose_mode"])
 
-      map_x = fx_ref * X_ref.x / |X_ref.z| + cx_ref
-      map_y = fy_ref * X_ref.y / |X_ref.z| + cy_ref
-    """
-    fx_t = float(intr_tar["fx"])
-    fy_t = float(intr_tar["fy"])
-    cx_t = float(intr_tar["cx"])
-    cy_t = float(intr_tar["cy"])
+    if pose_mode == "current_to_previous":
+        expected = list(range(len(frame_records)))
 
-    fx_r = float(intr_ref["fx"])
-    fy_r = float(intr_ref["fy"])
-    cx_r = float(intr_ref["cx"])
-    cy_r = float(intr_ref["cy"])
+        if pocs != expected:
+            raise ValueError(
+                "current_to_previous camera JSONL requires consecutive local POCs "
+                f"0..N-1, got first values={pocs[:8]}"
+            )
 
-    z_sign = float(intr_tar.get("z_sign", intr_ref.get("z_sign", 1.0)))
-
-    x, y = np.meshgrid(
-        np.arange(w, dtype=np.float32),
-        np.arange(h, dtype=np.float32),
+    intr0 = header["intrinsic"]
+    base_intr = np.array(
+        [
+            float(intr0["fx"]),
+            float(intr0["fy"]),
+            float(intr0["cx"]),
+            float(intr0["cy"]),
+        ],
+        dtype=np.float64,
     )
+    z_sign = float(intr0.get("z_sign", 1.0))
 
-    x_norm = (x - cx_t) / fx_t
-    y_norm = (y - cy_t) / fy_t
+    if z_sign == 0.0 or not np.isfinite(z_sign):
+        raise ValueError(f"invalid z_sign: {z_sign}")
+
+    z_sign = 1.0 if z_sign > 0.0 else -1.0
+    fixed_intrinsic = (
+        header.get("intrinsic_mode") == "rap_fixed"
+        or header.get("intrinsic_delta_mode") == "fixed_zero_delta"
+    )
+    depth_scale_real = get_depth_scale_real_from_header(header)
+
+    by_poc = {}
+    by_frame_idx = {}
+    ordered = []
+
+    cur_intr = base_intr.copy()
+    prev_w2c = np.eye(4, dtype=np.float64)
+
+    for order, rec in enumerate(frame_records):
+        poc = int(rec["poc"])
+        frame_idx = int(rec.get("frame_idx", poc))
+
+        delta = np.asarray(rec.get("intrinsic_delta", [0, 0, 0, 0]), dtype=np.float64)
+
+        if delta.shape != (4,):
+            raise ValueError(
+                f"POC {poc}: intrinsic_delta must have 4 values, got {delta.shape}"
+            )
+
+        if fixed_intrinsic:
+            cur_intr = base_intr.copy()
+        else:
+            # Header intrinsic is frame-0 K. Frame 0 normally carries zero delta;
+            # each later record carries the delta from the previous frame.
+            cur_intr = cur_intr + delta
+
+        k = intrinsic_vec_to_matrix(cur_intr)
+        t_rec = rt_to_4x4(rec["rvec"], rec["tvec"])
+
+        if pose_mode == "current_to_previous":
+            if order == 0:
+                w2c = np.eye(4, dtype=np.float64)
+            else:
+                # JSONL: X_prev = T_prev_from_cur * X_cur
+                # Hence: W2C_cur = inv(T_prev_from_cur) * W2C_prev
+                try:
+                    w2c = np.linalg.inv(t_rec) @ prev_w2c
+                except np.linalg.LinAlgError as exc:
+                    raise ValueError(f"POC {poc}: singular current_to_previous pose") from exc
+
+        elif pose_mode in ("gop_local", "absolute"):
+            # gop_local: X_i = T_i * X_0, and X_0 is the local world frame.
+            # absolute : T_i is already camera_from_world.
+            w2c = t_rec
+
+        else:
+            raise ValueError(f"Unsupported pose_mode: {pose_mode}")
+
+        try:
+            c2w = np.linalg.inv(w2c)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(f"POC {poc}: singular W2C") from exc
+
+        cam = {
+            "poc": poc,
+            "frame_idx": frame_idx,
+            "K": k,
+            "W2C": w2c,
+            "C2W": c2w,
+            "z_sign": z_sign,
+            "depth_scale_real": depth_scale_real,
+            "pose_mode": pose_mode,
+        }
+
+        by_poc[poc] = cam
+        by_frame_idx.setdefault(frame_idx, cam)
+        ordered.append(cam)
+        prev_w2c = w2c
+
+    declared_count = header.get("frame_count")
+
+    if declared_count is not None and int(declared_count) != len(ordered):
+        raise ValueError(
+            f"camera frame_count mismatch: header={declared_count}, records={len(ordered)}"
+        )
 
     return {
-        "w": int(w),
-        "h": int(h),
-
-        "fx_ref": fx_r,
-        "fy_ref": fy_r,
-        "cx_ref": cx_r,
-        "cy_ref": cy_r,
-
-        "z_sign": z_sign,
-        "x_norm": x_norm.astype(np.float32),
-        "y_norm": y_norm.astype(np.float32),
+        "header": header,
+        "by_poc": by_poc,
+        "by_frame_idx": by_frame_idx,
+        "ordered": ordered,
     }
 
 
-def backward_map_fast_pixel_coord_dual(depth_linear, precomp, rt):
-    w = precomp["w"]
-    h = precomp["h"]
+def get_camera(lookup, frame_idx):
+    # Generated depth YUVs are normally RAP-local; local POC is primary.
+    if frame_idx in lookup["by_poc"]:
+        return lookup["by_poc"][frame_idx]
 
-    fx = precomp["fx_ref"]
-    fy = precomp["fy_ref"]
-    cx = precomp["cx_ref"]
-    cy = precomp["cy_ref"]
+    # Fallback supports callers indexing with original/global frame_idx.
+    if frame_idx in lookup["by_frame_idx"]:
+        return lookup["by_frame_idx"][frame_idx]
 
-    z_sign = precomp["z_sign"]
+    raise KeyError(f"camera for frame/POC {frame_idx} not found")
 
+
+def camera_has_required_mats(cam):
+    try:
+        k = np.asarray(cam["K"], dtype=np.float64)
+        w2c = np.asarray(cam["W2C"], dtype=np.float64)
+        c2w = np.asarray(cam["C2W"], dtype=np.float64)
+        scale = float(cam["depth_scale_real"])
+        z_sign = float(cam["z_sign"])
+
+        return (
+            k.shape == (3, 3)
+            and w2c.shape == (4, 4)
+            and c2w.shape == (4, 4)
+            and np.isfinite(k).all()
+            and np.isfinite(w2c).all()
+            and np.isfinite(c2w).all()
+            and np.isfinite(scale)
+            and scale > 0.0
+            and z_sign in (-1.0, 1.0)
+        )
+    except Exception:
+        return False
+
+
+def get_depth_scale_real(cam):
+    scale = float(cam["depth_scale_real"])
+
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"invalid camera depth scale: {scale}")
+
+    return scale
+
+
+# ============================================================
+# Camera geometry: K-based pinhole model
+# ============================================================
+
+def pixel_rays_camera(u, v, cam):
+    """Return rays with signed camera-Z equal to z_sign.
+
+    Thus X_cam = ray * depth_real, where depth_real is positive.
+    """
+    k = np.asarray(cam["K"], dtype=np.float64)
+    fx = float(k[0, 0])
+    fy = float(k[1, 1])
+    cx = float(k[0, 2])
+    cy = float(k[1, 2])
+    z_sign = float(cam["z_sign"])
+
+    u = np.asarray(u, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+
+    rx = (u - cx) / fx
+    ry = (v - cy) / fy
+    rz = np.full_like(rx, z_sign, dtype=np.float64)
+
+    return np.stack([rx, ry, rz], axis=-1)
+
+
+def project_camera_points(points_cam, cam):
+    """Project camera-space points using K and the configured z_sign."""
+    p = np.asarray(points_cam, dtype=np.float64)
+    k = np.asarray(cam["K"], dtype=np.float64)
+    z_sign = float(cam["z_sign"])
+
+    depth = z_sign * p[..., 2]
+    front = np.isfinite(depth) & (depth > 1e-12)
+    safe_depth = np.where(front, depth, 1.0)
+
+    u = k[0, 0] * (p[..., 0] / safe_depth) + k[0, 2]
+    v = k[1, 1] * (p[..., 1] / safe_depth) + k[1, 2]
+
+    return u, v, depth, front
+
+
+
+def polygon_area(poly):
+    """Unsigned area of an ordered 2D polygon."""
+    p = np.asarray(poly, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] < 3 or p.shape[1] != 2:
+        return 0.0
+    x = p[:, 0]
+    y = p[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _clip_polygon_half_plane(poly, inside, intersect):
+    if not poly:
+        return []
+
+    out = []
+    prev = poly[-1]
+    prev_inside = inside(prev)
+
+    for cur in poly:
+        cur_inside = inside(cur)
+
+        if cur_inside:
+            if not prev_inside:
+                out.append(intersect(prev, cur))
+            out.append(cur)
+        elif prev_inside:
+            out.append(intersect(prev, cur))
+
+        prev = cur
+        prev_inside = cur_inside
+
+    return out
+
+
+def clip_polygon_to_rect(poly, x0, y0, x1, y1):
+    """Sutherland-Hodgman clipping against an axis-aligned rectangle."""
+    eps = 1e-12
+    pts = [np.asarray(p, dtype=np.float64) for p in np.asarray(poly)]
+
+    def intersect_x(a, b, x_edge):
+        dx = float(b[0] - a[0])
+        if abs(dx) < eps:
+            return np.array([x_edge, a[1]], dtype=np.float64)
+        t = (x_edge - float(a[0])) / dx
+        return a + t * (b - a)
+
+    def intersect_y(a, b, y_edge):
+        dy = float(b[1] - a[1])
+        if abs(dy) < eps:
+            return np.array([a[0], y_edge], dtype=np.float64)
+        t = (y_edge - float(a[1])) / dy
+        return a + t * (b - a)
+
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[0] >= x0 - eps,
+        lambda a, b: intersect_x(a, b, x0),
+    )
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[0] <= x1 + eps,
+        lambda a, b: intersect_x(a, b, x1),
+    )
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[1] >= y0 - eps,
+        lambda a, b: intersect_y(a, b, y0),
+    )
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[1] <= y1 + eps,
+        lambda a, b: intersect_y(a, b, y1),
+    )
+
+    if len(pts) < 3:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.stack(pts, axis=0)
+
+
+def transform_camera_points(points_src, cam_src, cam_tgt):
+    """Transform 3D points from source-camera to target-camera coordinates."""
+    p = np.asarray(points_src, dtype=np.float64).reshape(-1, 3)
+    m = (
+        np.asarray(cam_tgt["W2C"], dtype=np.float64)
+        @ np.asarray(cam_src["C2W"], dtype=np.float64)
+    )
+    ph = np.concatenate(
+        [p, np.ones((p.shape[0], 1), dtype=np.float64)],
+        axis=1,
+    )
+    return (ph @ m.T)[:, :3]
+
+
+def project_reference_leaf_polygon(leaf, cam_ref, cam_cur, args):
+    """Project a reference leaf's outer pixel-cell rectangle to current view."""
+    # Pixel-cell boundaries keep a non-zero footprint even for a 1x1 leaf.
+    us = np.array(
+        [
+            leaf.x - 0.5,
+            leaf.x + leaf.w - 0.5,
+            leaf.x + leaf.w - 0.5,
+            leaf.x - 0.5,
+        ],
+        dtype=np.float64,
+    )
+    vs = np.array(
+        [
+            leaf.y - 0.5,
+            leaf.y - 0.5,
+            leaf.y + leaf.h - 0.5,
+            leaf.y + leaf.h - 0.5,
+        ],
+        dtype=np.float64,
+    )
+
+    depth_y = inv_plane_to_depth_value(leaf.plane, us, vs, args)
+    depth_real = depth_y * get_depth_scale_real(cam_ref)
+    rays = pixel_rays_camera(us, vs, cam_ref)
+    points_ref = rays * depth_real[:, None]
+    points_cur = transform_camera_points(points_ref, cam_ref, cam_cur)
+    pu, pv, _, front = project_camera_points(points_cur, cam_cur)
+
+    valid = (
+        front
+        & np.isfinite(pu)
+        & np.isfinite(pv)
+        & np.isfinite(points_cur).all(axis=1)
+        & (depth_real > 0.0)
+    )
+
+    # A projective transform maps the rectangle to a quadrilateral only when
+    # all four corners remain in front of the current camera.
+    if not np.all(valid):
+        return None
+
+    poly = np.stack([pu, pv], axis=1).astype(np.float64)
+    area = polygon_area(poly)
+    if not np.isfinite(area) or area <= 1e-8:
+        return None
+
+    return poly
+
+
+def build_projected_leaf_cache(ref_store, cam_ref, cam_cur, args):
+    """Project and analytically transform each reference leaf exactly once."""
+    records = []
+
+    for leaf in ref_store or []:
+        plane3d_ref = image_inv_plane_to_3d_plane(
+            leaf,
+            cam_ref,
+            0,
+            0,
+            args,
+        )
+        if plane3d_ref is None:
+            continue
+
+        plane3d_cur = transform_plane_src_to_tgt(
+            plane3d_ref,
+            cam_ref,
+            cam_cur,
+        )
+        if plane3d_cur is None:
+            continue
+
+        poly = project_reference_leaf_polygon(
+            leaf,
+            cam_ref,
+            cam_cur,
+            args,
+        )
+        if poly is None:
+            continue
+
+        records.append(
+            {
+                "leaf": leaf,
+                "plane3d_cur": plane3d_cur,
+                "polygon": poly,
+                "polygon_area": polygon_area(poly),
+                "bbox": (
+                    float(np.min(poly[:, 0])),
+                    float(np.min(poly[:, 1])),
+                    float(np.max(poly[:, 0])),
+                    float(np.max(poly[:, 1])),
+                ),
+            }
+        )
+
+    return records
+
+
+def get_projected_leaf_cache(ctx, side, args):
+    if side not in ("l0", "l1"):
+        raise ValueError(f"bad reference side: {side}")
+
+    if side in ctx.projected_leaf_cache:
+        return ctx.projected_leaf_cache[side]
+
+    if side == "l0":
+        store = ctx.l0_store
+        cam_ref = ctx.cam_l0
+    else:
+        store = ctx.l1_store
+        cam_ref = ctx.cam_l1
+
+    if not store or cam_ref is None:
+        records = []
+    else:
+        records = build_projected_leaf_cache(
+            store,
+            cam_ref,
+            ctx.cam_cur,
+            args,
+        )
+
+    ctx.projected_leaf_cache[side] = records
+    return records
+
+
+def _plane_depth_at_pixel(plane3d_cur, cam_cur, x, y):
+    ray = pixel_rays_camera(
+        np.asarray([x], dtype=np.float64),
+        np.asarray([y], dtype=np.float64),
+        cam_cur,
+    )[0]
+    denom = float(np.dot(plane3d_cur[:3], ray))
+    if abs(denom) < 1e-12:
+        return float("inf")
+    depth = -float(plane3d_cur[3]) / denom
+    return depth if np.isfinite(depth) and depth > 0.0 else float("inf")
+
+
+def select_projected_leaf_for_block(records, cam_cur, x, y, w, h):
+    """Select the projected leaf with maximum polygon/block overlap area."""
+    if not records:
+        return None
+
+    # Current block's outer pixel-cell rectangle.
+    x0 = float(x) - 0.5
+    y0 = float(y) - 0.5
+    x1 = float(x + w) - 0.5
+    y1 = float(y + h) - 0.5
+    block_area = max(float(w * h), 1.0)
+    cx = x + (w - 1) / 2.0
+    cy = y + (h - 1) / 2.0
+
+    best = None
+    best_key = None
+
+    for rec in records:
+        bx0, by0, bx1, by1 = rec["bbox"]
+        if bx1 <= x0 or bx0 >= x1 or by1 <= y0 or by0 >= y1:
+            continue
+
+        clipped = clip_polygon_to_rect(
+            rec["polygon"],
+            x0,
+            y0,
+            x1,
+            y1,
+        )
+        overlap_area = polygon_area(clipped)
+        if overlap_area <= 1e-8:
+            continue
+
+        # Primary criterion is exactly the requested projected overlap area.
+        # When overlap areas tie, prefer the nearer transformed surface and
+        # then the footprint center nearer to the current block center.
+        center_depth = _plane_depth_at_pixel(
+            rec["plane3d_cur"],
+            cam_cur,
+            cx,
+            cy,
+        )
+        poly_center = np.mean(rec["polygon"], axis=0)
+        center_dist2 = float(
+            (poly_center[0] - cx) ** 2 + (poly_center[1] - cy) ** 2
+        )
+        key = (overlap_area, -center_depth, -center_dist2)
+
+        if best_key is None or key > best_key:
+            best_key = key
+            best = dict(rec)
+            best["overlap_area"] = overlap_area
+            best["overlap_ratio"] = overlap_area / block_area
+
+    return best
+
+
+def fit_3d_plane(points):
+    if points.shape[0] < 3:
+        return None
+
+    c = np.mean(points, axis=0)
+    q = points - c
+
+    try:
+        _, s, vh = np.linalg.svd(q, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+
+    if len(s) < 2 or s[1] < 1e-9:
+        return None
+
+    n = vh[-1]
+    norm = np.linalg.norm(n)
+
+    if norm < 1e-12:
+        return None
+
+    n = n / norm
+    d = -float(np.dot(n, c))
+
+    return np.array([n[0], n[1], n[2], d], dtype=np.float64)
+
+
+def transform_plane_src_to_tgt(plane_src, cam_src, cam_tgt):
+    c2w_src = np.asarray(cam_src["C2W"], dtype=np.float64)
+    w2c_tgt = np.asarray(cam_tgt["W2C"], dtype=np.float64)
+    m = w2c_tgt @ c2w_src
+
+    try:
+        plane_tgt = np.linalg.inv(m).T @ plane_src
+    except np.linalg.LinAlgError:
+        return None
+
+    n = plane_tgt[:3]
+    norm = np.linalg.norm(n)
+
+    if norm < 1e-12:
+        return None
+
+    return plane_tgt / norm
+
+
+def image_inv_plane_to_3d_plane(leaf, cam, frame_w, frame_h, args):
+    del frame_w, frame_h
+
+    depth_scale_real = get_depth_scale_real(cam)
+    ns = max(2, int(args.plane_warp_samples))
+
+    xs = np.linspace(leaf.x, leaf.x + leaf.w - 1, ns, dtype=np.float64)
+    ys = np.linspace(leaf.y, leaf.y + leaf.h - 1, ns, dtype=np.float64)
+    uu, vv = np.meshgrid(xs, ys)
+
+    depth_y = inv_plane_to_depth_value(leaf.plane, uu, vv, args)
+    depth_real = depth_y * depth_scale_real
+
+    rays = pixel_rays_camera(uu, vv, cam)
+    pts = rays.reshape(-1, 3) * depth_real.reshape(-1, 1)
+
+    valid = np.isfinite(pts).all(axis=1) & (depth_real.reshape(-1) > 0)
+    pts = pts[valid]
+
+    if pts.shape[0] < 3:
+        return None
+
+    return fit_3d_plane(pts)
+
+
+def render_3d_plane_to_depth_block(
+    plane_cam,
+    cam_cur,
+    x,
+    y,
+    w,
+    h,
+    frame_w,
+    frame_h,
+    args,
+):
+    del frame_w, frame_h
+
+    depth_scale_real = get_depth_scale_real(cam_cur)
+
+    gx = np.arange(x, x + w, dtype=np.float64)
+    gy = np.arange(y, y + h, dtype=np.float64)
+    uu, vv = np.meshgrid(gx, gy)
+
+    rays = pixel_rays_camera(uu, vv, cam_cur)
+
+    n = plane_cam[:3]
+    d = plane_cam[3]
+    denom = np.sum(rays * n.reshape(1, 1, 3), axis=-1)
+
+    valid = np.abs(denom) > 1e-12
+    depth_real = np.full((h, w), np.nan, dtype=np.float64)
+    depth_real[valid] = -d / denom[valid]
+
+    valid = valid & np.isfinite(depth_real) & (depth_real > 0)
+    valid_ratio = float(np.mean(valid))
+
+    if valid_ratio < args.plane_warp_min_valid_ratio:
+        return None
+
+    # Keep invalid samples invalid. They must not be filled with a median and
+    # then contaminate L0/L1 averaging or inverse-plane fitting.
+    depth_y = np.full((h, w), np.nan, dtype=np.float64)
+    depth_y[valid] = depth_real[valid] / depth_scale_real
+    depth_y[valid] = np.clip(
+        depth_y[valid],
+        args.depth_eps,
+        args.max_value,
+    )
+
+    return depth_y, valid
+
+
+def make_analytic_plane_warp_candidate(
+    ctx,
+    side,
+    x,
+    y,
+    w,
+    h,
+    cx,
+    cy,
+    args,
+    grid,
+):
+    """Use the reference leaf whose current-view footprint best overlaps.
+
+    Reference leaves are projected once per frame pair and cached in ``ctx``.
+    For this current block, the leaf with the largest projected polygon/block
+    intersection is selected, and its already transformed 3D plane is rendered
+    analytically over the block.
+    """
+    if ctx is None:
+        return None
+
+    records = get_projected_leaf_cache(ctx, side, args)
+    match = select_projected_leaf_for_block(
+        records,
+        ctx.cam_cur,
+        x,
+        y,
+        w,
+        h,
+    )
+    if match is None:
+        return None
+
+    rendered = render_3d_plane_to_depth_block(
+        match["plane3d_cur"],
+        ctx.cam_cur,
+        x,
+        y,
+        w,
+        h,
+        ctx.frame_w,
+        ctx.frame_h,
+        args,
+    )
+    if rendered is None:
+        return None
+
+    depth_block, valid = rendered
+    xx, yy, _ = grid.get(w, h)
+    plane = fit_inv_depth_plane_from_depth_block_masked(
+        depth_block,
+        valid,
+        xx,
+        yy,
+        cx,
+        cy,
+        args,
+    )
+    if plane is None:
+        return None
+
+    return {
+        "plane": plane,
+        "depth": depth_block,
+        "valid": valid,
+        "matched_leaf": match["leaf"],
+        "overlap_area": match["overlap_area"],
+        "overlap_ratio": match["overlap_ratio"],
+    }
+
+
+def make_plane_warp_candidates(ctx, x, y, w, h, cx, cy, args, grid):
+    if ctx is None:
+        return []
+
+    l0 = make_analytic_plane_warp_candidate(
+        ctx,
+        "l0",
+        x,
+        y,
+        w,
+        h,
+        cx,
+        cy,
+        args,
+        grid,
+    )
+
+    l1 = None
+    if ctx.l1_store is not None and ctx.cam_l1 is not None:
+        l1 = make_analytic_plane_warp_candidate(
+            ctx,
+            "l1",
+            x,
+            y,
+            w,
+            h,
+            cx,
+            cy,
+            args,
+            grid,
+        )
+
+    out = []
+
+    # Average only samples that are valid in at least one direction. Invalid
+    # samples never enter the arithmetic mean or the fitted inverse plane.
+    if l0 is not None and l1 is not None:
+        valid0 = l0["valid"]
+        valid1 = l1["valid"]
+        both = valid0 & valid1
+        only0 = valid0 & ~valid1
+        only1 = valid1 & ~valid0
+        valid_avg = valid0 | valid1
+
+        avg_depth = np.full((h, w), np.nan, dtype=np.float64)
+        avg_depth[only0] = l0["depth"][only0]
+        avg_depth[only1] = l1["depth"][only1]
+        avg_depth[both] = 0.5 * (
+            l0["depth"][both] + l1["depth"][both]
+        )
+
+        xx, yy, _ = grid.get(w, h)
+        avg_plane = fit_inv_depth_plane_from_depth_block_masked(
+            avg_depth,
+            valid_avg,
+            xx,
+            yy,
+            cx,
+            cy,
+            args,
+        )
+        if avg_plane is not None:
+            out.append(("plane_warp_avg", avg_plane))
+
+    if l0 is not None:
+        out.append(("plane_warp_l0", l0["plane"]))
+
+    if l1 is not None:
+        out.append(("plane_warp_l1", l1["plane"]))
+
+    return out
+
+
+def make_same_position_temporal_candidates(ctx, cx, cy):
+    if ctx is None:
+        return []
+
+    p0 = None
+    p1 = None
+
+    r0 = leaf_covering_point(ctx.l0_store, cx, cy)
+    if r0 is not None:
+        p0 = plane_to_center(r0.plane, cx, cy)
+
+    if ctx.l1_store is not None:
+        r1 = leaf_covering_point(ctx.l1_store, cx, cy)
+        if r1 is not None:
+            p1 = plane_to_center(r1.plane, cx, cy)
+
+    out = []
+
+    if p0 is not None and p1 is not None:
+        out.append(
+            (
+                "temporal_avg",
+                Plane(
+                    0.5 * (p0.a + p1.a),
+                    0.5 * (p0.b + p1.b),
+                    0.5 * (p0.c + p1.c),
+                    cx,
+                    cy,
+                ),
+            )
+        )
+
+    if p0 is not None:
+        out.append(("temporal_l0", p0))
+
+    if p1 is not None:
+        out.append(("temporal_l1", p1))
+
+    return out
+
+
+def make_candidates(
+    store,
+    temporal_store,
+    x,
+    y,
+    w,
+    h,
+    cx,
+    cy,
+    max_cands,
+    plane_warp_ctx,
+    args,
+    grid,
+):
+    del temporal_store  # references are carried explicitly in plane_warp_ctx
+
+    cand = []
+    conv = {}
+
+    if args.plane_warp_candidate and plane_warp_ctx is not None:
+        for name, p in make_plane_warp_candidates(
+            plane_warp_ctx,
+            x,
+            y,
+            w,
+            h,
+            cx,
+            cy,
+            args,
+            grid,
+        ):
+            conv[name] = p
+            cand.append((name, p))
+
+    if args.same_position_temporal_candidate and plane_warp_ctx is not None:
+        for name, p in make_same_position_temporal_candidates(
+            plane_warp_ctx,
+            cx,
+            cy,
+        ):
+            conv[name] = p
+            cand.append((name, p))
+
+    items = [
+        ("left", best_left(store, x, y, w, h)),
+        ("top", best_top(store, x, y, w, h)),
+        ("top_left", top_left(store, x, y)),
+        ("top_right", top_right(store, x, y, w)),
+    ]
+
+    for name, r in items:
+        if r is not None:
+            p = plane_to_center(r.plane, cx, cy)
+            conv[name] = p
+            cand.append((name, p))
+
+    if "left" in conv and "top" in conv:
+        l = conv["left"]
+        t = conv["top"]
+        cand.append(
+            (
+                "avg_left_top",
+                Plane(
+                    0.5 * (l.a + t.a),
+                    0.5 * (l.b + t.b),
+                    0.5 * (l.c + t.c),
+                    cx,
+                    cy,
+                ),
+            )
+        )
+
+    return cand[:max_cands]
+
+
+# ============================================================
+# Mode evaluation
+# ============================================================
+
+def eval_direct(block, actual, xx, yy, args, adaptive, avail_modes):
+    if args.c_only_plane:
+        qa = 0
+        qb = 0
+    else:
+        qa = quantize(actual.a, args.qa)
+        qb = quantize(actual.b, args.qb)
+    qc = quantize(actual.c, args.qc)
+
+    p = Plane(
+        0.0 if args.c_only_plane else dequantize(qa, args.qa),
+        0.0 if args.c_only_plane else dequantize(qb, args.qb),
+        dequantize(qc, args.qc),
+        actual.cx,
+        actual.cy,
+    )
+
+    recon = render_inv_depth_plane(p, xx, yy, args)
+    sse = block_sse(block, recon)
+
+    if adaptive is not None:
+        bits = adaptive["mode"].bits("direct", avail_modes)
+    else:
+        bits = float(args.mode_bits)
+
+    if not args.c_only_plane:
+        bits += exp_golomb_len_signed(qa)
+        bits += exp_golomb_len_signed(qb)
+    bits += exp_golomb_len_signed(qc)
+
+    return ModeResult(
+        "direct",
+        "none",
+        p,
+        recon,
+        bits,
+        sse,
+        sse + args.lambda_rd * bits,
+        (qa, qb, qc),
+    )
+
+
+def eval_copy(block, cands, xx, yy, args, adaptive, avail_modes, avail_cands):
+    out = []
+
+    for i, (name, p) in enumerate(cands):
+        recon = render_inv_depth_plane(p, xx, yy, args)
+        sse = block_sse(block, recon)
+
+        if adaptive is None:
+            bits = float(args.mode_bits + ceil_log2(len(cands)))
+        else:
+            bits = adaptive["mode"].bits("copy", avail_modes)
+
+            if "copy_candidate_unary" in adaptive:
+                bits += unary_candidate_bits(
+                    i,
+                    len(cands),
+                    adaptive["copy_candidate_unary"],
+                )
+            else:
+                bits += adaptive["candidate"].bits(name, avail_cands)
+
+        out.append(
+            ModeResult(
+                "copy",
+                name,
+                p,
+                recon,
+                bits,
+                sse,
+                sse + args.lambda_rd * bits,
+                (),
+            )
+        )
+
+    return out
+
+
+def eval_delta(block, actual, cands, xx, yy, args, adaptive, avail_modes, avail_cands):
+    out = []
+
+    for name, pred in cands:
+        if args.c_only_plane:
+            qda = 0
+            qdb = 0
+        else:
+            qda = quantize(actual.a - pred.a, args.qa)
+            qdb = quantize(actual.b - pred.b, args.qb)
+        qdc = quantize(actual.c - pred.c, args.qc)
+
+        p = Plane(
+            0.0 if args.c_only_plane else pred.a + dequantize(qda, args.qa),
+            0.0 if args.c_only_plane else pred.b + dequantize(qdb, args.qb),
+            pred.c + dequantize(qdc, args.qc),
+            actual.cx,
+            actual.cy,
+        )
+
+        recon = render_inv_depth_plane(p, xx, yy, args)
+        sse = block_sse(block, recon)
+
+        if adaptive is None:
+            bits = float(args.mode_bits + ceil_log2(len(cands)))
+        else:
+            bits = adaptive["mode"].bits("delta", avail_modes)
+            bits += adaptive["candidate"].bits(name, avail_cands)
+
+        if adaptive is not None and "delta_res_abs_a" in adaptive:
+            if not args.c_only_plane:
+                bits += adaptive_signed_residual_bits(
+                    qda,
+                    adaptive["delta_res_abs_a"],
+                    adaptive["delta_abs_max"],
+                )
+                bits += adaptive_signed_residual_bits(
+                    qdb,
+                    adaptive["delta_res_abs_b"],
+                    adaptive["delta_abs_max"],
+                )
+            bits += adaptive_signed_residual_bits(
+                qdc,
+                adaptive["delta_res_abs_c"],
+                adaptive["delta_abs_max"],
+            )
+        else:
+            if not args.c_only_plane:
+                bits += exp_golomb_len_signed(qda)
+                bits += exp_golomb_len_signed(qdb)
+            bits += exp_golomb_len_signed(qdc)
+
+        out.append(
+            ModeResult(
+                "delta",
+                name,
+                p,
+                recon,
+                bits,
+                sse,
+                sse + args.lambda_rd * bits,
+                (qda, qdb, qdc),
+            )
+        )
+
+    return out
+
+
+def eval_leaf(
+    padded,
+    x,
+    y,
+    w,
+    h,
+    depth,
+    parent,
+    args,
+    grid,
+    store,
+    prev_store,
+    adaptive,
+    plane_warp_ctx,
+):
+    block = padded[y : y + h, x : x + w]
+
+    cx = x + (w - 1) / 2.0
+    cy = y + (h - 1) / 2.0
+
+    xx, yy, pinv = grid.get(w, h)
+    actual = fit_inv_depth_plane_from_depth_block(block, pinv, cx, cy, args)
+
+    cands = make_candidates(
+        store=store,
+        temporal_store=prev_store,
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        cx=cx,
+        cy=cy,
+        max_cands=args.max_candidates,
+        plane_warp_ctx=plane_warp_ctx,
+        args=args,
+        grid=grid,
+    )
+
+    avail_cands = [n for n, _ in cands]
+    avail_modes = ["direct", "copy", "delta"] if cands else ["direct"]
+
+    modes = [eval_direct(block, actual, xx, yy, args, adaptive, avail_modes)]
+
+    if cands:
+        modes += eval_copy(block, cands, xx, yy, args, adaptive, avail_modes, avail_cands)
+        modes += eval_delta(block, actual, cands, xx, yy, args, adaptive, avail_modes, avail_cands)
+
+    best = min(modes, key=lambda r: r.cost)
+
+    return CSNode(
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        depth=depth,
+        parent=parent,
+        split="leaf",
+        best=best,
+        actual=actual,
+        avail_modes=avail_modes,
+        avail_cands=avail_cands,
+        bits=best.bits,
+        sse=best.sse,
+        cost=best.cost,
+    )
+
+
+# ============================================================
+# Recursive block coding
+# ============================================================
+
+def add_leaves_to_store(node, store):
+    if node.is_leaf():
+        store.append(LeafRecord(node.x, node.y, node.w, node.h, node.best.plane))
+        return
+
+    for c in node.children:
+        add_leaves_to_store(c, store)
+
+
+def parent_node(x, y, w, h, depth, parent, split, split_bits, children, args, qt_flag_present):
+    n = CSNode(
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        depth=depth,
+        parent=parent,
+        split=split,
+        children=children,
+        split_bits=split_bits,
+        qt_flag_present=qt_flag_present,
+    )
+
+    for c in children:
+        c.parent = n
+
+    n.bits = split_bits + sum(c.bits for c in children)
+    n.sse = sum(c.sse for c in children)
+    n.cost = args.lambda_rd * split_bits + sum(c.cost for c in children)
+
+    return n
+
+
+def encode_node(
+    padded,
+    x,
+    y,
+    w,
+    h,
+    depth,
+    parent,
+    args,
+    grid,
+    store,
+    prev_store,
+    adaptive,
+    plane_warp_ctx,
+):
+    qt_ok = (
+        depth < args.max_qt_depth
+        and w >= 2
+        and h >= 2
+        and w % 2 == 0
+        and h % 2 == 0
+    )
+
+    bh_ok = h >= 2 and h % 2 == 0
+    bv_ok = w >= 2 and w % 2 == 0
+    extra_ok = bh_ok or bv_ok
+
+    cand = []
+
+    leaf = eval_leaf(
+        padded,
+        x,
+        y,
+        w,
+        h,
+        depth,
+        parent,
+        args,
+        grid,
+        store,
+        prev_store,
+        adaptive,
+        plane_warp_ctx,
+    )
+
+    leaf.qt_flag_present = qt_ok
+    leaf.split_bits = 0.0
+
+    if qt_ok:
+        leaf.split_bits += qt_split_flag_bits(adaptive, depth, 0)
+
+    if extra_ok:
+        leaf.split_bits += 1.0
+
+    leaf.bits += leaf.split_bits
+    leaf.cost += args.lambda_rd * leaf.split_bits
+    cand.append(leaf)
+
+    if bh_ok:
+        st = list(store)
+        h0 = h // 2
+
+        c0 = eval_leaf(
+            padded,
+            x,
+            y,
+            w,
+            h0,
+            depth + 1,
+            None,
+            args,
+            grid,
+            st,
+            prev_store,
+            adaptive,
+            plane_warp_ctx,
+        )
+        add_leaves_to_store(c0, st)
+
+        c1 = eval_leaf(
+            padded,
+            x,
+            y + h0,
+            w,
+            h - h0,
+            depth + 1,
+            None,
+            args,
+            grid,
+            st,
+            prev_store,
+            adaptive,
+            plane_warp_ctx,
+        )
+
+        split_bits = 0.0
+
+        if qt_ok:
+            split_bits += qt_split_flag_bits(adaptive, depth, 0)
+
+        split_bits += 1.0
+        split_bits += 1.0
+
+        cand.append(
+            parent_node(
+                x,
+                y,
+                w,
+                h,
+                depth,
+                parent,
+                "bh",
+                split_bits,
+                [c0, c1],
+                args,
+                qt_flag_present=qt_ok,
+            )
+        )
+
+    if bv_ok:
+        st = list(store)
+        w0 = w // 2
+
+        c0 = eval_leaf(
+            padded,
+            x,
+            y,
+            w0,
+            h,
+            depth + 1,
+            None,
+            args,
+            grid,
+            st,
+            prev_store,
+            adaptive,
+            plane_warp_ctx,
+        )
+        add_leaves_to_store(c0, st)
+
+        c1 = eval_leaf(
+            padded,
+            x + w0,
+            y,
+            w - w0,
+            h,
+            depth + 1,
+            None,
+            args,
+            grid,
+            st,
+            prev_store,
+            adaptive,
+            plane_warp_ctx,
+        )
+
+        split_bits = 0.0
+
+        if qt_ok:
+            split_bits += qt_split_flag_bits(adaptive, depth, 0)
+
+        split_bits += 1.0
+        split_bits += 1.0
+
+        cand.append(
+            parent_node(
+                x,
+                y,
+                w,
+                h,
+                depth,
+                parent,
+                "bv",
+                split_bits,
+                [c0, c1],
+                args,
+                qt_flag_present=qt_ok,
+            )
+        )
+
+    if qt_ok:
+        st = list(store)
+        w0 = w // 2
+        h0 = h // 2
+
+        specs = [
+            (x, y, w0, h0),
+            (x + w0, y, w - w0, h0),
+            (x, y + h0, w0, h - h0),
+            (x + w0, y + h0, w - w0, h - h0),
+        ]
+
+        children = []
+
+        for child_x, child_y, child_w, child_h in specs:
+            c = encode_node(
+                padded,
+                child_x,
+                child_y,
+                child_w,
+                child_h,
+                depth + 1,
+                None,
+                args,
+                grid,
+                st,
+                prev_store,
+                adaptive,
+                plane_warp_ctx,
+            )
+
+            children.append(c)
+            add_leaves_to_store(c, st)
+
+        split_bits = qt_split_flag_bits(adaptive, depth, 1)
+
+        cand.append(
+            parent_node(
+                x,
+                y,
+                w,
+                h,
+                depth,
+                parent,
+                "qt",
+                split_bits,
+                children,
+                args,
+                qt_flag_present=True,
+            )
+        )
+
+    best = min(cand, key=lambda n: n.cost)
+    best.parent = parent
+
+    return best
+
+
+def commit_node(node, store, adaptive, writer, frame_idx, args):
+    qt_split_flag_update(adaptive, node)
+
+    if not node.is_leaf():
+        for c in node.children:
+            commit_node(c, store, adaptive, writer, frame_idx, args)
+        return
+
+    b = node.best
+
+    if adaptive is not None:
+        if len(node.avail_modes) > 1:
+            adaptive["mode"].update(b.mode)
+
+        if b.mode == "copy" and len(node.avail_cands) > 1:
+            if "copy_candidate_unary" in adaptive:
+                unary_candidate_update(
+                    node.avail_cands.index(b.candidate_name),
+                    len(node.avail_cands),
+                    adaptive["copy_candidate_unary"],
+                )
+            else:
+                adaptive["candidate"].update(b.candidate_name)
+
+        elif b.mode == "delta" and len(node.avail_cands) > 1:
+            adaptive["candidate"].update(b.candidate_name)
+
+        if b.mode == "delta" and "delta_res_abs_a" in adaptive:
+            residual_items = (
+                [(b.q_values[2], "c")]
+                if args.c_only_plane
+                else list(zip(b.q_values, "abc"))
+            )
+            for q, k in residual_items:
+                adaptive_signed_residual_update(
+                    q,
+                    adaptive[f"delta_res_abs_{k}"],
+                    adaptive["delta_abs_max"],
+                )
+
+    store.append(LeafRecord(node.x, node.y, node.w, node.h, b.plane))
+
+    if writer:
+        q = list(b.q_values) + ["", "", ""]
+
+        writer.writerow(
+            {
+                "frame": frame_idx,
+                "bx": node.x,
+                "by": node.y,
+                "block_w": node.w,
+                "block_h": node.h,
+                "qt_depth": node.depth,
+                "split_type": node.split,
+                "mode": b.mode,
+                "candidate": b.candidate_name,
+                "bits": node.bits,
+                "split_bits": node.split_bits,
+                "sse": node.sse,
+                "cost": node.cost,
+                "q0": q[0],
+                "q1": q[1],
+                "q2": q[2],
+                "actual_inv_a": node.actual.a,
+                "actual_inv_b": node.actual.b,
+                "actual_inv_c": node.actual.c,
+                "recon_inv_a": b.plane.a,
+                "recon_inv_b": b.plane.b,
+                "recon_inv_c": b.plane.c,
+            }
+        )
+
+
+def paint(node, recon):
+    if node.is_leaf():
+        recon[node.y : node.y + node.h, node.x : node.x + node.w] = node.best.recon_block
+        return
+
+    for c in node.children:
+        paint(c, recon)
+
+
+def collect(node, s):
+    s["split_bits"] += node.split_bits
+
+    if node.split == "qt":
+        s["qt_nodes"] += 1
+    elif node.split == "bh":
+        s["bin_h_nodes"] += 1
+    elif node.split == "bv":
+        s["bin_v_nodes"] += 1
+
+    if node.is_leaf():
+        b = node.best
+        s["leaf_blocks"] += 1
+        s[f"{b.mode}_blocks"] += 1
+        s[f"candidate_{b.candidate_name}_count"] = s.get(
+            f"candidate_{b.candidate_name}_count",
+            0,
+        ) + 1
+
+        if b.mode == "delta":
+            s["delta_mode_count"] += 1
+
+            if b.q_values == (0, 0, 0):
+                s["zero_delta_blocks"] += 1
+
+        return
+
+    for c in node.children:
+        collect(c, s)
+
+
+# ============================================================
+# Metrics / padding
+# ============================================================
+
+def pad_to_block_multiple(img, bs):
+    h, w = img.shape
+    ph = (bs - h % bs) % bs
+    pw = (bs - w % bs) % bs
+
+    if ph or pw:
+        img = np.pad(img, ((0, ph), (0, pw)), mode="edge")
+
+    return img.copy(), h + ph, w + pw
+
+
+def compute_metrics(orig, recon, maxv, mask=None):
+    d = orig.astype(np.float64) - recon.astype(np.float64)
+
+    if mask is not None:
+        mask = mask.astype(bool)
+        if not np.any(mask):
+            return {
+                "mae": float("nan"),
+                "mse": float("nan"),
+                "rmse": float("nan"),
+                "psnr": float("nan"),
+                "max_error": float("nan"),
+            }
+        d = d[mask]
+
+    mse = float(np.mean(d * d))
+
+    return {
+        "mae": float(np.mean(np.abs(d))),
+        "mse": mse,
+        "rmse": math.sqrt(mse),
+        "psnr": float("inf") if mse == 0 else 10.0 * math.log10(maxv * maxv / mse),
+        "max_error": float(np.max(np.abs(d))),
+    }
+
+
+# ============================================================
+# Backward warping of previous GT video frame
+# ============================================================
+
+def bilinear_sample(img, map_x, map_y, valid, fill):
+    h, w = img.shape
+
+    mx = np.where(np.isfinite(map_x), map_x, 0.0)
+    my = np.where(np.isfinite(map_y), map_y, 0.0)
+
+    x0 = np.floor(mx).astype(np.int64)
+    y0 = np.floor(my).astype(np.int64)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    valid2 = (
+        valid
+        & (x0 >= 0)
+        & (y0 >= 0)
+        & (x1 < w)
+        & (y1 < h)
+    )
+
+    x0c = np.clip(x0, 0, w - 1)
+    x1c = np.clip(x1, 0, w - 1)
+    y0c = np.clip(y0, 0, h - 1)
+    y1c = np.clip(y1, 0, h - 1)
+
+    dx = mx - x0
+    dy = my - y0
+
+    v00 = img[y0c, x0c]
+    v01 = img[y0c, x1c]
+    v10 = img[y1c, x0c]
+    v11 = img[y1c, x1c]
+
+    out = (
+        (1.0 - dx) * (1.0 - dy) * v00
+        + dx * (1.0 - dy) * v01
+        + (1.0 - dx) * dy * v10
+        + dx * dy * v11
+    )
+
+    out = np.where(valid2, out, fill)
+
+    return np.clip(np.rint(out), 0, np.iinfo(np.uint16).max).astype(np.float64), valid2
+
+
+def relative_camera_transform(cam_source, cam_target):
+    """Return target_from_source in camera coordinates.
+
+    For current_to_previous JSONL, the adjacent transforms were accumulated
+    when the camera lookup was built. This relative transform also supports
+    arbitrary RA references such as current 16 -> reference 0 or 32.
+    """
+    w2c_target = np.asarray(cam_target["W2C"], dtype=np.float64)
+    c2w_source = np.asarray(cam_source["C2W"], dtype=np.float64)
+    m = w2c_target @ c2w_source
+    return m[:3, :3], m[:3, 3]
+
+
+def make_projection_precompute_dual(width, height, cam_source, cam_target):
+    """VGGT pixel-coordinate precompute.
+
+    ``source`` is unprojected with its own intrinsic and ``target`` is
+    projected with its own intrinsic. There is no NDC/projection matrix.
+    """
+    ks = np.asarray(cam_source["K"], dtype=np.float64)
+    kt = np.asarray(cam_target["K"], dtype=np.float64)
+
+    xs, ys = np.meshgrid(
+        np.arange(width, dtype=np.float64),
+        np.arange(height, dtype=np.float64),
+    )
+
+    return {
+        "width": int(width),
+        "height": int(height),
+        "x_norm": (xs - float(ks[0, 2])) / float(ks[0, 0]),
+        "y_norm": (ys - float(ks[1, 2])) / float(ks[1, 1]),
+        "fx_target": float(kt[0, 0]),
+        "fy_target": float(kt[1, 1]),
+        "cx_target": float(kt[0, 2]),
+        "cy_target": float(kt[1, 2]),
+        "z_sign": float(cam_source["z_sign"]),
+    }
+
+
+def backward_map_fast_pixel_coord_dual(depth_linear, precomp, r, t):
+    """Exact pixel-coordinate mapping used by the supplied VGGT script."""
+    z = np.asarray(depth_linear, dtype=np.float64)
     x_norm = precomp["x_norm"]
     y_norm = precomp["y_norm"]
+    z_sign = float(precomp["z_sign"])
 
-    z = depth_linear.astype(np.float32)
+    r = np.asarray(r, dtype=np.float64).reshape(3, 3)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
 
-    rvec = np.array(rt["rvec"], dtype=np.float32).reshape(3, 1)
-    tvec = np.array(rt["tvec"], dtype=np.float32)
+    kx = r[0, 0] * x_norm + r[0, 1] * y_norm + r[0, 2] * z_sign
+    ky = r[1, 0] * x_norm + r[1, 1] * y_norm + r[1, 2] * z_sign
+    kz = r[2, 0] * x_norm + r[2, 1] * y_norm + r[2, 2] * z_sign
 
-    R, _ = cv2.Rodrigues(rvec)
-    R = R.astype(np.float32)
+    xp = z * kx + float(t[0])
+    yp = z * ky + float(t[1])
+    zp = z * kz + float(t[2])
 
-    tx = float(tvec[0])
-    ty = float(tvec[1])
-    tz = float(tvec[2])
+    denom = np.maximum(np.abs(zp), 1e-8)
+    map_x = precomp["fx_target"] * (xp / denom) + precomp["cx_target"]
+    map_y = precomp["fy_target"] * (yp / denom) + precomp["cy_target"]
 
-    kx = R[0, 0] * x_norm + R[0, 1] * y_norm + R[0, 2] * z_sign
-    ky = R[1, 0] * x_norm + R[1, 1] * y_norm + R[1, 2] * z_sign
-    kz = R[2, 0] * x_norm + R[2, 1] * y_norm + R[2, 2] * z_sign
-
-    Xp = z * kx + tx
-    Yp = z * ky + ty
-    Zp = z * kz + tz
-
-    denom = np.maximum(np.abs(Zp), 1e-8)
-
-    map_x = fx * (Xp / denom) + cx
-    map_y = fy * (Yp / denom) + cy
-
+    width = int(precomp["width"])
+    height = int(precomp["height"])
     valid = (
         np.isfinite(map_x)
         & np.isfinite(map_y)
-        & (Zp * z_sign > 0)
+        & np.isfinite(z)
+        & np.isfinite(zp)
+        & (zp * z_sign > 0.0)
         & (map_x >= 0.0)
-        & (map_x <= w - 1)
+        & (map_x <= width - 1.0)
         & (map_y >= 0.0)
-        & (map_y <= h - 1)
+        & (map_y <= height - 1.0)
         & (z > 0.0)
     )
 
-    map_x = map_x.astype(np.float32)
-    map_y = map_y.astype(np.float32)
-
+    map_x = map_x.astype(np.float64)
+    map_y = map_y.astype(np.float64)
     map_x[~valid] = -1.0
     map_y[~valid] = -1.0
+    return map_x, map_y, valid, zp
 
-    return map_x, map_y
+
+def make_backward_map_cur_to_prev(depth_y_cur, cam_cur, cam_prev, width, height):
+    """Current-depth backward map to an arbitrary RA reference camera."""
+    depth_linear = (
+        np.asarray(depth_y_cur, dtype=np.float64)
+        * get_depth_scale_real(cam_cur)
+    )
+    precomp = make_projection_precompute_dual(
+        width,
+        height,
+        cam_source=cam_cur,
+        cam_target=cam_prev,
+    )
+    r, t = relative_camera_transform(cam_cur, cam_prev)
+    map_x, map_y, valid, _ = backward_map_fast_pixel_coord_dual(
+        depth_linear,
+        precomp,
+        r,
+        t,
+    )
+    return map_x, map_y, valid
 
 
-# ============================================================
-# Remap / Warp
-# ============================================================
+def forward_project_recon_depth_to_target(
+    ref_depth_y,
+    cam_ref,
+    cam_target,
+    width,
+    height,
+):
+    """Forward-project a decoded reference depth frame into the target view.
 
-def remap_plane(src, map_x, map_y, bit_depth, border_value):
-    maxv = (1 << bit_depth) - 1
-
-    dst = cv2.remap(
-        src.astype(np.float32),
-        map_x.astype(np.float32),
-        map_y.astype(np.float32),
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=float(border_value),
+    A z-buffer keeps the nearest projected surface. The resulting depth is
+    returned in the target frame's stored depth-sample domain.
+    """
+    depth_linear = (
+        np.asarray(ref_depth_y, dtype=np.float64)
+        * get_depth_scale_real(cam_ref)
+    )
+    precomp = make_projection_precompute_dual(
+        width,
+        height,
+        cam_source=cam_ref,
+        cam_target=cam_target,
+    )
+    r, t = relative_camera_transform(cam_ref, cam_target)
+    map_x, map_y, valid, z_target_signed = backward_map_fast_pixel_coord_dual(
+        depth_linear,
+        precomp,
+        r,
+        t,
     )
 
-    dst = np.clip(np.round(dst), 0, maxv)
+    # Linear depth follows the supplied projection convention: abs(camera Z).
+    z_target = np.abs(z_target_signed)
+    valid &= np.isfinite(z_target) & (z_target > 0.0)
 
-    if bit_depth <= 8:
-        return dst.astype(np.uint8)
+    zbuf = np.full(height * width, np.inf, dtype=np.float64)
+    if np.any(valid):
+        mx = map_x[valid]
+        my = map_y[valid]
+        zz = z_target[valid]
+        x0 = np.floor(mx).astype(np.int64)
+        y0 = np.floor(my).astype(np.int64)
 
-    return dst.astype(np.dtype("<u2"))
+        # Bilinear footprint with a nearest-depth z-buffer. The interpolation
+        # weights are intentionally not used for depth: each source surface
+        # contributes its actual transformed camera depth to covered samples.
+        for dy in (0, 1):
+            for dx in (0, 1):
+                xi = x0 + dx
+                yi = y0 + dy
+                ok = (
+                    (xi >= 0)
+                    & (xi < width)
+                    & (yi >= 0)
+                    & (yi < height)
+                )
+                if np.any(ok):
+                    flat = yi[ok] * width + xi[ok]
+                    np.minimum.at(zbuf, flat, zz[ok])
+
+    depth_target_linear = zbuf.reshape(height, width)
+    target_valid = np.isfinite(depth_target_linear)
+    depth_target_y = np.zeros((height, width), dtype=np.float64)
+    depth_target_y[target_valid] = (
+        depth_target_linear[target_valid]
+        / get_depth_scale_real(cam_target)
+    )
+    depth_target_y[target_valid] = np.clip(
+        depth_target_y[target_valid],
+        0.0,
+        1023.0,
+    )
+    return depth_target_y, target_valid
 
 
-def downsample_luma_map_to_chroma_map(map_x, map_y):
+def combine_projected_depths(pred0, valid0, pred1=None, valid1=None):
+    """Combine one or two projected reference depths without using GT depth."""
+    pred0 = np.asarray(pred0, dtype=np.float64)
+    valid0 = np.asarray(valid0, dtype=bool)
+
+    if pred1 is None or valid1 is None:
+        return pred0.copy(), valid0.copy(), np.zeros_like(valid0)
+
+    pred1 = np.asarray(pred1, dtype=np.float64)
+    valid1 = np.asarray(valid1, dtype=bool)
+    both = valid0 & valid1
+    only0 = valid0 & ~valid1
+    only1 = valid1 & ~valid0
+
+    out = np.zeros_like(pred0, dtype=np.float64)
+    out[only0] = pred0[only0]
+    out[only1] = pred1[only1]
+    out[both] = 0.5 * (pred0[both] + pred1[both])
+    return out, valid0 | valid1, both
+
+
+def downsample_map_for_chroma(map_x, map_y, valid):
     h, w = map_x.shape
+    hc = h // 2
+    wc = w // 2
 
-    if h % 2 != 0 or w % 2 != 0:
-        raise ValueError("luma map size must be even for YUV420")
+    mx = map_x[: hc * 2, : wc * 2].reshape(hc, 2, wc, 2).mean(axis=(1, 3)) / 2.0
+    my = map_y[: hc * 2, : wc * 2].reshape(hc, 2, wc, 2).mean(axis=(1, 3)) / 2.0
+    mv = valid[: hc * 2, : wc * 2].reshape(hc, 2, wc, 2).mean(axis=(1, 3)) >= 0.5
 
-    uv_h = h // 2
-    uv_w = w // 2
-
-    mx = map_x.reshape(uv_h, 2, uv_w, 2)
-    my = map_y.reshape(uv_h, 2, uv_w, 2)
-
-    valid = (mx >= 0.0) & (my >= 0.0)
-    cnt = np.sum(valid, axis=(1, 3)).astype(np.float32)
-
-    sum_x = np.sum(np.where(valid, mx, 0.0), axis=(1, 3))
-    sum_y = np.sum(np.where(valid, my, 0.0), axis=(1, 3))
-
-    avg_x = np.full((uv_h, uv_w), -1.0, dtype=np.float32)
-    avg_y = np.full((uv_h, uv_w), -1.0, dtype=np.float32)
-
-    ok = cnt > 0
-
-    avg_x[ok] = sum_x[ok] / cnt[ok]
-    avg_y[ok] = sum_y[ok] / cnt[ok]
-
-    map_x_uv = avg_x * 0.5
-    map_y_uv = avg_y * 0.5
-
-    map_x_uv[~ok] = -1.0
-    map_y_uv[~ok] = -1.0
-
-    return map_x_uv.astype(np.float32), map_y_uv.astype(np.float32)
+    return mx, my, mv
 
 
-def backward_warp_yuv420_bilinear(prev_y, prev_u, prev_v, map_x, map_y, bit_depth):
-    y = remap_plane(prev_y, map_x, map_y, bit_depth, 0)
+def _single_reference_warp(ref_yuv, rec_depth_y, cam_ref, cam_cur, args):
+    """Warp one already-coded reference view into the current view."""
+    ref_y, ref_u, ref_v = ref_yuv
+    h, w = ref_y.shape
 
-    map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
+    map_x, map_y, valid_y_map = make_backward_map_cur_to_prev(
+        rec_depth_y,
+        cam_cur,
+        cam_ref,
+        w,
+        h,
+    )
 
-    neutral = 128 if bit_depth <= 8 else 512
+    if args.invalid_fill == "zero":
+        fill_y = np.zeros_like(ref_y)
+    elif args.invalid_fill == "neutral":
+        fill_y = np.full_like(ref_y, args.max_value // 2)
+    else:
+        # Same-position sample from this reference. It is used only where the
+        # geometric map is invalid; valid samples always come from bilinear warp.
+        fill_y = ref_y
 
-    u = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
-    v = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
+    pred_y, valid_y = bilinear_sample(ref_y, map_x, map_y, valid_y_map, fill_y)
+
+    mx_c, my_c, valid_c_map = downsample_map_for_chroma(map_x, map_y, valid_y)
+
+    if args.invalid_fill == "zero":
+        fill_u = np.zeros_like(ref_u)
+        fill_v = np.zeros_like(ref_v)
+    elif args.invalid_fill == "neutral":
+        neutral = min(512, args.max_value)
+        fill_u = np.full_like(ref_u, neutral)
+        fill_v = np.full_like(ref_v, neutral)
+    else:
+        fill_u = ref_u
+        fill_v = ref_v
+
+    pred_u, valid_u = bilinear_sample(ref_u, mx_c, my_c, valid_c_map, fill_u)
+    pred_v, valid_v = bilinear_sample(ref_v, mx_c, my_c, valid_c_map, fill_v)
+
+    return {
+        "pred": (pred_y, pred_u, pred_v),
+        "valid_y": valid_y,
+        "valid_u": valid_u,
+        "valid_v": valid_v,
+    }
+
+
+def _prediction_metrics(cur_yuv, pred_yuv, valid_y, valid_u, valid_v, args):
+    cur_y, cur_u, cur_v = cur_yuv
+    pred_y, pred_u, pred_v = pred_yuv
+
+    my = compute_metrics(cur_y, pred_y, args.max_value)
+    my_valid = compute_metrics(cur_y, pred_y, args.max_value, mask=valid_y)
+    mu = compute_metrics(cur_u, pred_u, args.max_value)
+    mv = compute_metrics(cur_v, pred_v, args.max_value)
+
+    return {
+        "warp_valid_y_ratio": float(np.mean(valid_y)),
+        "warp_valid_uv_ratio": float(np.mean(valid_u & valid_v)),
+        "warp_y_psnr": my["psnr"],
+        "warp_y_mae": my["mae"],
+        "warp_y_mse": my["mse"],
+        "warp_y_psnr_valid": my_valid["psnr"],
+        "warp_y_mae_valid": my_valid["mae"],
+        "warp_u_psnr": mu["psnr"],
+        "warp_v_psnr": mv["psnr"],
+    }
+
+
+def _blend_two_predictions(pred0, valid0, pred1, valid1, fill, max_value):
+    """Blend two arrays without allowing invalid samples into the average."""
+    both = valid0 & valid1
+    only0 = valid0 & ~valid1
+    only1 = valid1 & ~valid0
+
+    out = np.asarray(fill, dtype=np.float64).copy()
+    out[only0] = pred0[only0]
+    out[only1] = pred1[only1]
+    out[both] = 0.5 * (pred0[both] + pred1[both])
+
+    return np.clip(np.rint(out), 0, max_value).astype(np.float64), both
+
+
+def backward_warp_prev_yuv_to_cur(prev_yuv, cur_yuv, rec_depth_y, cam_prev, cam_cur, args):
+    """Single-reference camera/depth predictor, used by sequential mode."""
+    warped = _single_reference_warp(prev_yuv, rec_depth_y, cam_prev, cam_cur, args)
+    stats = _prediction_metrics(
+        cur_yuv,
+        warped["pred"],
+        warped["valid_y"],
+        warped["valid_u"],
+        warped["valid_v"],
+        args,
+    )
+    stats.update(
+        {
+            "prediction_type": "P",
+            "warp_l0_valid_y_ratio": float(np.mean(warped["valid_y"])),
+            "warp_l1_valid_y_ratio": 0.0,
+            "warp_both_valid_y_ratio": 0.0,
+        }
+    )
+    return warped["pred"], stats
+
+
+def bidirectional_warp_yuv_to_cur(
+    l0_yuv,
+    l1_yuv,
+    cur_yuv,
+    rec_depth_y,
+    cam_l0,
+    cam_l1,
+    cam_cur,
+    args,
+):
+    """Create an RA B-frame predictor from two camera/depth warps.
+
+    Combination rule per sample:
+      - both valid: arithmetic mean of L0 and L1
+      - only one valid: use the valid prediction
+      - neither valid: apply --invalid-fill
+    """
+    w0 = _single_reference_warp(l0_yuv, rec_depth_y, cam_l0, cam_cur, args)
+    w1 = _single_reference_warp(l1_yuv, rec_depth_y, cam_l1, cam_cur, args)
+
+    l0_y, l0_u, l0_v = l0_yuv
+    l1_y, l1_u, l1_v = l1_yuv
+
+    if args.invalid_fill == "zero":
+        fill_y = np.zeros_like(l0_y)
+        fill_u = np.zeros_like(l0_u)
+        fill_v = np.zeros_like(l0_v)
+    elif args.invalid_fill == "neutral":
+        fill_y = np.full_like(l0_y, args.max_value // 2)
+        neutral = min(512, args.max_value)
+        fill_u = np.full_like(l0_u, neutral)
+        fill_v = np.full_like(l0_v, neutral)
+    else:
+        # Same-position bi-prediction is a neutral fallback when neither
+        # camera projection reaches the current sample.
+        fill_y = 0.5 * (l0_y + l1_y)
+        fill_u = 0.5 * (l0_u + l1_u)
+        fill_v = 0.5 * (l0_v + l1_v)
+
+    p0_y, p0_u, p0_v = w0["pred"]
+    p1_y, p1_u, p1_v = w1["pred"]
+
+    pred_y, both_y = _blend_two_predictions(
+        p0_y, w0["valid_y"], p1_y, w1["valid_y"], fill_y, args.max_value
+    )
+    pred_u, both_u = _blend_two_predictions(
+        p0_u, w0["valid_u"], p1_u, w1["valid_u"], fill_u, args.max_value
+    )
+    pred_v, both_v = _blend_two_predictions(
+        p0_v, w0["valid_v"], p1_v, w1["valid_v"], fill_v, args.max_value
+    )
+
+    valid_y = w0["valid_y"] | w1["valid_y"]
+    valid_u = w0["valid_u"] | w1["valid_u"]
+    valid_v = w0["valid_v"] | w1["valid_v"]
+    pred = (pred_y, pred_u, pred_v)
+
+    stats = _prediction_metrics(cur_yuv, pred, valid_y, valid_u, valid_v, args)
+
+    l0_valid_metrics = compute_metrics(
+        cur_yuv[0], p0_y, args.max_value, mask=w0["valid_y"]
+    )
+    l1_valid_metrics = compute_metrics(
+        cur_yuv[0], p1_y, args.max_value, mask=w1["valid_y"]
+    )
+
+    stats.update(
+        {
+            "prediction_type": "B",
+            "warp_l0_valid_y_ratio": float(np.mean(w0["valid_y"])),
+            "warp_l1_valid_y_ratio": float(np.mean(w1["valid_y"])),
+            "warp_both_valid_y_ratio": float(np.mean(both_y)),
+            "warp_both_valid_uv_ratio": float(np.mean(both_u & both_v)),
+            "warp_l0_y_psnr_valid": l0_valid_metrics["psnr"],
+            "warp_l1_y_psnr_valid": l1_valid_metrics["psnr"],
+        }
+    )
+
+    return pred, stats
+
+
+def intra_prediction_stats():
+    """Statistics for RA anchor frames whose output predictor is the source frame."""
+    return {
+        "prediction_type": "I",
+        "warp_valid_y_ratio": 0.0,
+        "warp_valid_uv_ratio": 0.0,
+        "warp_l0_valid_y_ratio": 0.0,
+        "warp_l1_valid_y_ratio": 0.0,
+        "warp_both_valid_y_ratio": 0.0,
+        "warp_both_valid_uv_ratio": 0.0,
+        "warp_y_psnr": float("inf"),
+        "warp_y_mae": 0.0,
+        "warp_y_mse": 0.0,
+        "warp_y_psnr_valid": float("inf"),
+        "warp_y_mae_valid": 0.0,
+        "warp_u_psnr": float("inf"),
+        "warp_v_psnr": float("inf"),
+        "warp_l0_y_psnr_valid": float("nan"),
+        "warp_l1_y_psnr_valid": float("nan"),
+    }
+
+
+# ============================================================
+# Frame simulation
+# ============================================================
+
+def simulate_one_depth_frame(
+    depth,
+    frame_idx,
+    args,
+    grid,
+    prev_store=None,
+    writer=None,
+    adaptive=None,
+    plane_warp_ctx=None,
+):
+    h, w = depth.shape
+    padded, hp, wp = pad_to_block_multiple(depth, args.block_size)
+
+    recon = np.zeros_like(padded, dtype=np.float64)
+    store = []
+    prev_store = prev_store or []
+
+    root_count = 0
+    total_bits = 0.0
+    total_sse = 0.0
+
+    st = {
+        "leaf_blocks": 0,
+        "qt_nodes": 0,
+        "bin_h_nodes": 0,
+        "bin_v_nodes": 0,
+        "split_bits": 0.0,
+        "direct_blocks": 0,
+        "copy_blocks": 0,
+        "delta_blocks": 0,
+        "zero_delta_blocks": 0,
+        "delta_mode_count": 0,
+    }
+
+    for y in range(0, hp, args.block_size):
+        for x in range(0, wp, args.block_size):
+            root_count += 1
+
+            root = encode_node(
+                padded,
+                x,
+                y,
+                args.block_size,
+                args.block_size,
+                0,
+                None,
+                args,
+                grid,
+                store,
+                prev_store,
+                adaptive,
+                plane_warp_ctx,
+            )
+
+            commit_node(root, store, adaptive, writer, frame_idx, args)
+            paint(root, recon)
+            collect(root, st)
+
+            total_bits += root.bits
+            total_sse += root.sse
+
+    rec = recon[:h, :w]
+    m = compute_metrics(depth, rec, args.max_value)
+
+    leaves = max(int(st["leaf_blocks"]), 1)
+
+    summary = {
+        "frame": frame_idx,
+        "width": w,
+        "height": h,
+        "padded_width": wp,
+        "padded_height": hp,
+        "root_block_size": args.block_size,
+        "max_qt_depth": args.max_qt_depth,
+        "num_roots": root_count,
+        "leaf_blocks": int(st["leaf_blocks"]),
+        "qt_nodes": int(st["qt_nodes"]),
+        "bin_h_nodes": int(st["bin_h_nodes"]),
+        "bin_v_nodes": int(st["bin_v_nodes"]),
+        "split_bits": float(st["split_bits"]),
+        "depth_bits": total_bits,
+        "depth_bpp": total_bits / (h * w),
+        "depth_sse": total_sse,
+        "depth_mae": m["mae"],
+        "depth_mse": m["mse"],
+        "depth_rmse": m["rmse"],
+        "depth_psnr": m["psnr"],
+        "depth_max_error": m["max_error"],
+        "plane_model": "c_only" if args.c_only_plane else "abc",
+        "c_only_plane": int(args.c_only_plane),
+        "direct_blocks": int(st["direct_blocks"]),
+        "copy_blocks": int(st["copy_blocks"]),
+        "delta_blocks": int(st["delta_blocks"]),
+        "direct_ratio": st["direct_blocks"] / leaves,
+        "copy_ratio": st["copy_blocks"] / leaves,
+        "delta_ratio": st["delta_blocks"] / leaves,
+        "zero_delta_blocks": int(st["zero_delta_blocks"]),
+        "zero_delta_ratio_in_delta": (
+            st["zero_delta_blocks"] / st["delta_mode_count"]
+            if st["delta_mode_count"]
+            else 0.0
+        ),
+    }
+
+    for k, v in st.items():
+        if k.startswith("candidate_"):
+            summary[k.replace("-", "_")] = int(v)
+
+    if adaptive is not None:
+        summary.update(adaptive["mode"].snapshot("final_mode"))
+        summary.update(adaptive["candidate"].snapshot("final_candidate"))
+
+        if "copy_candidate_unary" in adaptive:
+            for i, c in enumerate(adaptive["copy_candidate_unary"]):
+                summary[f"final_copy_unary_ctx{i}_p1"] = c.p1
+
+        if "qt_split" in adaptive:
+            for i, c in enumerate(adaptive["qt_split"]):
+                summary[f"final_qt_split_depth{i}_p1"] = c.p1
+
+        if "delta_res_abs_a" in adaptive:
+            for k in "abc":
+                summary.update(
+                    adaptive[f"delta_res_abs_{k}"].snapshot(f"final_delta_abs_{k}")
+                )
+
+    return rec, summary, store
+
+
+# ============================================================
+# YUV420p10le IO
+# ============================================================
+
+def frame_size_yuv420p10le(w, h):
+    return w * h * 3
+
+
+def count_frames(path, w, h):
+    fs = frame_size_yuv420p10le(w, h)
+    size = os.path.getsize(path)
+    n = size // fs
+    trailing = size % fs
+
+    if trailing:
+        print(f"[WARN] trailing bytes ignored: {path}, trailing={trailing}")
+
+    return n
+
+
+def read_yuv420p10le_frame(fp, idx, w, h):
+    fs = frame_size_yuv420p10le(w, h)
+    fp.seek(idx * fs)
+
+    y_raw = fp.read(w * h * 2)
+    if len(y_raw) != w * h * 2:
+        raise EOFError(f"Failed to read Y frame {idx}")
+
+    cw = w // 2
+    ch = h // 2
+
+    u_raw = fp.read(cw * ch * 2)
+    v_raw = fp.read(cw * ch * 2)
+
+    if len(u_raw) != cw * ch * 2 or len(v_raw) != cw * ch * 2:
+        raise EOFError(f"Failed to read UV frame {idx}")
+
+    y = np.frombuffer(y_raw, dtype="<u2").reshape(h, w).astype(np.float64)
+    u = np.frombuffer(u_raw, dtype="<u2").reshape(ch, cw).astype(np.float64)
+    v = np.frombuffer(v_raw, dtype="<u2").reshape(ch, cw).astype(np.float64)
 
     return y, u, v
 
 
-# ============================================================
-# Optional subblk4 + 6tap torch
-# ============================================================
-
-LUMA_6TAP_32_NP = np.array([
-    [0,   0, 256,   0,   0, 0],
-    [0,  -4, 253,   9,  -2, 0],
-    [1,  -7, 249,  17,  -4, 0],
-    [1, -10, 245,  25,  -6, 1],
-    [1, -13, 241,  34,  -8, 1],
-    [2, -16, 235,  44, -10, 1],
-    [2, -18, 229,  53, -12, 2],
-    [2, -20, 223,  63, -14, 2],
-    [2, -22, 217,  72, -15, 2],
-    [3, -23, 209,  82, -17, 2],
-    [3, -24, 202,  92, -19, 2],
-    [3, -25, 194, 101, -20, 3],
-    [3, -25, 185, 111, -21, 3],
-    [3, -26, 178, 121, -23, 3],
-    [3, -25, 168, 131, -24, 3],
-    [3, -25, 159, 141, -25, 3],
-    [3, -25, 150, 150, -25, 3],
-    [3, -25, 141, 159, -25, 3],
-    [3, -24, 131, 168, -25, 3],
-    [3, -23, 121, 178, -26, 3],
-    [3, -21, 111, 185, -25, 3],
-    [3, -20, 101, 194, -25, 3],
-    [2, -19,  92, 202, -24, 3],
-    [2, -17,  82, 209, -23, 3],
-    [2, -15,  72, 217, -22, 2],
-    [2, -14,  63, 223, -20, 2],
-    [2, -12,  53, 229, -18, 2],
-    [1, -10,  44, 235, -16, 2],
-    [1,  -8,  34, 241, -13, 1],
-    [1,  -6,  25, 245, -10, 1],
-    [0,  -4,  17, 249,  -7, 1],
-    [0,  -2,   9, 253,  -4, 0],
-], dtype=np.float32)
+def read_yuv420p10le_y_frame(fp, idx, w, h):
+    y, _, _ = read_yuv420p10le_frame(fp, idx, w, h)
+    return y
 
 
-def make_subblk4_avg_flow_map_fast(map_x, map_y):
-    h, w = map_x.shape
+def write_yuv420p10le_frame(fp, y, u, v, maxv):
+    y16 = np.clip(np.rint(y), 0, maxv).astype("<u2")
+    u16 = np.clip(np.rint(u), 0, maxv).astype("<u2")
+    v16 = np.clip(np.rint(v), 0, maxv).astype("<u2")
 
-    if h % 4 != 0 or w % 4 != 0:
-        raise ValueError("subblk4 mode requires width/height multiple of 4")
-
-    yy, xx = np.meshgrid(
-        np.arange(h, dtype=np.float32),
-        np.arange(w, dtype=np.float32),
-        indexing="ij",
-    )
-
-    flow_x = map_x - xx
-    flow_y = map_y - yy
-    valid = (map_x >= 0.0) & (map_y >= 0.0)
-
-    bh = h // 4
-    bw = w // 4
-
-    fx4 = flow_x.reshape(bh, 4, bw, 4)
-    fy4 = flow_y.reshape(bh, 4, bw, 4)
-    vd4 = valid.reshape(bh, 4, bw, 4)
-
-    corner_valid = (
-        vd4[:, 0, :, 0]
-        & vd4[:, 0, :, 3]
-        & vd4[:, 3, :, 0]
-        & vd4[:, 3, :, 3]
-    )
-
-    avg_fx = (
-        fx4[:, 0, :, 0]
-        + fx4[:, 0, :, 3]
-        + fx4[:, 3, :, 0]
-        + fx4[:, 3, :, 3]
-    ) * 0.25
-
-    avg_fy = (
-        fy4[:, 0, :, 0]
-        + fy4[:, 0, :, 3]
-        + fy4[:, 3, :, 0]
-        + fy4[:, 3, :, 3]
-    ) * 0.25
-
-    avg_fx = np.repeat(np.repeat(avg_fx, 4, axis=0), 4, axis=1)
-    avg_fy = np.repeat(np.repeat(avg_fy, 4, axis=0), 4, axis=1)
-    blk_valid = np.repeat(np.repeat(corner_valid, 4, axis=0), 4, axis=1)
-
-    out_x = xx + avg_fx
-    out_y = yy + avg_fy
-
-    out_x[~blk_valid] = -1.0
-    out_y[~blk_valid] = -1.0
-
-    return out_x.astype(np.float32), out_y.astype(np.float32)
+    fp.write(y16.tobytes())
+    fp.write(u16.tobytes())
+    fp.write(v16.tobytes())
 
 
-def remap_plane_subblk4_6tap_torch(src, map_x, map_y, bit_depth, device=None):
-    try:
-        import torch
-        import torch.nn.functional as F
-    except ImportError as exc:
-        raise ImportError(
-            "subblk4_6tap_torch mode requires torch. "
-            "Use --warp-filter bilinear or install torch."
-        ) from exc
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    h, w = src.shape
-    maxv = (1 << bit_depth) - 1
-
-    sub_x, sub_y = make_subblk4_avg_flow_map_fast(map_x, map_y)
-
-    valid_np = (
-        (sub_x >= 0.0)
-        & (sub_y >= 0.0)
-        & (sub_x <= w - 1)
-        & (sub_y <= h - 1)
-    )
-
-    sx = torch.from_numpy(sub_x).to(device=device, dtype=torch.float32)
-    sy = torch.from_numpy(sub_y).to(device=device, dtype=torch.float32)
-    valid = torch.from_numpy(valid_np).to(device=device)
-
-    ix = torch.floor(sx).to(torch.long)
-    iy = torch.floor(sy).to(torch.long)
-
-    frac_x = torch.round((sx - ix.float()) * 32.0).to(torch.long)
-    frac_y = torch.round((sy - iy.float()) * 32.0).to(torch.long)
-
-    carry_x = frac_x >= 32
-    carry_y = frac_y >= 32
-
-    ix = ix + carry_x.long()
-    iy = iy + carry_y.long()
-
-    frac_x = torch.where(carry_x, torch.zeros_like(frac_x), frac_x)
-    frac_y = torch.where(carry_y, torch.zeros_like(frac_y), frac_y)
-
-    ix = ix.clamp(0, w - 1)
-    iy = iy.clamp(0, h - 1)
-
-    src_t = torch.from_numpy(src.astype(np.float32)).to(device)
-    src_t = src_t.view(1, 1, h, w)
-
-    src_pad = F.pad(src_t, (2, 3, 2, 3), mode="replicate")
-
-    patches_all = F.unfold(src_pad, kernel_size=(6, 6), stride=1)
-
-    col_idx = (iy * w + ix).reshape(-1)
-    patches = patches_all[0, :, col_idx]
-
-    coeff = torch.from_numpy(LUMA_6TAP_32_NP).to(device=device, dtype=torch.float32)
-
-    cx = coeff[frac_x.reshape(-1)]
-    cy = coeff[frac_y.reshape(-1)]
-
-    weight = (cy[:, :, None] * cx[:, None, :]).reshape(-1, 36)
-
-    val = torch.sum(patches.transpose(0, 1) * weight, dim=1)
-
-    val = torch.round(val / 65536.0)
-    val = val.clamp(0, maxv)
-
-    val = val.reshape(h, w)
-    val = torch.where(valid, val, torch.zeros_like(val))
-
-    out = val.detach().cpu().numpy()
-
-    if bit_depth <= 8:
-        return out.astype(np.uint8)
-
-    return out.astype(np.dtype("<u2"))
+def write_depth_as_yuv420p10le(fp, y, w, h, maxv):
+    uv = np.full((h // 2, w // 2), min(512, maxv), dtype=np.float64)
+    write_yuv420p10le_frame(fp, y, uv, uv, maxv)
 
 
-def backward_warp_yuv420_subblk4_6tap_torch(
-    prev_y,
-    prev_u,
-    prev_v,
-    map_x,
-    map_y,
-    bit_depth,
-    torch_device=None,
-):
-    wy = remap_plane_subblk4_6tap_torch(
-        prev_y,
-        map_x,
-        map_y,
-        bit_depth,
-        device=torch_device,
-    )
+def write_yuv420p10le_frame_at(fp, output_idx, y, u, v, w, h, maxv):
+    """Write one frame at a display-order slot while coding in RA order."""
+    if output_idx < 0:
+        raise ValueError("output_idx must be non-negative")
+    fp.seek(output_idx * frame_size_yuv420p10le(w, h))
+    write_yuv420p10le_frame(fp, y, u, v, maxv)
 
-    map_x_uv, map_y_uv = downsample_luma_map_to_chroma_map(map_x, map_y)
 
-    neutral = 128 if bit_depth <= 8 else 512
-
-    wu = remap_plane(prev_u, map_x_uv, map_y_uv, bit_depth, neutral)
-    wv = remap_plane(prev_v, map_x_uv, map_y_uv, bit_depth, neutral)
-
-    return wy, wu, wv
+def write_depth_as_yuv420p10le_at(fp, output_idx, y, w, h, maxv):
+    uv = np.full((h // 2, w // 2), min(512, maxv), dtype=np.float64)
+    write_yuv420p10le_frame_at(fp, output_idx, y, uv, uv, w, h, maxv)
 
 
 # ============================================================
-# Main
+# Frame coding order / RA hierarchy
 # ============================================================
+
+def _append_ra_midpoints(lo, hi, layer, order, plan_by_frame, coded_rank):
+    """Depth-first hierarchical B-frame order for one RA interval."""
+    if hi - lo <= 1:
+        return
+
+    mid = (lo + hi) // 2
+    if mid <= lo or mid >= hi:
+        return
+
+    # Both endpoints are already coded and become L0/L1 references.
+    # depth_reference is retained only as a backward-compatible summary field;
+    # analytic temporal coding below uses both endpoints independently.
+    depth_ref = lo if coded_rank[lo] > coded_rank[hi] else hi
+
+    order.append(mid)
+    plan_by_frame[mid] = {
+        "reference_l0": lo,
+        "reference_l1": hi,
+        "depth_reference": depth_ref,
+        "prediction_type": "B",
+        "temporal_layer": layer,
+    }
+    coded_rank[mid] = len(order) - 1
+
+    _append_ra_midpoints(lo, mid, layer + 1, order, plan_by_frame, coded_rank)
+    _append_ra_midpoints(mid, hi, layer + 1, order, plan_by_frame, coded_rank)
+
+
+def build_frame_coding_plan(start, end, coding_order, ra_gop_size, ref_offset):
+    """Return coding-order records for display frames in [start, end).
+
+    RA GOP size 32 starts as:
+      0(I), 32(I), 16(B:0/32), 8(B:0/16), 4(B:0/8), ...
+
+    Output YUV files are still written in display order.
+    """
+    if start < 0 or end <= start:
+        return []
+
+    if coding_order == "sequential":
+        plan = []
+        for coding_idx, fi in enumerate(range(start, end)):
+            ref = fi - ref_offset
+            if ref < start:
+                ref = None
+            pred_type = "I" if ref is None else "P"
+            plan.append(
+                {
+                    "frame": fi,
+                    "reference_l0": ref,
+                    "reference_l1": None,
+                    "depth_reference": ref,
+                    "prediction_type": pred_type,
+                    "temporal_layer": 0,
+                    "coding_order_idx": coding_idx,
+                    "display_order_idx": fi - start,
+                }
+            )
+        return plan
+
+    order = [start]
+    plan_by_frame = {
+        start: {
+            "reference_l0": None,
+            "reference_l1": None,
+            "depth_reference": None,
+            "prediction_type": "I",
+            "temporal_layer": 0,
+        }
+    }
+    coded_rank = {start: 0}
+
+    gop_start = start
+    last_frame = end - 1
+
+    while gop_start < last_frame:
+        gop_end = min(gop_start + ra_gop_size, last_frame)
+
+        # Each RA endpoint is coded as an independent anchor/I picture.
+        if gop_end not in coded_rank:
+            order.append(gop_end)
+            plan_by_frame[gop_end] = {
+                "reference_l0": None,
+                "reference_l1": None,
+                "depth_reference": None,
+                "prediction_type": "I",
+                "temporal_layer": 0,
+            }
+            coded_rank[gop_end] = len(order) - 1
+
+        _append_ra_midpoints(
+            gop_start,
+            gop_end,
+            1,
+            order,
+            plan_by_frame,
+            coded_rank,
+        )
+        gop_start = gop_end
+
+    expected = list(range(start, end))
+    if sorted(order) != expected or len(order) != len(expected):
+        raise RuntimeError(
+            "Internal RA order error: requested frames were not emitted exactly once"
+        )
+
+    plan = []
+    for coding_idx, fi in enumerate(order):
+        rec = dict(plan_by_frame[fi])
+        rec.update(
+            {
+                "frame": fi,
+                "coding_order_idx": coding_idx,
+                "display_order_idx": fi - start,
+            }
+        )
+        plan.append(rec)
+
+    return plan
+
+
+# ============================================================
+# CLI / main
+# ============================================================
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Inverse-depth plane compression simulation + "
+            "camera plane candidate + RA bidirectional projection predictor "
+            "using camparam_v2 JSONL."
+        )
+    )
+
+    p.add_argument("--input-depth", required=True, help="depth YUV420p10le sequence")
+    p.add_argument(
+        "--input-video",
+        default="",
+        help="GT video YUV420p10le sequence to backward warp. If empty, input-depth is used.",
+    )
+    p.add_argument("--camera-param", required=True, help="camparam_v2 JSONL")
+
+    p.add_argument("--width", type=int, required=True)
+    p.add_argument("--height", type=int, required=True)
+
+    p.add_argument("--start-frame", type=int, default=0)
+    p.add_argument("--num-frames", type=int, default=0)
+    p.add_argument(
+        "--coding-order",
+        choices=["ra", "sequential"],
+        default="ra",
+        help="Frame processing order. Default: hierarchical random access.",
+    )
+    p.add_argument(
+        "--ra-gop-size",
+        type=int,
+        default=32,
+        help="RA anchor interval. 32 gives 0(I),32(I),16(B),8(B),...",
+    )
+    p.add_argument(
+        "--ref-offset",
+        type=int,
+        default=1,
+        help="Reference offset used only with --coding-order sequential.",
+    )
+
+    p.add_argument("--block-size", type=int, default=128)
+    p.add_argument("--max-qt-depth", type=int, default=0)
+
+    p.add_argument("--lambda-rd", type=float, default=0.0)
+
+    # Plane is 1/Y, so qsteps are much smaller than linear-depth qsteps.
+    p.add_argument("--qa", type=float, default=1e-6)
+    p.add_argument("--qb", type=float, default=1e-6)
+    p.add_argument("--qc", type=float, default=1e-4)
+    p.add_argument(
+        "--c-only-plane",
+        action="store_true",
+        help=(
+            "represent every block as invY(x,y)=c only; force a=b=0 and "
+            "code only c in direct/delta modes"
+        ),
+    )
+
+    p.add_argument("--mode-bits", type=int, default=2)
+    p.add_argument("--max-value", type=int, default=1023)
+    p.add_argument("--depth-eps", type=float, default=1.0)
+
+    # Camera-projected reconstructed-depth candidate. Enabled by default so
+    # RA B pictures actually use temporal depth prediction from POC 16 onward.
+    p.add_argument(
+        "--plane-warp-candidate",
+        dest="plane_warp_candidate",
+        action="store_true",
+        help="enable analytic L0/L1/average camera-plane candidates (default)",
+    )
+    p.add_argument(
+        "--no-plane-warp-candidate",
+        dest="plane_warp_candidate",
+        action="store_false",
+        help="disable analytic camera-plane candidates",
+    )
+    p.set_defaults(plane_warp_candidate=True)
+
+    p.add_argument(
+        "--same-position-temporal-candidate",
+        dest="same_position_temporal_candidate",
+        action="store_true",
+        help=(
+            "enable same-position L0/L1/average reconstructed-plane "
+            "candidates (default)"
+        ),
+    )
+    p.add_argument(
+        "--no-same-position-temporal-candidate",
+        dest="same_position_temporal_candidate",
+        action="store_false",
+        help="disable the same-position RA temporal plane candidate",
+    )
+    p.set_defaults(same_position_temporal_candidate=True)
+
+    p.add_argument("--plane-warp-samples", type=int, default=5)
+    p.add_argument("--plane-warp-min-valid-ratio", type=float, default=0.5)
+
+    p.add_argument("--adaptive-prob", action="store_true")
+    p.add_argument("--copy-candidate-unary", action="store_true")
+    p.add_argument("--qt-split-adaptive", action="store_true")
+
+    p.add_argument("--delta-residual-adaptive", action="store_true")
+    p.add_argument("--delta-abs-max", type=int, default=7)
+
+    p.add_argument("--max-candidates", type=int, default=8)
+
+    p.add_argument("--prob-lr", type=float, default=0.05)
+    p.add_argument("--prob-min", type=float, default=0.02)
+    p.add_argument("--prob-max", type=float, default=0.95)
+    p.add_argument("--prob-reset", choices=["frame", "sequence"], default="frame")
+
+    p.add_argument(
+        "--invalid-fill",
+        choices=["prev_same", "zero", "neutral"],
+        default="prev_same",
+        help="fill strategy used only where no temporal warp is valid",
+    )
+
+    p.add_argument("--out-csv", default="inv_depth_plane_backward_stats.csv")
+    p.add_argument("--out-json", default="inv_depth_plane_backward_summary.json")
+    p.add_argument("--out-depth-recon-yuv", default="recon_inv_plane_depth.yuv")
+    p.add_argument("--out-pred-yuv", default="backward_pred.yuv")
+    p.add_argument("--out-block-csv", default="")
+
+    return p.parse_args()
+
+
+def validate_args(args):
+    if args.block_size <= 0 or args.max_qt_depth < 0:
+        raise ValueError("bad block/split size")
+
+    if min(args.qa, args.qb, args.qc) <= 0:
+        raise ValueError("qstep must be positive")
+
+    if args.width % 2 or args.height % 2:
+        raise ValueError("yuv420p10le requires even width/height")
+
+    if args.copy_candidate_unary and not args.adaptive_prob:
+        raise ValueError("--copy-candidate-unary requires --adaptive-prob")
+
+    if args.qt_split_adaptive and not args.adaptive_prob:
+        raise ValueError("--qt-split-adaptive requires --adaptive-prob")
+
+    if args.delta_residual_adaptive and not args.adaptive_prob:
+        raise ValueError("--delta-residual-adaptive requires --adaptive-prob")
+
+    if args.max_candidates <= 0 or args.delta_abs_max < 0:
+        raise ValueError("bad candidate/residual setting")
+
+    if not (0 <= args.prob_lr <= 1):
+        raise ValueError("bad probability setting")
+
+    if args.prob_min < 0 or args.prob_max <= 0 or args.prob_min >= args.prob_max:
+        raise ValueError("bad probability setting")
+
+    if args.ref_offset <= 0:
+        raise ValueError("--ref-offset must be positive")
+
+    if args.ra_gop_size <= 0:
+        raise ValueError("--ra-gop-size must be positive")
+
+    if args.coding_order == "ra" and (args.ra_gop_size & (args.ra_gop_size - 1)) != 0:
+        raise ValueError("--ra-gop-size must be a power of two in RA mode")
+
+    if args.depth_eps <= 0:
+        raise ValueError("--depth-eps must be positive")
+
+    if args.plane_warp_samples < 2:
+        raise ValueError("--plane-warp-samples must be >= 2")
+
+    if not (0.0 <= args.plane_warp_min_valid_ratio <= 1.0):
+        raise ValueError("--plane-warp-min-valid-ratio must be in [0,1]")
+
+
+def ensure_camera_or_raise(camera_lookup, frame_idx, label):
+    cam = get_camera(camera_lookup, frame_idx)
+
+    if not camera_has_required_mats(cam):
+        raise ValueError(f"{label} camera frame {frame_idx} is invalid")
+
+    return cam
+
 
 def main():
-    ap = argparse.ArgumentParser()
+    args = parse_args()
+    validate_args(args)
 
-    ap.add_argument("--seq-yuv", required=True)
-    ap.add_argument("--depth-yuv", required=True)
-    ap.add_argument("--param-jsonl", required=True)
+    video_path = args.input_video if args.input_video else args.input_depth
 
-    ap.add_argument("--width", type=int, required=True)
-    ap.add_argument("--height", type=int, required=True)
+    depth_total = count_frames(args.input_depth, args.width, args.height)
+    video_total = count_frames(video_path, args.width, args.height)
+    total = min(depth_total, video_total)
 
-    ap.add_argument(
-        "--seq-start",
-        type=int,
-        default=0,
-        help=(
-            "Frame index offset in seq-yuv. "
-            "For rap1 starting at original frame 32, use --seq-start 32."
-        ),
+    if total <= 0:
+        raise ValueError("no complete frames found")
+
+    if args.start_frame < 0 or args.start_frame >= total:
+        raise ValueError("bad frame range")
+
+    end = total if args.num_frames == 0 else min(total, args.start_frame + args.num_frames)
+
+    coding_plan = build_frame_coding_plan(
+        start=args.start_frame,
+        end=end,
+        coding_order=args.coding_order,
+        ra_gop_size=args.ra_gop_size,
+        ref_offset=args.ref_offset,
     )
 
-    ap.add_argument("--coded-width", type=int, default=None)
-    ap.add_argument("--coded-height", type=int, default=None)
+    if not coding_plan:
+        raise ValueError("empty coding plan")
 
-    ap.add_argument("--pad-left", type=int, default=0)
-    ap.add_argument("--pad-top", type=int, default=0)
+    cam_json = load_camera_json(args.camera_param)
+    cam_header = cam_json["header"]
 
-    ap.add_argument("--bit-depth", type=int, default=10)
-
-    ap.add_argument("--out-yuv", required=True)
-    ap.add_argument("--out-q-jsonl", required=True)
-
-    ap.add_argument("--pred-n", type=int, default=3)
-    ap.add_argument("--pred-degree", type=int, default=2)
-
-    # User-requested defaults
-    ap.add_argument("--ext-bits", type=int, default=16)
-    ap.add_argument("--r-step", type=float, default=1.0 / 16.0)
-    ap.add_argument("--t-step-norm", type=float, default=1.0 / 4.0)
-
-    # Intrinsic delta coding
-    ap.add_argument("--intr-delta-bits", type=int, default=16)
-    ap.add_argument(
-        "--intr-step",
-        type=float,
-        default=1.0 / 16.0,
-        help=(
-            "Intrinsic delta quantization step in pixel units. "
-            "q_intr_delta = round(delta / intr_step). Default: 1/16 pixel."
-        ),
-    )
-
-    ap.add_argument("--intr-f-max", type=float, default=4.0)
-    ap.add_argument("--intr-c-min", type=float, default=-1.0)
-    ap.add_argument("--intr-c-max", type=float, default=2.0)
-
-    ap.add_argument(
-        "--depth-scale-bits",
-        type=int,
-        default=16,
-        help=(
-            "Bit estimate for fixed-point depth_scale integer. "
-            "depth_scale_precision is assumed known or fixed by design."
-        ),
-    )
-
-    ap.add_argument(
-        "--warp-filter",
-        choices=["bilinear", "subblk4_6tap_torch"],
-        default="bilinear",
-    )
-
-    ap.add_argument(
-        "--torch-device",
-        default=None,
-        help="cuda, cpu, cuda:0, etc. Used only for subblk4_6tap_torch.",
-    )
-
-    ap.add_argument("--overwrite", action="store_true")
-
-    args = ap.parse_args()
-
-    if args.r_step <= 0:
-        raise ValueError("--r-step must be positive")
-    if args.t_step_norm <= 0:
-        raise ValueError("--t-step-norm must be positive")
-    if args.intr_step <= 0:
-        raise ValueError("--intr-step must be positive")
-
-    seq_yuv = Path(args.seq_yuv)
-    depth_yuv = Path(args.depth_yuv)
-    param_jsonl = Path(args.param_jsonl)
-
-    out_yuv = Path(args.out_yuv)
-    out_q_jsonl = Path(args.out_q_jsonl)
-
-    for p in [out_yuv, out_q_jsonl]:
-        if p.exists():
-            if args.overwrite:
-                p.unlink()
-            else:
-                raise RuntimeError(f"Output exists: {p}")
-
-    src_w = int(args.width)
-    src_h = int(args.height)
-    bit_depth = int(args.bit_depth)
-
-    pad_left = int(args.pad_left)
-    pad_top = int(args.pad_top)
-
-    coded_w = (
-        int(args.coded_width)
-        if args.coded_width is not None
-        else align_to(src_w + pad_left, 4)
-    )
-
-    coded_h = (
-        int(args.coded_height)
-        if args.coded_height is not None
-        else align_to(src_h + pad_top, 4)
-    )
-
-    pad_right, pad_bottom = calc_padding(
-        src_w,
-        src_h,
-        coded_w,
-        coded_h,
-        pad_left,
-        pad_top,
-    )
-
-    validate_yuv420_padding(
-        src_w,
-        src_h,
-        coded_w,
-        coded_h,
-        pad_left,
-        pad_top,
-        pad_right,
-        pad_bottom,
-    )
-
-    header, frames = load_param_jsonl(param_jsonl)
-
-    pose_mode = header.get("pose_mode", "current_to_previous")
-    if pose_mode != "current_to_previous":
-        raise RuntimeError(
-            f"This script expects pose_mode='current_to_previous', got '{pose_mode}'."
+    if int(cam_header["width"]) != args.width or int(cam_header["height"]) != args.height:
+        raise ValueError(
+            "camera/depth resolution mismatch: "
+            f"camera={cam_header['width']}x{cam_header['height']}, "
+            f"input={args.width}x{args.height}"
         )
 
-    depth_scale_real = get_depth_scale_real_from_header(header)
-    depth_scale_precision = get_depth_scale_precision_from_header(header)
+    camera_lookup = build_camera_lookup(cam_json)
+    depth_scale_real = get_depth_scale_real_from_header(cam_header)
 
-    if depth_scale_real <= 0:
-        raise ValueError(f"Invalid depth_scale_real: {depth_scale_real}")
-
-    intr_gt_original0 = header["intrinsic"]
-
-    intr_gt_padded0 = make_padded_intrinsic_from_original(
-        intr_gt_original0,
-        pad_left=pad_left,
-        pad_top=pad_top,
-    )
-
-    # Header first-frame intrinsic absolute coding.
-    intr_q0, intr_dec0, intr_clip0 = quantize_intrinsic_16(
-        intr_gt_padded0,
-        coded_w,
-        coded_h,
-        f_max=args.intr_f_max,
-        c_min=args.intr_c_min,
-        c_max=args.intr_c_max,
-    )
-
-    seq_count = count_frames(seq_yuv, src_w, src_h, bit_depth)
-    depth_count = count_frames(depth_yuv, src_w, src_h, 10)
-
-    if args.seq_start < 0:
-        raise ValueError("--seq-start must be non-negative")
-
-    available_seq_count = seq_count - args.seq_start
-    if available_seq_count <= 0:
-        raise RuntimeError(
-            f"--seq-start {args.seq_start} is outside seq-yuv frame count {seq_count}"
-        )
-
-    max_poc = min(
-        available_seq_count,
-        depth_count,
-        max(frames.keys()) + 1,
-    )
-
-    if max_poc <= 0:
-        raise RuntimeError(
-            f"No frames to process: available_seq_count={available_seq_count}, "
-            f"depth_count={depth_count}, param_frames={len(frames)}"
-        )
-
-    decoded_hist = []
-
-    q_abs_max_ext = signed_q_abs_max(args.ext_bits)
-    q_abs_max_intr = signed_q_abs_max(args.intr_delta_bits)
-
-    header_intrinsic_bits = 4 * 16
-    depth_scale_bits = int(args.depth_scale_bits)
-    z_sign_bits = 1
-    header_bits = header_intrinsic_bits + depth_scale_bits + z_sign_bits
-
-    total_ext_bits = 0
-    total_ext_bits_r = 0
-    total_ext_bits_t = 0
-    total_ext_bits_each = np.zeros(6, dtype=np.int64)
-
-    total_intr_delta_bits = 0
-    total_intr_delta_bits_each = np.zeros(4, dtype=np.int64)
-    total_intr_delta_frames = 0
-    total_intr_clipped_frames = 0
-
-    total_coded_frames = 0
-    total_clipped_frames = 0
-
-    sum_mae_active = 0.0
-    sum_mae_coded = 0.0
-    sum_psnr_active = 0.0
-    sum_psnr_coded = 0.0
-    psnr_count_active = 0
-    psnr_count_coded = 0
-
-    ys_active, xs_active = active_slice(src_w, src_h, pad_left, pad_top)
-
-    decoded_intrinsics = [intr_dec0]
-
-    print("============================================================")
-    print("Input summary")
-    print("============================================================")
-    print(f"seq_yuv               : {seq_yuv}")
-    print(f"depth_yuv             : {depth_yuv}")
-    print(f"param_jsonl           : {param_jsonl}")
-    print(f"seq frames total      : {seq_count}")
-    print(f"seq_start             : {args.seq_start}")
-    print(f"depth frames          : {depth_count}")
-    print(f"param max poc         : {max(frames.keys())}")
-    print(f"process frames        : {max_poc}")
-    print(f"depth_scale header    : {header['depth_scale']}")
-    print(f"depth_scale_precision : {depth_scale_precision}")
-    print(f"depth_scale_real      : {depth_scale_real}")
-    print(f"pose_mode             : {pose_mode}")
-    print(f"warp_filter           : {args.warp_filter}")
-    print("------------------------------------------------------------")
-    print(f"ext-bits              : {args.ext_bits}")
-    print(f"r-step                : {args.r_step}")
-    print(f"t-step-norm           : {args.t_step_norm}")
-    print(f"intr-delta-bits       : {args.intr_delta_bits}")
-    print(f"intr-step             : {args.intr_step}")
-    print("============================================================")
-
-    with open(out_q_jsonl, "w", encoding="utf-8") as fq:
-        fq.write(json.dumps({
-            "type": "header",
-
-            "source_size": {
-                "width": src_w,
-                "height": src_h,
-            },
-            "coded_size": {
-                "width": coded_w,
-                "height": coded_h,
-            },
-            "padding": {
-                "left": pad_left,
-                "top": pad_top,
-                "right": pad_right,
-                "bottom": pad_bottom,
-            },
-
-            "seq_start": int(args.seq_start),
-
-            "projection_mode": "fast_pixel_coordinate_no_ndc_dual_intrinsic",
-            "warp_filter": args.warp_filter,
-            "precompute": [
-                "target: x_norm=(x-cx_tar)/fx_tar",
-                "target: y_norm=(y-cy_tar)/fy_tar",
-                "reference: fx_ref,fy_ref,cx_ref,cy_ref cached",
-            ],
-            "depth_padding": "edge",
-            "image_padding": "edge",
-
-            "depth_scale_header": header["depth_scale"],
-            "depth_scale_precision": depth_scale_precision,
-            "depth_scale_real": depth_scale_real,
-            "depth_decode_formula": (
-                "depth_linear = depth_y * depth_scale / depth_scale_precision"
-                if depth_scale_precision is not None
-                else "depth_linear = depth_y * depth_scale"
-            ),
-
-            "intrinsic_gt_original0": intr_gt_original0,
-            "intrinsic_gt_padded0": intr_gt_padded0,
-            "intrinsic_q16_first": intr_q0,
-            "intrinsic_dec_first": intr_dec0,
-            "intrinsic_first_clipped": intr_clip0,
-
-            "intrinsic_delta_code": "signed_truncated_exp_golomb",
-            "intrinsic_delta_bits": args.intr_delta_bits,
-            "intrinsic_delta_q_abs_max": q_abs_max_intr,
-            "intrinsic_delta_q_range": [-q_abs_max_intr, q_abs_max_intr],
-            "intrinsic_delta_step": args.intr_step,
-            "intrinsic_delta_order": ["dfx", "dfy", "dcx", "dcy"],
-            "intrinsic_decode": (
-                "intrinsic_dec[poc] = intrinsic_dec[poc-1] "
-                "+ q_intrinsic_delta[poc] * intrinsic_delta_step"
-            ),
-
-            "extrinsic_bits": args.ext_bits,
-            "extrinsic_q_abs_max": q_abs_max_ext,
-            "extrinsic_q_range": [-q_abs_max_ext, q_abs_max_ext],
-            "r_step": args.r_step,
-            "t_step_norm": args.t_step_norm,
-            "pred_n": args.pred_n,
-            "pred_degree": args.pred_degree,
-
-            "bit_count": {
-                "header_intrinsic_bits": header_intrinsic_bits,
-                "depth_scale_bits": depth_scale_bits,
-                "z_sign_bits": z_sign_bits,
-                "header_bits": header_bits,
-                "extrinsic_code": "signed_truncated_exp_golomb",
-                "intrinsic_delta_code": "signed_truncated_exp_golomb",
-            },
-
-            "param6_order": [
-                "rx",
-                "ry",
-                "rz",
-                "tx_over_depth_scale_real",
-                "ty_over_depth_scale_real",
-                "tz_over_depth_scale_real",
-            ],
-        }, ensure_ascii=False) + "\n")
-
-        for poc in range(max_poc):
-            seq_idx = args.seq_start + poc
-
-            cur_y, cur_u, cur_v = read_yuv420(
-                seq_yuv,
-                seq_idx,
-                src_w,
-                src_h,
-                bit_depth,
-            )
-
-            cur_y_pad, cur_u_pad, cur_v_pad = pad_yuv420_edge(
-                cur_y,
-                cur_u,
-                cur_v,
-                coded_w,
-                coded_h,
-                pad_left,
-                pad_top,
-            )
-
-            if poc == 0:
-                write_yuv420(out_yuv, cur_y_pad, cur_u_pad, cur_v_pad)
-
-                p0_dec = np.zeros(6, dtype=np.float32)
-                decoded_hist.append(p0_dec)
-
-                fq.write(json.dumps({
-                    "poc": 0,
-                    "seq_idx": int(seq_idx),
-
-                    "q_residual": [0, 0, 0, 0, 0, 0],
-                    "q_residual_bits": [0, 0, 0, 0, 0, 0],
-                    "q_residual_total_bits": 0,
-                    "param6_dec": p0_dec.astype(float).tolist(),
-
-                    "intrinsic_delta_gt": [0.0, 0.0, 0.0, 0.0],
-                    "q_intrinsic_delta": [0, 0, 0, 0],
-                    "q_intrinsic_delta_bits": [0, 0, 0, 0],
-                    "q_intrinsic_delta_total_bits": 0,
-                    "intrinsic_dec": intr_dec0,
-
-                    "mae_y_active": 0.0,
-                    "mae_y_coded": 0.0,
-                    "psnr_y_active": "inf",
-                    "psnr_y_coded": "inf",
-                }, ensure_ascii=False) + "\n")
-
-                print(f"[{poc:04d}/{max_poc - 1:04d}] copy first frame, seq_idx={seq_idx}")
-                continue
-
-            if poc not in frames:
-                raise RuntimeError(f"POC {poc} not found in param jsonl")
-
-            frame = frames[poc]
-
-            if "intrinsic_delta" not in frame:
-                raise RuntimeError(
-                    f"POC {poc} has no intrinsic_delta. "
-                    f"Regenerate camParam JSONL with per-frame intrinsic_delta."
-                )
-
-            # ------------------------------------------------------------
-            # Intrinsic delta coding
-            # ------------------------------------------------------------
-            intr_delta_gt = np.array(frame["intrinsic_delta"], dtype=np.float32).reshape(4)
-
-            q_intr, d_intr, clip_intr = quantize_intrinsic_delta_4(
-                intr_delta_gt,
-                step=args.intr_step,
-                bits=args.intr_delta_bits,
-            )
-
-            q_intr_bits_each, q_intr_bits_total = q_residual_bits_signed_trunc_exp_golomb(
-                q_intr,
-                q_abs_max=q_abs_max_intr,
-            )
-
-            total_intr_delta_bits += q_intr_bits_total
-            total_intr_delta_bits_each += np.array(q_intr_bits_each, dtype=np.int64)
-            total_intr_delta_frames += 1
-
-            intrinsic_clipped = bool(np.any(clip_intr))
-            if intrinsic_clipped:
-                total_intr_clipped_frames += 1
-
-            intr_dec_cur = add_intrinsic_delta(
-                decoded_intrinsics[-1],
-                d_intr,
-            )
-
-            decoded_intrinsics.append(intr_dec_cur)
-
-            intr_dec_ref = decoded_intrinsics[poc - 1]
-            intr_dec_tar = decoded_intrinsics[poc]
-
-            # ------------------------------------------------------------
-            # Extrinsic coding
-            # ------------------------------------------------------------
-            p_gt = param6_from_frame(frame, depth_scale_real)
-
-            p_pred = predict_from_history(
-                decoded_hist,
-                pred_n=args.pred_n,
-                pred_degree=args.pred_degree,
-            )
-
-            residual = p_gt - p_pred
-
-            q_r, d_r, clip_r = quant_s(
-                residual[:3],
-                step=args.r_step,
-                bits=args.ext_bits,
-            )
-
-            q_t, d_t, clip_t = quant_s(
-                residual[3:],
-                step=args.t_step_norm,
-                bits=args.ext_bits,
-            )
-
-            q_residual = np.concatenate([q_r, q_t]).astype(np.int32)
-
-            q_bits_each, q_bits_total = q_residual_bits_signed_trunc_exp_golomb(
-                q_residual,
-                q_abs_max=q_abs_max_ext,
-            )
-
-            total_ext_bits += q_bits_total
-            total_ext_bits_r += sum(q_bits_each[:3])
-            total_ext_bits_t += sum(q_bits_each[3:])
-            total_ext_bits_each += np.array(q_bits_each, dtype=np.int64)
-
-            total_coded_frames += 1
-
-            p_dec = p_pred.copy()
-            p_dec[:3] += d_r
-            p_dec[3:] += d_t
-
-            decoded_hist.append(p_dec)
-
-            rt_dec = rt_from_param6(p_dec, depth_scale_real)
-
-            # ------------------------------------------------------------
-            # Depth
-            # ------------------------------------------------------------
-            depth_y, _, _ = read_yuv420(
-                depth_yuv,
-                poc,
-                src_w,
-                src_h,
-                10,
-            )
-
-            depth_linear = depth_y.astype(np.float32) * float(depth_scale_real)
-
-            depth_linear_pad = pad_2d_edge(
-                depth_linear,
-                coded_w,
-                coded_h,
-                pad_left,
-                pad_top,
-            ).astype(np.float32)
-
-            # ------------------------------------------------------------
-            # Projection with dual intrinsic
-            # target: current intrinsic
-            # ref   : previous intrinsic
-            # ------------------------------------------------------------
-            projection_precomp = make_projection_precompute_dual(
-                coded_w,
-                coded_h,
-                intr_tar=intr_dec_tar,
-                intr_ref=intr_dec_ref,
-            )
-
-            map_x, map_y = backward_map_fast_pixel_coord_dual(
-                depth_linear=depth_linear_pad,
-                precomp=projection_precomp,
-                rt=rt_dec,
-            )
-
-            prev_seq_idx = args.seq_start + poc - 1
-
-            prev_y, prev_u, prev_v = read_yuv420(
-                seq_yuv,
-                prev_seq_idx,
-                src_w,
-                src_h,
-                bit_depth,
-            )
-
-            prev_y_pad, prev_u_pad, prev_v_pad = pad_yuv420_edge(
-                prev_y,
-                prev_u,
-                prev_v,
-                coded_w,
-                coded_h,
-                pad_left,
-                pad_top,
-            )
-
-            if args.warp_filter == "bilinear":
-                wy, wu, wv = backward_warp_yuv420_bilinear(
-                    prev_y_pad,
-                    prev_u_pad,
-                    prev_v_pad,
-                    map_x,
-                    map_y,
-                    bit_depth,
-                )
-            elif args.warp_filter == "subblk4_6tap_torch":
-                wy, wu, wv = backward_warp_yuv420_subblk4_6tap_torch(
-                    prev_y_pad,
-                    prev_u_pad,
-                    prev_v_pad,
-                    map_x,
-                    map_y,
-                    bit_depth,
-                    torch_device=args.torch_device,
-                )
-            else:
-                raise ValueError(args.warp_filter)
-
-            write_yuv420(out_yuv, wy, wu, wv)
-
-            mae_y_coded = float(np.mean(np.abs(
-                wy.astype(np.float32) - cur_y_pad.astype(np.float32)
-            )))
-
-            mae_y_active = float(np.mean(np.abs(
-                wy[ys_active, xs_active].astype(np.float32)
-                - cur_y_pad[ys_active, xs_active].astype(np.float32)
-            )))
-
-            psnr_y_coded = calc_psnr(
-                wy,
-                cur_y_pad,
-                bit_depth,
-            )
-
-            psnr_y_active = calc_psnr(
-                wy[ys_active, xs_active],
-                cur_y_pad[ys_active, xs_active],
-                bit_depth,
-            )
-
-            clipped = bool(np.any(clip_r) or np.any(clip_t))
-            if clipped:
-                total_clipped_frames += 1
-
-            sum_mae_active += mae_y_active
-            sum_mae_coded += mae_y_coded
-
-            if np.isfinite(psnr_y_active):
-                sum_psnr_active += psnr_y_active
-                psnr_count_active += 1
-
-            if np.isfinite(psnr_y_coded):
-                sum_psnr_coded += psnr_y_coded
-                psnr_count_coded += 1
-
-            fq.write(json.dumps({
-                "poc": int(poc),
-                "seq_idx": int(seq_idx),
-
-                "q_residual": q_residual.astype(int).tolist(),
-                "q_residual_bits": q_bits_each,
-                "q_residual_total_bits": int(q_bits_total),
-                "param6_pred": p_pred.astype(float).tolist(),
-                "param6_dec": p_dec.astype(float).tolist(),
-                "param6_gt": p_gt.astype(float).tolist(),
-                "rt_dec": rt_dec,
-                "extrinsic_clipped": clipped,
-
-                "intrinsic_delta_gt": intr_delta_gt.astype(float).tolist(),
-                "q_intrinsic_delta": q_intr.astype(int).tolist(),
-                "intrinsic_delta_dec": d_intr.astype(float).tolist(),
-                "q_intrinsic_delta_bits": q_intr_bits_each,
-                "q_intrinsic_delta_total_bits": int(q_intr_bits_total),
-                "intrinsic_ref_dec": intr_dec_ref,
-                "intrinsic_tar_dec": intr_dec_tar,
-                "intrinsic_clipped": intrinsic_clipped,
-
-                "mae_y_active": mae_y_active,
-                "mae_y_coded": mae_y_coded,
-                "psnr_y_active": json_safe_float(psnr_y_active),
-                "psnr_y_coded": json_safe_float(psnr_y_coded),
-            }, ensure_ascii=False) + "\n")
-
-            print(
-                f"[{poc:04d}/{max_poc - 1:04d}] "
-                f"seq_idx={seq_idx}, "
-                f"Y-PSNR-active={psnr_y_active:.3f} dB, "
-                f"Y-PSNR-coded={psnr_y_coded:.3f} dB, "
-                f"Y-MAE-active={mae_y_active:.3f}, "
-                f"Y-MAE-coded={mae_y_coded:.3f}, "
-                f"ext_clip={clipped}, "
-                f"intr_clip={intrinsic_clipped}, "
-                f"ext_bits={q_bits_total}, "
-                f"intr_bits={q_intr_bits_total}"
-            )
-
-    total_bits = header_bits + total_ext_bits + total_intr_delta_bits
-
-    print("============================================================")
-    print("Padding / projection summary")
-    print("============================================================")
-    print(f"source size           : {src_w}x{src_h}")
-    print(f"coded size            : {coded_w}x{coded_h}")
     print(
-        f"padding               : "
-        f"L={pad_left}, T={pad_top}, "
-        f"R={pad_right}, B={pad_bottom}"
+        "Camera depth scale real: "
+        f"{depth_scale_real:.12g} "
+        "(depth_scale / depth_scale_precision)"
     )
-    print(f"seq_start             : {args.seq_start}")
-    print("projection            : fast pixel-coordinate, dual intrinsic, no NDC")
-    print(f"warp filter           : {args.warp_filter}")
-    print("image/depth padding   : edge")
-    print("------------------------------------------------------------")
-    print("Depth scale")
-    print("------------------------------------------------------------")
-    print(f"depth_scale header    : {header['depth_scale']}")
-    print(f"depth_scale precision : {depth_scale_precision}")
-    print(f"depth_scale real      : {depth_scale_real}")
-    print("decoder formula       : depth_linear = depth_y * depth_scale_real")
-    print("------------------------------------------------------------")
-    print("Intrinsic")
-    print("------------------------------------------------------------")
-    print(f"first intrinsic gt    : {intr_gt_original0}")
-    print(f"first intrinsic padded: {intr_gt_padded0}")
-    print(f"first intrinsic dec   : {intr_dec0}")
-    print(f"first intrinsic clip  : {intr_clip0}")
-    print(f"intrinsic delta step  : {args.intr_step}")
-    print(f"intrinsic delta bits  : {args.intr_delta_bits}")
-    print(f"intrinsic q range     : [-{q_abs_max_intr}, {q_abs_max_intr}]")
-    print("============================================================")
-    print("Metric summary")
-    print("============================================================")
+    print(f"Camera pose mode       : {cam_header['pose_mode']}")
+    print(f"Coding order           : {args.coding_order}")
+    if args.coding_order == "ra":
+        print(f"RA GOP size            : {args.ra_gop_size}")
+    preview = ", ".join(str(x["frame"]) for x in coding_plan[:16])
+    if len(coding_plan) > 16:
+        preview += ", ..."
+    print(f"Coding POC preview     : {preview}")
 
-    if total_coded_frames > 0:
-        avg_mae_active = sum_mae_active / total_coded_frames
-        avg_mae_coded = sum_mae_coded / total_coded_frames
-        avg_psnr_active = (
-            sum_psnr_active / psnr_count_active
-            if psnr_count_active > 0
-            else float("inf")
-        )
-        avg_psnr_coded = (
-            sum_psnr_coded / psnr_count_coded
-            if psnr_count_coded > 0
-            else float("inf")
-        )
+    grid = GridCache()
 
-        print(f"avg MAE active        : {avg_mae_active:.3f}")
-        print(f"avg MAE coded         : {avg_mae_coded:.3f}")
-        print(f"avg PSNR active       : {avg_psnr_active:.3f} dB")
-        print(f"avg PSNR coded        : {avg_psnr_coded:.3f} dB")
+    seq_adapt = (
+        create_adaptive_models(args)
+        if args.adaptive_prob and args.prob_reset == "sequence"
+        else None
+    )
 
-    print("============================================================")
-    print("Bit summary")
-    print("============================================================")
-    print(f"header intrinsic bits : {header_intrinsic_bits} bits")
-    print(f"  fx, fy, cx, cy      : 16 bits each")
-    print(f"depth_scale bits      : {depth_scale_bits} bits")
-    print(f"z_sign bits           : {z_sign_bits} bits")
-    print(f"header bits           : {header_bits} bits")
-    print("------------------------------------------------------------")
-    print(f"extrinsic code        : signed truncated Exp-Golomb")
-    print(f"extrinsic q range     : [-{q_abs_max_ext}, {q_abs_max_ext}]")
-    print(f"extrinsic frames      : {total_coded_frames}")
-    print(f"extrinsic clipped     : {total_clipped_frames}")
-    print(f"extrinsic total bits  : {total_ext_bits} bits")
+    summaries = []
+    frame_store = {}
+    frame_recon_depth = {}
 
-    if total_coded_frames > 0:
-        avg_ext_bits = total_ext_bits / total_coded_frames
-        avg_r_bits = total_ext_bits_r / total_coded_frames
-        avg_t_bits = total_ext_bits_t / total_coded_frames
-        avg_bits_each = total_ext_bits_each.astype(np.float64) / total_coded_frames
+    depth_recon_fp = open(args.out_depth_recon_yuv, "wb+") if args.out_depth_recon_yuv else None
+    pred_fp = open(args.out_pred_yuv, "wb+") if args.out_pred_yuv else None
 
-        print(f"avg ext bits/frame    : {avg_ext_bits:.3f}")
-        print(f"avg rotation bits     : {avg_r_bits:.3f} / frame")
-        print(f"avg translation bits  : {avg_t_bits:.3f} / frame")
-        print(
-            "avg ext bits each     : "
-            f"rx={avg_bits_each[0]:.3f}, "
-            f"ry={avg_bits_each[1]:.3f}, "
-            f"rz={avg_bits_each[2]:.3f}, "
-            f"tx={avg_bits_each[3]:.3f}, "
-            f"ty={avg_bits_each[4]:.3f}, "
-            f"tz={avg_bits_each[5]:.3f}"
-        )
+    block_fp = None
+    writer = None
 
-    print("------------------------------------------------------------")
-    print(f"intrinsic delta code  : signed truncated Exp-Golomb")
-    print(f"intrinsic delta range : [-{q_abs_max_intr}, {q_abs_max_intr}]")
-    print(f"intrinsic delta frames: {total_intr_delta_frames}")
-    print(f"intrinsic clipped     : {total_intr_clipped_frames}")
-    print(f"intrinsic delta bits  : {total_intr_delta_bits} bits")
+    if args.out_block_csv:
+        block_fp = open(args.out_block_csv, "w", newline="")
 
-    if total_intr_delta_frames > 0:
-        avg_intr_bits = total_intr_delta_bits / total_intr_delta_frames
-        avg_intr_each = total_intr_delta_bits_each.astype(np.float64) / total_intr_delta_frames
+        fields = [
+            "frame",
+            "bx",
+            "by",
+            "block_w",
+            "block_h",
+            "qt_depth",
+            "split_type",
+            "mode",
+            "candidate",
+            "bits",
+            "split_bits",
+            "sse",
+            "cost",
+            "q0",
+            "q1",
+            "q2",
+            "actual_inv_a",
+            "actual_inv_b",
+            "actual_inv_c",
+            "recon_inv_a",
+            "recon_inv_b",
+            "recon_inv_c",
+        ]
 
-        print(f"avg intr bits/frame   : {avg_intr_bits:.3f}")
-        print(
-            "avg intr bits each    : "
-            f"dfx={avg_intr_each[0]:.3f}, "
-            f"dfy={avg_intr_each[1]:.3f}, "
-            f"dcx={avg_intr_each[2]:.3f}, "
-            f"dcy={avg_intr_each[3]:.3f}"
-        )
+        writer = csv.DictWriter(block_fp, fieldnames=fields)
+        writer.writeheader()
 
-    print("------------------------------------------------------------")
-    print(f"total bits            : {total_bits} bits")
-    print("============================================================")
+    try:
+        with open(args.input_depth, "rb") as depth_fp, open(video_path, "rb") as video_fp:
+            for item in coding_plan:
+                fi = int(item["frame"])
+                ref_l0 = item["reference_l0"]
+                ref_l1 = item["reference_l1"]
+                depth_ref_idx = item["depth_reference"]
+                prediction_type = str(item["prediction_type"])
+                coding_idx = int(item["coding_order_idx"])
+                display_idx = int(item["display_order_idx"])
+                temporal_layer = int(item["temporal_layer"])
+
+                if args.adaptive_prob and args.prob_reset == "frame":
+                    adaptive = create_adaptive_models(args)
+                else:
+                    adaptive = seq_adapt
+
+                depth_y = read_yuv420p10le_y_frame(depth_fp, fi, args.width, args.height)
+                cur_video = read_yuv420p10le_frame(video_fp, fi, args.width, args.height)
+
+                cam_cur = ensure_camera_or_raise(camera_lookup, fi, "current")
+
+                # --------------------------------------------------------
+                # RA temporal depth candidates.
+                #
+                # Both same-position temporal candidates and camera-plane
+                # candidates use reconstructed leaf planes from the actual RA
+                # L0/L1 references. Camera candidates are transformed
+                # analytically per block, matching the successful LD path.
+                # --------------------------------------------------------
+                plane_warp_ctx = None
+                depth_pred_stats = {
+                    "depth_pred_valid_ratio": 0.0,
+                    "depth_pred_l0_valid_ratio": 0.0,
+                    "depth_pred_l1_valid_ratio": 0.0,
+                    "depth_pred_both_valid_ratio": 0.0,
+                }
+
+                temporal_candidate_enabled = (
+                    args.plane_warp_candidate
+                    or args.same_position_temporal_candidate
+                )
+
+                if temporal_candidate_enabled and prediction_type in ("P", "B"):
+                    if ref_l0 is None or ref_l0 not in frame_store:
+                        raise RuntimeError(
+                            f"POC {fi}: reconstructed L0 plane store {ref_l0} "
+                            "is unavailable"
+                        )
+
+                    cam_l0_depth = ensure_camera_or_raise(
+                        camera_lookup,
+                        ref_l0,
+                        "depth-L0-reference",
+                    )
+
+                    l1_store = None
+                    cam_l1_depth = None
+                    if prediction_type == "B":
+                        if ref_l1 is None or ref_l1 not in frame_store:
+                            raise RuntimeError(
+                                f"POC {fi}: reconstructed L1 plane store {ref_l1} "
+                                "is unavailable"
+                            )
+                        l1_store = frame_store[ref_l1]
+                        cam_l1_depth = ensure_camera_or_raise(
+                            camera_lookup,
+                            ref_l1,
+                            "depth-L1-reference",
+                        )
+
+                    plane_warp_ctx = PlaneWarpContext(
+                        l0_store=frame_store[ref_l0],
+                        cam_l0=cam_l0_depth,
+                        cam_cur=cam_cur,
+                        frame_w=args.width,
+                        frame_h=args.height,
+                        l1_store=l1_store,
+                        cam_l1=cam_l1_depth,
+                        source_type=(
+                            "analytic_plane_bi"
+                            if prediction_type == "B"
+                            else "analytic_plane_l0"
+                        ),
+                    )
+
+                    depth_pred_stats = {
+                        "depth_pred_valid_ratio": 1.0,
+                        "depth_pred_l0_valid_ratio": 1.0,
+                        "depth_pred_l1_valid_ratio": (
+                            1.0 if prediction_type == "B" else 0.0
+                        ),
+                        "depth_pred_both_valid_ratio": (
+                            1.0 if prediction_type == "B" else 0.0
+                        ),
+                    }
+
+                rec_depth_y, sm, cur_store = simulate_one_depth_frame(
+                    depth_y,
+                    fi,
+                    args,
+                    grid,
+                    prev_store=None,
+                    writer=writer,
+                    adaptive=adaptive,
+                    plane_warp_ctx=plane_warp_ctx,
+                )
+
+                frame_store[fi] = cur_store
+                frame_recon_depth[fi] = np.asarray(rec_depth_y, dtype=np.float64).copy()
+                sm.update(depth_pred_stats)
+
+                if depth_recon_fp:
+                    write_depth_as_yuv420p10le_at(
+                        depth_recon_fp,
+                        display_idx,
+                        rec_depth_y,
+                        args.width,
+                        args.height,
+                        args.max_value,
+                    )
+
+                if prediction_type == "B":
+                    if ref_l0 is None or ref_l1 is None:
+                        raise RuntimeError(
+                            f"POC {fi}: B prediction requires both L0 and L1"
+                        )
+
+                    l0_video = read_yuv420p10le_frame(
+                        video_fp, ref_l0, args.width, args.height
+                    )
+                    l1_video = read_yuv420p10le_frame(
+                        video_fp, ref_l1, args.width, args.height
+                    )
+                    cam_l0 = ensure_camera_or_raise(
+                        camera_lookup, ref_l0, "warp-L0-reference"
+                    )
+                    cam_l1 = ensure_camera_or_raise(
+                        camera_lookup, ref_l1, "warp-L1-reference"
+                    )
+
+                    pred_video, warp_stats = bidirectional_warp_yuv_to_cur(
+                        l0_video,
+                        l1_video,
+                        cur_video,
+                        rec_depth_y,
+                        cam_l0,
+                        cam_l1,
+                        cam_cur,
+                        args,
+                    )
+
+                elif prediction_type == "P":
+                    if ref_l0 is None:
+                        raise RuntimeError(f"POC {fi}: P prediction requires L0")
+
+                    l0_video = read_yuv420p10le_frame(
+                        video_fp, ref_l0, args.width, args.height
+                    )
+                    cam_l0 = ensure_camera_or_raise(
+                        camera_lookup, ref_l0, "warp-L0-reference"
+                    )
+
+                    pred_video, warp_stats = backward_warp_prev_yuv_to_cur(
+                        l0_video,
+                        cur_video,
+                        rec_depth_y,
+                        cam_l0,
+                        cam_cur,
+                        args,
+                    )
+
+                else:
+                    # RA endpoints (e.g. POC 0 and 32) are I/anchor frames.
+                    pred_video = cur_video
+                    warp_stats = intra_prediction_stats()
+
+                if pred_fp:
+                    write_yuv420p10le_frame_at(
+                        pred_fp,
+                        display_idx,
+                        pred_video[0],
+                        pred_video[1],
+                        pred_video[2],
+                        args.width,
+                        args.height,
+                        args.max_value,
+                    )
+
+                sm.update(warp_stats)
+                sm["depth_scale_real"] = depth_scale_real
+                sm["camera_pose_mode"] = cam_header["pose_mode"]
+                sm["coding_order"] = args.coding_order
+                sm["coding_order_idx"] = coding_idx
+                sm["display_order_idx"] = display_idx
+                sm["prediction_type"] = prediction_type
+                sm["reference_l0"] = -1 if ref_l0 is None else int(ref_l0)
+                sm["reference_l1"] = -1 if ref_l1 is None else int(ref_l1)
+                sm["plane_reference_frame"] = (
+                    -1 if ref_l0 is None else int(ref_l0)
+                )
+                sm["plane_reference_l0"] = -1 if ref_l0 is None else int(ref_l0)
+                sm["plane_reference_l1"] = -1 if ref_l1 is None else int(ref_l1)
+                sm["depth_prediction_type"] = (
+                    "none" if plane_warp_ctx is None else plane_warp_ctx.source_type
+                )
+                sm["same_position_temporal_enabled"] = int(
+                    args.same_position_temporal_candidate
+                )
+                sm["same_position_temporal_count"] = (
+                    0
+                    if plane_warp_ctx is None
+                    else 2 if plane_warp_ctx.l1_store is not None else 1
+                )
+                # Backward-compatible single-reference column.
+                sm["reference_frame"] = -1 if ref_l0 is None else int(ref_l0)
+                sm["temporal_layer"] = temporal_layer
+
+                summaries.append(sm)
+
+                l0_text = "-" if ref_l0 is None else str(ref_l0)
+                l1_text = "-" if ref_l1 is None else str(ref_l1)
+                print(
+                    f"CO={coding_idx:4d} | "
+                    f"POC={fi:4d} | "
+                    f"Type={prediction_type} | "
+                    f"L0/L1={l0_text:>4s}/{l1_text:<4s} | "
+                    f"TL={temporal_layer:2d} | "
+                    f"depthBits={sm['depth_bits']:.1f} | "
+                    f"depthPSNR={sm['depth_psnr']:.3f} | "
+                    f"warpYPSNR={sm['warp_y_psnr']:.3f} | "
+                    f"warpYPSNRValid={sm['warp_y_psnr_valid']:.3f} | "
+                    f"valid={sm['warp_valid_y_ratio']:.3f} | "
+                    f"depthPredValid={sm['depth_pred_valid_ratio']:.3f} | "
+                    f"leaf={sm['leaf_blocks']} | "
+                    f"QT={sm['qt_nodes']} | "
+                    f"BH/BV={sm['bin_h_nodes']}/{sm['bin_v_nodes']} | "
+                    f"D/C/Δ={sm['direct_ratio']:.3f}/"
+                    f"{sm['copy_ratio']:.3f}/"
+                    f"{sm['delta_ratio']:.3f}"
+                )
+
+    finally:
+        if depth_recon_fp:
+            depth_recon_fp.close()
+
+        if pred_fp:
+            pred_fp.close()
+
+        if block_fp:
+            block_fp.close()
+
+    if not summaries:
+        raise RuntimeError("No frames processed")
+
+    with open(args.out_csv, "w", newline="") as f:
+        fields = sorted(set().union(*(s.keys() for s in summaries)))
+        w_csv = csv.DictWriter(f, fieldnames=fields)
+        w_csv.writeheader()
+        w_csv.writerows(summaries)
+
+    avg = {}
+
+    for k in sorted(set().union(*(s.keys() for s in summaries))):
+        vals = []
+
+        for s in summaries:
+            try:
+                v = float(s[k])
+
+                if math.isfinite(v):
+                    vals.append(v)
+            except Exception:
+                pass
+
+        if vals:
+            avg[k] = float(np.mean(vals))
+
+    total_depth_bits = float(sum(s["depth_bits"] for s in summaries))
+    total_pixels = float(args.width * args.height * len(summaries))
+
+    overall = {
+        **vars(args),
+        "input_video_resolved": video_path,
+        "camera_format": cam_header.get("format"),
+        "camera_pose_mode": cam_header["pose_mode"],
+        "projection_mode": "vggt_fast_pixel_coordinate_dual_intrinsic_no_ndc",
+        "ra_depth_prediction": (
+            "projected_footprint_matched_analytic_L0_L1_leaf_planes"
+            "+valid_only_l0_l1_avg_plane_transform"
+            "+same_position_l0_l1_avg_plane_candidates"
+        ),
+        "plane_model": "c_only" if args.c_only_plane else "abc",
+        "coded_plane_parameters": ["c"] if args.c_only_plane else ["a", "b", "c"],
+        "depth_scale": cam_header["depth_scale"],
+        "depth_scale_precision": cam_header["depth_scale_precision"],
+        "depth_scale_real_used": depth_scale_real,
+        "num_processed_frames": len(summaries),
+        "coding_plan": coding_plan,
+        "coding_poc_order": [int(x["frame"]) for x in coding_plan],
+        "total_depth_bits": total_depth_bits,
+        "overall_depth_bpp": total_depth_bits / total_pixels,
+        "average": avg,
+        "frame_csv": args.out_csv,
+        "depth_recon_yuv": args.out_depth_recon_yuv,
+        "pred_yuv": args.out_pred_yuv,
+        "block_csv": args.out_block_csv,
+        "output_yuv_order": "display_order",
+    }
+
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(overall, f, indent=2, ensure_ascii=False)
+
+    print()
     print("Done.")
-    print(f"warped yuv            : {out_yuv}")
-    print(f"q jsonl               : {out_q_jsonl}")
+    print(f"Frame CSV       : {args.out_csv}")
+    print(f"Summary         : {args.out_json}")
+    print(f"Recon depth YUV : {args.out_depth_recon_yuv}")
+    print(f"RA inter pred   : {args.out_pred_yuv}")
+
+    if args.out_block_csv:
+        print(f"Block CSV       : {args.out_block_csv}")
+
+    print(f"Overall depth bpp: {overall['overall_depth_bpp']:.6f}")
 
 
 if __name__ == "__main__":
