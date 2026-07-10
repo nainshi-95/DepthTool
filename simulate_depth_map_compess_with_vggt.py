@@ -22,6 +22,9 @@ Important behavior:
      fixed-point depth is decoded as:
        depth_linear = depth_y * depth_scale / depth_scale_precision
      JSONL tvec values are already in the same real-depth unit.
+  6) With --c-only-plane, every coded block is represented by a constant
+     inverse-depth plane invY(x,y)=c. Slopes a/b are forced to zero and are
+     neither quantized nor counted in direct/delta residual bits.
 """
 
 import argparse
@@ -465,6 +468,12 @@ class GridCache:
 def fit_inv_depth_plane_from_depth_block(block_y, pinv, cx, cy, args):
     y = np.clip(block_y.astype(np.float64), args.depth_eps, args.max_value)
     inv = 1.0 / y
+
+    if args.c_only_plane:
+        # Least-squares constant inverse-depth model:
+        #   invY(x,y) = c,  c = mean(1 / Y).
+        return Plane(0.0, 0.0, float(np.mean(inv)), cx, cy)
+
     a, b, c = (pinv @ inv.reshape(-1)).tolist()
     return Plane(a, b, c, cx, cy)
 
@@ -490,6 +499,13 @@ def fit_inv_depth_plane_from_depth_block_masked(
 
     y = np.clip(block_y[valid], args.depth_eps, args.max_value)
     inv = 1.0 / y
+
+    if args.c_only_plane:
+        c = float(np.mean(inv))
+        if not np.isfinite(c):
+            return None
+        return Plane(0.0, 0.0, c, cx, cy)
+
     A = np.stack(
         [
             np.asarray(xx, dtype=np.float64)[valid],
@@ -1657,13 +1673,17 @@ def make_candidates(
 # ============================================================
 
 def eval_direct(block, actual, xx, yy, args, adaptive, avail_modes):
-    qa = quantize(actual.a, args.qa)
-    qb = quantize(actual.b, args.qb)
+    if args.c_only_plane:
+        qa = 0
+        qb = 0
+    else:
+        qa = quantize(actual.a, args.qa)
+        qb = quantize(actual.b, args.qb)
     qc = quantize(actual.c, args.qc)
 
     p = Plane(
-        dequantize(qa, args.qa),
-        dequantize(qb, args.qb),
+        0.0 if args.c_only_plane else dequantize(qa, args.qa),
+        0.0 if args.c_only_plane else dequantize(qb, args.qb),
         dequantize(qc, args.qc),
         actual.cx,
         actual.cy,
@@ -1677,8 +1697,9 @@ def eval_direct(block, actual, xx, yy, args, adaptive, avail_modes):
     else:
         bits = float(args.mode_bits)
 
-    bits += exp_golomb_len_signed(qa)
-    bits += exp_golomb_len_signed(qb)
+    if not args.c_only_plane:
+        bits += exp_golomb_len_signed(qa)
+        bits += exp_golomb_len_signed(qb)
     bits += exp_golomb_len_signed(qc)
 
     return ModeResult(
@@ -1734,13 +1755,17 @@ def eval_delta(block, actual, cands, xx, yy, args, adaptive, avail_modes, avail_
     out = []
 
     for name, pred in cands:
-        qda = quantize(actual.a - pred.a, args.qa)
-        qdb = quantize(actual.b - pred.b, args.qb)
+        if args.c_only_plane:
+            qda = 0
+            qdb = 0
+        else:
+            qda = quantize(actual.a - pred.a, args.qa)
+            qdb = quantize(actual.b - pred.b, args.qb)
         qdc = quantize(actual.c - pred.c, args.qc)
 
         p = Plane(
-            pred.a + dequantize(qda, args.qa),
-            pred.b + dequantize(qdb, args.qb),
+            0.0 if args.c_only_plane else pred.a + dequantize(qda, args.qa),
+            0.0 if args.c_only_plane else pred.b + dequantize(qdb, args.qb),
             pred.c + dequantize(qdc, args.qc),
             actual.cx,
             actual.cy,
@@ -1756,24 +1781,26 @@ def eval_delta(block, actual, cands, xx, yy, args, adaptive, avail_modes, avail_
             bits += adaptive["candidate"].bits(name, avail_cands)
 
         if adaptive is not None and "delta_res_abs_a" in adaptive:
-            bits += adaptive_signed_residual_bits(
-                qda,
-                adaptive["delta_res_abs_a"],
-                adaptive["delta_abs_max"],
-            )
-            bits += adaptive_signed_residual_bits(
-                qdb,
-                adaptive["delta_res_abs_b"],
-                adaptive["delta_abs_max"],
-            )
+            if not args.c_only_plane:
+                bits += adaptive_signed_residual_bits(
+                    qda,
+                    adaptive["delta_res_abs_a"],
+                    adaptive["delta_abs_max"],
+                )
+                bits += adaptive_signed_residual_bits(
+                    qdb,
+                    adaptive["delta_res_abs_b"],
+                    adaptive["delta_abs_max"],
+                )
             bits += adaptive_signed_residual_bits(
                 qdc,
                 adaptive["delta_res_abs_c"],
                 adaptive["delta_abs_max"],
             )
         else:
-            bits += exp_golomb_len_signed(qda)
-            bits += exp_golomb_len_signed(qdb)
+            if not args.c_only_plane:
+                bits += exp_golomb_len_signed(qda)
+                bits += exp_golomb_len_signed(qdb)
             bits += exp_golomb_len_signed(qdc)
 
         out.append(
@@ -2134,12 +2161,12 @@ def encode_node(
     return best
 
 
-def commit_node(node, store, adaptive, writer, frame_idx):
+def commit_node(node, store, adaptive, writer, frame_idx, args):
     qt_split_flag_update(adaptive, node)
 
     if not node.is_leaf():
         for c in node.children:
-            commit_node(c, store, adaptive, writer, frame_idx)
+            commit_node(c, store, adaptive, writer, frame_idx, args)
         return
 
     b = node.best
@@ -2162,7 +2189,12 @@ def commit_node(node, store, adaptive, writer, frame_idx):
             adaptive["candidate"].update(b.candidate_name)
 
         if b.mode == "delta" and "delta_res_abs_a" in adaptive:
-            for q, k in zip(b.q_values, "abc"):
+            residual_items = (
+                [(b.q_values[2], "c")]
+                if args.c_only_plane
+                else list(zip(b.q_values, "abc"))
+            )
+            for q, k in residual_items:
                 adaptive_signed_residual_update(
                     q,
                     adaptive[f"delta_res_abs_{k}"],
@@ -2811,7 +2843,7 @@ def simulate_one_depth_frame(
                 plane_warp_ctx,
             )
 
-            commit_node(root, store, adaptive, writer, frame_idx)
+            commit_node(root, store, adaptive, writer, frame_idx, args)
             paint(root, recon)
             collect(root, st)
 
@@ -2845,6 +2877,8 @@ def simulate_one_depth_frame(
         "depth_rmse": m["rmse"],
         "depth_psnr": m["psnr"],
         "depth_max_error": m["max_error"],
+        "plane_model": "c_only" if args.c_only_plane else "abc",
+        "c_only_plane": int(args.c_only_plane),
         "direct_blocks": int(st["direct_blocks"]),
         "copy_blocks": int(st["copy_blocks"]),
         "delta_blocks": int(st["delta_blocks"]),
@@ -3140,6 +3174,14 @@ def parse_args():
     p.add_argument("--qa", type=float, default=1e-6)
     p.add_argument("--qb", type=float, default=1e-6)
     p.add_argument("--qc", type=float, default=1e-4)
+    p.add_argument(
+        "--c-only-plane",
+        action="store_true",
+        help=(
+            "represent every block as invY(x,y)=c only; force a=b=0 and "
+            "code only c in direct/delta modes"
+        ),
+    )
 
     p.add_argument("--mode-bits", type=int, default=2)
     p.add_argument("--max-value", type=int, default=1023)
@@ -3664,6 +3706,8 @@ def main():
             "+valid_only_l0_l1_avg_plane_transform"
             "+same_position_l0_l1_avg_plane_candidates"
         ),
+        "plane_model": "c_only" if args.c_only_plane else "abc",
+        "coded_plane_parameters": ["c"] if args.c_only_plane else ["a", "b", "c"],
         "depth_scale": cam_header["depth_scale"],
         "depth_scale_precision": cam_header["depth_scale_precision"],
         "depth_scale_real_used": depth_scale_real,
