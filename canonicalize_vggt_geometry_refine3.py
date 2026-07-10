@@ -1,561 +1,678 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-depth_satd_refine_fixed_cam.py
+batch_depth_satd_refine_canonical_outputs.py
 
-GOP/frame-level depth refinement with fixed camera K, R|t.
+Depth-only SATD refinement for canonical fixedK GOP NN-depth outputs.
 
-- K, R|t are read from the same JSONL style as the projection/eval script.
-- Reference/target Y frames are read from YUV420 sequence.
-- Base depth is read from reconstructed depth YUV420p10le.
-- Learnable low-resolution inverse-depth offset grid is optimized.
-- Loss is multi-pair projection residual SATD + regularization.
-- No OpenCV required. Uses PyTorch + NumPy only.
+Input under --src-root:
+  <base>_fixedK_gop_nn_geometry.npz
+  <base>_fixedK_gop_nn_cam.jsonl                         optional metadata source
+  <base>_fixedK_gop_nn_depth_linear_yuv420p10le.yuv       optional depth-scale source
+  <base>_fixedK_gop_nn_manifest.json                      optional metadata source
 
-Typical use:
-  python depth_satd_refine_fixed_cam.py \
-    --seq-yuv recon_or_orig.yuv \
-    --depth-yuv recon_depth.yuv \
-    --param-jsonl cam_param.jsonl \
-    --width 3840 --height 2160 --bit-depth 10 \
-    --pairs 0:16,32:16 \
-    --num-steps 300 \
-    --offset-stride 64 \
-    --max-delta-rho-ratio 0.01 \
-    --out-depth-yuv refined_depth.yuv \
-    --out-json refine_stats.json \
-    --out-delta-npz delta_rho.npz
+Output under --dst-root with the SAME canonical filenames:
+  <base>_fixedK_gop_nn_geometry.npz
+  <base>_fixedK_gop_nn_cam.jsonl
+  <base>_fixedK_gop_nn_depth_linear_yuv420p10le.yuv
+  <base>_fixedK_gop_nn_manifest.json
 
-Notes:
-  - This script optimizes target-frame depth only.
-  - For pair ref:tar, the target depth D_tar is refined.
-  - Reference frames are fixed.
-  - If --target-yuv is omitted, --seq-yuv is used as both reference and target.
+This script keeps K and W2C R|t fixed, and optimizes only a low-resolution
+inverse-depth offset grid to reduce multi-pair 4x4 SATD.
+
+Pair convention follows your affine-CP script:
+  --pairs target:ref[:weight]
+Projection convention:
+  target depth backward projection, target pixel -> reference pixel
+  R_rel = R_ref @ R_target.T
+  t_rel = t_ref - R_rel @ t_target
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import math
 import os
+import re
+import shutil
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+GEOM_SUFFIX = "_fixedK_gop_nn_geometry.npz"
+CAM_SUFFIX = "_fixedK_gop_nn_cam.jsonl"
+DEPTH_SUFFIX = "_fixedK_gop_nn_depth_linear_yuv420p10le.yuv"
+MANIFEST_SUFFIX = "_fixedK_gop_nn_manifest.json"
+
 
 # ============================================================
-# Basic utilities
+# Logging / JSON helpers
 # ============================================================
 
-def align_to(x: int, a: int) -> int:
-    return ((x + a - 1) // a) * a
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def calc_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top):
-    pad_right = coded_w - src_w - pad_left
-    pad_bottom = coded_h - src_h - pad_top
-    if pad_right < 0 or pad_bottom < 0:
-        raise ValueError(
-            f"Invalid padding: src={src_w}x{src_h}, coded={coded_w}x{coded_h}, "
-            f"pad_left={pad_left}, pad_top={pad_top}"
-        )
-    return pad_right, pad_bottom
+def ensure_dir(path: str | Path) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def validate_yuv420_padding(src_w, src_h, coded_w, coded_h, pad_left, pad_top, pad_right, pad_bottom):
-    vals = {
-        "src_w": src_w, "src_h": src_h,
-        "coded_w": coded_w, "coded_h": coded_h,
-        "pad_left": pad_left, "pad_top": pad_top,
-        "pad_right": pad_right, "pad_bottom": pad_bottom,
-    }
-    for name, v in vals.items():
-        if v < 0:
-            raise ValueError(f"{name} must be non-negative: {v}")
-        if v % 2 != 0:
-            raise ValueError(f"{name} must be even for YUV420: {v}")
+def ensure_parent(path: str | Path) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-def active_slice(src_w, src_h, pad_left, pad_top):
-    return slice(pad_top, pad_top + src_h), slice(pad_left, pad_left + src_w)
-
-
-def pad_2d_edge_np(arr, coded_w, coded_h, pad_left, pad_top):
-    h, w = arr.shape
-    pad_right = coded_w - w - pad_left
-    pad_bottom = coded_h - h - pad_top
-    return np.pad(arr, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="edge")
-
-
-def crop_active_np(arr, src_w, src_h, pad_left, pad_top):
-    return arr[pad_top:pad_top + src_h, pad_left:pad_left + src_w]
-
-
-def calc_psnr_np(a, b, bit_depth, mask=None):
-    a = a.astype(np.float64)
-    b = b.astype(np.float64)
-    d = a - b
-    if mask is not None:
-        m = mask.astype(bool)
-        if not np.any(m):
-            return float("nan")
-        d = d[m]
-    mse = float(np.mean(d * d))
-    if mse == 0.0:
-        return float("inf")
-    maxv = (1 << bit_depth) - 1
-    return 10.0 * math.log10((maxv * maxv) / mse)
-
-
-def json_safe(x):
+def json_safe_float(x: Any) -> Any:
     if x is None:
         return None
-    try:
-        xf = float(x)
-        if math.isnan(xf):
-            return None
-        if math.isinf(xf):
-            return "inf" if xf > 0 else "-inf"
-        return xf
-    except Exception:
-        return x
+    x = float(x)
+    if np.isnan(x):
+        return None
+    if np.isinf(x):
+        return "inf" if x > 0 else "-inf"
+    return x
 
 
-# ============================================================
-# YUV420 IO
-# ============================================================
-
-def yuv_dtype(bit_depth: int):
-    return np.uint8 if bit_depth <= 8 else np.dtype("<u2")
-
-
-def frame_size_yuv420(w: int, h: int, bit_depth: int) -> int:
-    bps = 1 if bit_depth <= 8 else 2
-    return (w * h + 2 * (w // 2) * (h // 2)) * bps
-
-
-def count_frames_yuv420(path: str, w: int, h: int, bit_depth: int) -> int:
-    fs = frame_size_yuv420(w, h, bit_depth)
-    size = os.path.getsize(path)
-    trailing = size % fs
-    if trailing:
-        print(f"[WARN] trailing bytes ignored: {path}, trailing={trailing}")
-    return size // fs
+def to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return json_safe_float(obj)
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    return obj
 
 
-def read_yuv420_frame(path: str, idx: int, w: int, h: int, bit_depth: int):
-    dtype = yuv_dtype(bit_depth)
-    y_size = w * h
-    uv_size = (w // 2) * (h // 2)
-    fs = frame_size_yuv420(w, h, bit_depth)
-
-    with open(path, "rb") as f:
-        f.seek(idx * fs)
-        y = np.fromfile(f, dtype=dtype, count=y_size)
-        u = np.fromfile(f, dtype=dtype, count=uv_size)
-        v = np.fromfile(f, dtype=dtype, count=uv_size)
-
-    if y.size != y_size or u.size != uv_size or v.size != uv_size:
-        raise EOFError(f"Cannot read frame {idx} from {path}")
-
-    return (
-        y.reshape(h, w),
-        u.reshape(h // 2, w // 2),
-        v.reshape(h // 2, w // 2),
-    )
+def npz_scalar_json(x: Any) -> Any:
+    if isinstance(x, np.ndarray):
+        if x.shape == ():
+            return npz_scalar_json(x.item())
+        return [npz_scalar_json(v) for v in x.tolist()]
+    if isinstance(x, bytes):
+        x = x.decode("utf-8")
+    if isinstance(x, str):
+        return json.loads(x)
+    return x
 
 
-def read_y_frame(path: str, idx: int, w: int, h: int, bit_depth: int):
-    y, _, _ = read_yuv420_frame(path, idx, w, h, bit_depth)
-    return y
-
-
-def write_yuv420_frame(fp, y, u, v):
-    fp.write(np.ascontiguousarray(y).tobytes())
-    fp.write(np.ascontiguousarray(u).tobytes())
-    fp.write(np.ascontiguousarray(v).tobytes())
-
-
-def write_depth_yuv420p10_frame(fp, depth_y_10, maxv=1023):
-    y = np.clip(np.rint(depth_y_10), 0, maxv).astype("<u2")
-    h, w = y.shape
-    uv = np.full((h // 2, w // 2), 512, dtype="<u2")
-    write_yuv420_frame(fp, y, uv, uv)
-
-
-# ============================================================
-# JSONL camera parsing
-# ============================================================
-
-def load_param_jsonl(path: str):
-    header = None
-    frames = {}
-
-    with open(path, "r", encoding="utf-8") as f:
+def load_first_jsonl_object(path: str | Path | None) -> Optional[dict[str, Any]]:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    with open(p, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-
-            obj = json.loads(line)
-
-            if obj.get("type") in ["header", "intrinsic"]:
-                header = obj
-            elif "poc" in obj:
-                frames[int(obj["poc"])] = obj
-
-    if header is None:
-        raise RuntimeError("header line not found in param jsonl")
-    if not frames:
-        raise RuntimeError("no frame lines found in param jsonl")
-
-    return header, frames
-
-
-def get_depth_scale_real_from_header(header):
-    if "depth_scale_precision" in header:
-        precision = float(header["depth_scale_precision"])
-        if precision <= 0:
-            raise ValueError("depth_scale_precision must be positive")
-        return float(header["depth_scale"]) / precision
-
-    if "depth_scale_real" in header:
-        return float(header["depth_scale_real"])
-
-    if "depth_scale" not in header:
-        raise RuntimeError("depth_scale not found in header")
-
-    return float(header["depth_scale"])
-
-
-def make_padded_intrinsic_from_original(intr, pad_left, pad_top):
-    return {
-        "fx": float(intr["fx"]),
-        "fy": float(intr["fy"]),
-        "cx": float(intr["cx"]) + float(pad_left),
-        "cy": float(intr["cy"]) + float(pad_top),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
-
-
-def intrinsic_copy(intr):
-    return {
-        "fx": float(intr["fx"]),
-        "fy": float(intr["fy"]),
-        "cx": float(intr["cx"]),
-        "cy": float(intr["cy"]),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
-
-
-def add_intrinsic_delta(intr, delta):
-    return {
-        "fx": float(intr["fx"]) + float(delta[0]),
-        "fy": float(intr["fy"]) + float(delta[1]),
-        "cx": float(intr["cx"]) + float(delta[2]),
-        "cy": float(intr["cy"]) + float(delta[3]),
-        "z_sign": float(intr.get("z_sign", 1.0)),
-    }
-
-
-def build_frame_intrinsics(header, frames, max_idx, pad_left, pad_top):
-    intrs = {}
-
-    if "intrinsic_dec_first" in header:
-        intr0 = intrinsic_copy(header["intrinsic_dec_first"])
-    elif "intrinsic_gt_padded0" in header:
-        intr0 = intrinsic_copy(header["intrinsic_gt_padded0"])
-    elif "intrinsic" in header:
-        intr0 = make_padded_intrinsic_from_original(header["intrinsic"], pad_left, pad_top)
-    else:
-        raise RuntimeError("No intrinsic information found in JSONL header")
-
-    intrs[0] = intr0
-
-    for i in range(1, int(max_idx) + 1):
-        f = frames.get(i, {})
-
-        if "intrinsic_tar_dec" in f:
-            intrs[i] = intrinsic_copy(f["intrinsic_tar_dec"])
-        elif "intrinsic_dec" in f:
-            intrs[i] = intrinsic_copy(f["intrinsic_dec"])
-        elif "intrinsic" in f:
-            intrs[i] = make_padded_intrinsic_from_original(f["intrinsic"], pad_left, pad_top)
-        elif "intrinsic_delta" in f:
-            delta = np.asarray(f["intrinsic_delta"], dtype=np.float64).reshape(4)
-            intrs[i] = add_intrinsic_delta(intrs[i - 1], delta)
-        else:
-            intrs[i] = intrs[i - 1].copy()
-
-    return intrs
-
-
-# ============================================================
-# Pose helpers
-# ============================================================
-
-def rodrigues_to_matrix_np(rvec):
-    r = np.asarray(rvec, dtype=np.float64).reshape(3)
-    theta = float(np.linalg.norm(r))
-
-    if theta < 1e-12:
-        K = np.array(
-            [
-                [0.0, -r[2], r[1]],
-                [r[2], 0.0, -r[0]],
-                [-r[1], r[0], 0.0],
-            ],
-            dtype=np.float64,
-        )
-        return np.eye(3, dtype=np.float64) + K
-
-    k = r / theta
-    K = np.array(
-        [
-            [0.0, -k[2], k[1]],
-            [k[2], 0.0, -k[0]],
-            [-k[1], k[0], 0.0],
-        ],
-        dtype=np.float64,
-    )
-
-    return (
-        np.eye(3, dtype=np.float64)
-        + np.sin(theta) * K
-        + (1.0 - np.cos(theta)) * (K @ K)
-    )
-
-
-def _as_extrinsic_matrix(frame):
-    for key in ["extrinsic_abs", "extrinsic", "camera_extrinsic", "cam_from_world"]:
-        if key in frame:
-            E = np.asarray(frame[key], dtype=np.float64)
-            if E.shape == (4, 4):
-                return E[:3, :4]
-            if E.shape == (3, 4):
-                return E
-            if E.size == 12:
-                return E.reshape(3, 4)
-            if E.size == 16:
-                return E.reshape(4, 4)[:3, :4]
-
-    if "rvec_abs" in frame and "tvec_abs" in frame:
-        R = rodrigues_to_matrix_np(frame["rvec_abs"])
-        t = np.asarray(frame["tvec_abs"], dtype=np.float64).reshape(3)
-        return np.concatenate([R, t.reshape(3, 1)], axis=1)
-
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(obj, dict):
+                return obj
     return None
 
 
-def _frame_relative_rt_current_to_previous(frame):
-    if "rt_dec" in frame:
-        rt = frame["rt_dec"]
-        rvec = rt["rvec"]
-        tvec = rt["tvec"]
-    elif "rvec" in frame and "tvec" in frame:
-        rvec = frame["rvec"]
-        tvec = frame["tvec"]
+def load_manifest(path: str | Path | None) -> Optional[dict[str, Any]]:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+# ============================================================
+# Canonical filenames / discovery
+# ============================================================
+
+def derive_base_from_geometry_npz(npz_path: Path) -> str:
+    name = npz_path.name
+    if name.endswith(GEOM_SUFFIX):
+        return name[: -len(GEOM_SUFFIX)]
+    return npz_path.stem
+
+
+def find_geometry_npz_files(src_root: Path, pattern: str) -> list[Path]:
+    return [p for p in sorted(src_root.rglob(pattern)) if p.is_file()]
+
+
+def make_out_prefix(npz_path: Path, src_root: Path, dst_root: Path, layout: str) -> Path:
+    base = derive_base_from_geometry_npz(npz_path)
+    if layout == "preserve":
+        rel_dir = npz_path.parent.relative_to(src_root)
+        out_dir = dst_root / rel_dir
+    elif layout == "flat":
+        out_dir = dst_root
     else:
-        raise RuntimeError("Frame has no relative pose. Expected rt_dec or rvec/tvec.")
-
-    return rodrigues_to_matrix_np(rvec), np.asarray(tvec, dtype=np.float64).reshape(3)
-
-
-def _invert_rt(R, t):
-    Ri = R.T
-    ti = -Ri @ t
-    return Ri, ti
+        raise ValueError(layout)
+    return out_dir / base
 
 
-def _compose_rt(R2, t2, R1, t1):
-    return R2 @ R1, R2 @ t1 + t2
+def canonical_paths_from_prefix(prefix: Path) -> dict[str, Path]:
+    base = prefix.name
+    parent = prefix.parent
+    return {
+        "geometry_npz": parent / f"{base}{GEOM_SUFFIX}",
+        "camera_jsonl": parent / f"{base}{CAM_SUFFIX}",
+        "depth_yuv": parent / f"{base}{DEPTH_SUFFIX}",
+        "manifest": parent / f"{base}{MANIFEST_SUFFIX}",
+    }
 
 
-def get_target_to_reference_rt(frames, ref_idx: int, tar_idx: int):
-    ref_idx = int(ref_idx)
-    tar_idx = int(tar_idx)
+def find_canonical_sidecars(geometry_npz: Path) -> dict[str, Optional[Path]]:
+    base = derive_base_from_geometry_npz(geometry_npz)
+    parent = geometry_npz.parent
+    paths = {
+        "camera_jsonl": parent / f"{base}{CAM_SUFFIX}",
+        "depth_yuv": parent / f"{base}{DEPTH_SUFFIX}",
+        "manifest": parent / f"{base}{MANIFEST_SUFFIX}",
+    }
+    return {k: (v if v.is_file() else None) for k, v in paths.items()}
 
-    if ref_idx == tar_idx:
-        return {
-            "R": np.eye(3, dtype=np.float64),
-            "t": np.zeros(3, dtype=np.float64),
-            "source": "identity",
-        }
 
-    f_ref = frames.get(ref_idx, {})
-    f_tar = frames.get(tar_idx, {})
+def already_done(out_prefix: Path) -> bool:
+    return canonical_paths_from_prefix(out_prefix)["manifest"].is_file()
 
-    E_ref = _as_extrinsic_matrix(f_ref)
-    E_tar = _as_extrinsic_matrix(f_tar)
 
-    if E_ref is not None and E_tar is not None:
-        R_ref, t_ref = E_ref[:, :3], E_ref[:, 3]
-        R_tar, t_tar = E_tar[:, :3], E_tar[:, 3]
+def validate_canonical_npz(npz_path: Path) -> bool:
+    required_any = {
+        "K": ["K_fixed", "K_refined", "K"],
+        "r": ["rvec_abs_final", "rvec_abs_refined", "rvec_abs_stage4_smooth", "rvec_abs_stage3_joint", "rvec_abs_stage2_t_nn", "rvec_abs_stage1_rt"],
+        "t": ["tvec_abs_final", "tvec_abs_refined", "tvec_abs_stage4_smooth", "tvec_abs_stage3_joint", "tvec_abs_stage2_t_nn", "tvec_abs_stage1_rt"],
+        "depth": ["depth_canonical", "depth_original"],
+    }
+    try:
+        with np.load(npz_path, allow_pickle=True) as data:
+            files = set(data.files)
+        missing = [name for name, keys in required_any.items() if not any(k in files for k in keys)]
+        if missing:
+            log(f"SKIP invalid canonical NPZ: {npz_path} / missing groups {missing}")
+            return False
+        return True
+    except Exception as e:
+        log(f"SKIP unreadable NPZ: {npz_path} / {e}")
+        return False
 
-        R = R_ref @ R_tar.T
-        t = t_ref - R @ t_tar
 
-        return {
-            "R": R.astype(np.float64),
-            "t": t.astype(np.float64),
-            "source": "absolute_extrinsic",
-        }
+# ============================================================
+# YUV helpers
+# ============================================================
 
-    # Fallback: compose current-to-previous relative transforms.
-    if tar_idx > ref_idx:
-        R_tot = np.eye(3, dtype=np.float64)
-        t_tot = np.zeros(3, dtype=np.float64)
+def frame_size_yuv420(w: int, h: int, bitdepth: int) -> int:
+    bps = 1 if bitdepth <= 8 else 2
+    return (w * h + 2 * (w // 2) * (h // 2)) * bps
 
-        for p in range(tar_idx, ref_idx, -1):
-            if p not in frames:
-                raise RuntimeError(f"Missing frame {p} for relative pose composition")
-            R_p, t_p = _frame_relative_rt_current_to_previous(frames[p])
-            R_tot, t_tot = _compose_rt(R_p, t_p, R_tot, t_tot)
-    else:
-        R_fwd = np.eye(3, dtype=np.float64)
-        t_fwd = np.zeros(3, dtype=np.float64)
 
-        for p in range(ref_idx, tar_idx, -1):
-            if p not in frames:
-                raise RuntimeError(f"Missing frame {p} for relative pose composition")
-            R_p, t_p = _frame_relative_rt_current_to_previous(frames[p])
-            R_fwd, t_fwd = _compose_rt(R_p, t_p, R_fwd, t_fwd)
+def count_frames_yuv420(path: str | Path, w: int, h: int, bitdepth: int) -> int:
+    fs = frame_size_yuv420(w, h, bitdepth)
+    size = os.path.getsize(path)
+    trailing = size % fs
+    if trailing:
+        log(f"[WARN] trailing bytes ignored: {path}, trailing={trailing}")
+    return size // fs
 
-        R_tot, t_tot = _invert_rt(R_fwd, t_fwd)
+
+def read_y_frame(path: str | Path, w: int, h: int, bitdepth: int, idx: int) -> np.ndarray:
+    dtype = np.uint8 if bitdepth <= 8 else np.dtype("<u2")
+    fs = frame_size_yuv420(w, h, bitdepth)
+    y_samples = int(w) * int(h)
+    with open(path, "rb") as f:
+        f.seek(int(idx) * fs)
+        y = np.fromfile(f, dtype=dtype, count=y_samples)
+    if y.size != y_samples:
+        raise RuntimeError(f"Cannot read Y frame idx={idx} from {path}")
+    return y.reshape(h, w)
+
+
+def write_depth_yuv420p10le_linear(path: Path, depth: np.ndarray, scale_meta: dict[str, Any]) -> dict[str, Any]:
+    n, h, w = depth.shape
+    if w % 2 or h % 2:
+        raise ValueError("YUV420 output requires even width/height")
+
+    ensure_parent(path)
+
+    max_code = int(scale_meta.get("max_code", 1023))
+    scale = float(scale_meta["depth_scale_real"])
+    clipped_total = 0
+
+    with open(path, "wb") as f:
+        for i in range(n):
+            y = np.round(depth[i].astype(np.float64) / scale)
+            clipped = (y < 0) | (y > max_code) | ~np.isfinite(y)
+            clipped_total += int(np.count_nonzero(clipped))
+            y = np.nan_to_num(y, nan=0.0, posinf=max_code, neginf=0.0)
+            y = np.clip(y, 0, max_code).astype("<u2")
+            uv = np.full((h // 2, w // 2), 512, dtype="<u2")
+            f.write(y.tobytes())
+            f.write(uv.tobytes())
+            f.write(uv.tobytes())
 
     return {
-        "R": R_tot.astype(np.float64),
-        "t": t_tot.astype(np.float64),
-        "source": "composed_current_to_previous",
+        **scale_meta,
+        "depth_yuv": str(path),
+        "depth_yuv_format": "yuv420p10le",
+        "depth_yuv_semantics": "Y stores linear depth code = round(depth / depth_scale_real); U/V neutral 512",
+        "clipped_samples_total": int(clipped_total),
+        "total_samples": int(n * h * w),
+    }
+
+
+def choose_depth_scale_fixed_point(depth: np.ndarray, percentile: float, precision: int, bit_depth: int = 10) -> dict[str, Any]:
+    max_code = (1 << bit_depth) - 1
+    m = np.isfinite(depth) & (depth > 0)
+
+    if not np.any(m):
+        scale_real = 1.0 / max_code
+    else:
+        ref = float(np.percentile(depth[m], percentile))
+        ref = max(ref, 1e-12)
+        scale_real = ref / float(max_code)
+
+    scale_int = max(1, int(round(scale_real * precision)))
+    scale_real_q = scale_int / float(precision)
+
+    return {
+        "depth_scale": int(scale_int),
+        "depth_scale_precision": int(precision),
+        "depth_scale_real": float(scale_real_q),
+        "depth_scale_percentile": float(percentile),
+        "depth_bit_depth": int(bit_depth),
+        "max_code": int(max_code),
+    }
+
+
+def extract_depth_scale_meta(stage_depth: np.ndarray, copied_header: Optional[dict[str, Any]], source_manifest: Optional[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+    if not args.recompute_depth_scale:
+        candidates: list[Any] = []
+
+        if copied_header is not None:
+            candidates.append(copied_header.get("depth_output"))
+            candidates.append(copied_header.get("depth_yuv"))
+
+        if source_manifest is not None:
+            candidates.append(source_manifest.get("depth_yuv"))
+            candidates.append(source_manifest.get("depth_output"))
+
+        for c in candidates:
+            if isinstance(c, dict) and "depth_scale_real" in c:
+                meta = dict(c)
+                meta.setdefault("depth_scale_precision", int(args.depth_scale_precision))
+                meta.setdefault("depth_scale", int(round(float(meta["depth_scale_real"]) * int(meta["depth_scale_precision"]))))
+                meta.setdefault("depth_bit_depth", 10)
+                meta.setdefault("max_code", 1023)
+                meta["depth_scale_real"] = float(meta["depth_scale_real"])
+                return meta
+
+            if isinstance(c, dict) and "depth_scale" in c and "depth_scale_precision" in c:
+                meta = dict(c)
+                meta["depth_scale_precision"] = int(meta["depth_scale_precision"])
+                meta["depth_scale"] = int(meta["depth_scale"])
+                meta["depth_scale_real"] = float(meta["depth_scale"]) / float(meta["depth_scale_precision"])
+                meta.setdefault("depth_bit_depth", 10)
+                meta.setdefault("max_code", 1023)
+                return meta
+
+    return choose_depth_scale_fixed_point(stage_depth, args.depth_scale_percentile, args.depth_scale_precision, 10)
+
+
+# ============================================================
+# NPZ loading
+# ============================================================
+
+def npz_key(data: np.lib.npyio.NpzFile, candidates: list[str], required: bool = True) -> Optional[str]:
+    for k in candidates:
+        if k in data.files:
+            return k
+    if required:
+        raise KeyError(f"NPZ missing any of keys: {candidates}. Available keys: {data.files}")
+    return None
+
+
+def load_canonical_npz(npz_path: str | Path) -> dict[str, Any]:
+    path = Path(npz_path)
+    data = np.load(path, allow_pickle=True)
+
+    k_key = npz_key(data, ["K_fixed", "K_refined", "K"])
+    r_key = npz_key(data, ["rvec_abs_final", "rvec_abs_refined", "rvec_abs_stage4_smooth", "rvec_abs_stage3_joint", "rvec_abs_stage2_t_nn", "rvec_abs_stage1_rt"])
+    t_key = npz_key(data, ["tvec_abs_final", "tvec_abs_refined", "tvec_abs_stage4_smooth", "tvec_abs_stage3_joint", "tvec_abs_stage2_t_nn", "tvec_abs_stage1_rt"])
+    d_key = npz_key(data, ["depth_canonical", "depth_original"])
+
+    K = np.asarray(data[k_key], dtype=np.float64).reshape(3, 3)
+    rvecs = np.asarray(data[r_key], dtype=np.float64).reshape(-1, 3)
+    tvecs = np.asarray(data[t_key], dtype=np.float64).reshape(-1, 3)
+    depth = np.asarray(data[d_key], dtype=np.float32)
+
+    if depth.ndim != 3:
+        raise ValueError(f"depth must be [N,H,W], got {depth.shape}")
+
+    n, h, w = depth.shape
+
+    if rvecs.shape[0] != n or tvecs.shape[0] != n:
+        raise ValueError(f"Pose count mismatch: depth N={n}, r={rvecs.shape}, t={tvecs.shape}")
+
+    if "frame_indices" in data.files:
+        frame_indices = np.asarray(data["frame_indices"], dtype=np.int32).reshape(-1)
+        if frame_indices.shape[0] != n:
+            raise ValueError(f"frame_indices count mismatch: {frame_indices.shape[0]} vs N={n}")
+    else:
+        frame_indices = np.arange(n, dtype=np.int32)
+
+    pairs = None
+    if "pairs_json" in data.files:
+        try:
+            obj = npz_scalar_json(data["pairs_json"])
+            if isinstance(obj, list):
+                pairs = []
+                for p in obj:
+                    if isinstance(p, dict):
+                        if "target" in p and "ref" in p:
+                            pairs.append((int(p["target"]), int(p["ref"]), float(p.get("weight", 1.0)), str(p.get("kind", "npz"))))
+                        elif "tar" in p and "ref" in p:
+                            pairs.append((int(p["tar"]), int(p["ref"]), float(p.get("weight", 1.0)), str(p.get("kind", "npz"))))
+                    elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                        pairs.append((int(p[0]), int(p[1]), float(p[2]) if len(p) >= 3 else 1.0, "npz"))
+        except Exception:
+            pairs = None
+
+    return {
+        "npz_path": str(path),
+        "data": data,
+        "K": K,
+        "rvecs": rvecs,
+        "tvecs": tvecs,
+        "depth": depth,
+        "frame_indices": frame_indices,
+        "pairs": pairs,
+        "source_keys": {"K": k_key, "rvecs": r_key, "tvecs": t_key, "depth": d_key},
     }
 
 
 # ============================================================
-# Pair parsing
+# Pair selection
 # ============================================================
 
-def parse_pairs_string(s: str) -> List[Tuple[int, int]]:
-    out = []
-    s = str(s).strip()
-    if not s:
+def parse_pairs(s: str, default_weight: float = 1.0) -> list[tuple[int, int, float, str]]:
+    out: list[tuple[int, int, float, str]] = []
+    if not s or not s.strip():
         return out
 
-    for item in s.split(","):
-        item = item.strip()
-        if not item:
+    for tok in re.split(r"[,;\s]+", s.strip()):
+        if not tok:
             continue
-        if ":" not in item:
-            raise ValueError(f"Bad pair item: {item}. Expected ref:tar")
-        a, b = item.split(":", 1)
-        out.append((int(a), int(b)))
+        tok = tok.replace("->", ":")
+        parts = tok.split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError(f"Invalid pair token '{tok}'. Use target:ref[:weight].")
+        target = int(parts[0])
+        ref = int(parts[1])
+        weight = float(parts[2]) if len(parts) == 3 else float(default_weight)
+        out.append((target, ref, weight, "cli"))
 
     return out
 
 
-def load_pairs(args):
-    pairs = []
+def generate_adjacent_pairs(n: int, bidirectional: bool, weight: float) -> list[tuple[int, int, float, str]]:
+    out = []
+    for i in range(1, n):
+        out.append((i, i - 1, float(weight), "adjacent"))
+        if bidirectional:
+            out.append((i - 1, i, float(weight), "adjacent_rev"))
+    return out
 
-    if args.pairs:
-        pairs.extend(parse_pairs_string(args.pairs))
 
-    if args.pairs_json:
-        with open(args.pairs_json, "r", encoding="utf-8") as f:
-            obj = json.load(f)
+def generate_dyadic_pairs(n: int, bidirectional: bool = True, weight: float = 1.0) -> list[tuple[int, int, float, str]]:
+    acc: dict[tuple[int, int], tuple[int, int, float, str]] = {}
 
-        if isinstance(obj, dict):
-            obj = obj.get("pairs", [])
+    def add(t: int, r: int, w: float, kind: str) -> None:
+        if t == r or not (0 <= t < n and 0 <= r < n):
+            return
+        key = (int(t), int(r))
+        if key in acc:
+            old = acc[key]
+            acc[key] = (old[0], old[1], old[2] + float(w), old[3] + "+" + kind)
+        else:
+            acc[key] = (key[0], key[1], float(w), kind)
 
-        for p in obj:
-            if isinstance(p, dict):
-                pairs.append((int(p["ref"]), int(p["tar"])))
-            else:
-                pairs.append((int(p[0]), int(p[1])))
+    def rec(a: int, b: int, level: int) -> None:
+        if b <= a + 1:
+            return
+        m = (a + b) // 2
+        ww = float(weight) / math.sqrt(level + 1.0)
+        add(m, a, ww, f"dyadic_L{level}")
+        add(m, b, ww, f"dyadic_L{level}")
+        if bidirectional:
+            add(a, m, ww, f"dyadic_rev_L{level}")
+            add(b, m, ww, f"dyadic_rev_L{level}")
+        rec(a, m, level + 1)
+        rec(m, b, level + 1)
 
-    if not pairs:
-        raise ValueError("No pairs provided. Use --pairs or --pairs-json.")
+    rec(0, n - 1, 0)
+    return sorted(acc.values(), key=lambda x: (abs(x[0] - x[1]), x[0], x[1]))
 
-    return pairs
+
+def build_pair_list(args: argparse.Namespace, stage: dict[str, Any]) -> list[tuple[int, int, float, str]]:
+    n = int(stage["depth"].shape[0])
+
+    if args.pairs.strip():
+        pairs = parse_pairs(args.pairs, default_weight=args.pair_weight)
+    elif args.pair_source == "npz" and stage.get("pairs"):
+        pairs = list(stage["pairs"])
+    elif args.pair_source == "adjacent":
+        pairs = generate_adjacent_pairs(n, bidirectional=not args.no_bidirectional_pairs, weight=args.pair_weight)
+    elif args.pair_source in ("dyadic", "npz"):
+        pairs = generate_dyadic_pairs(n, bidirectional=not args.no_bidirectional_pairs, weight=args.pair_weight)
+    elif args.pair_source == "all":
+        pairs = [(t, r, args.pair_weight, "all") for t in range(n) for r in range(n) if t != r]
+    else:
+        raise ValueError(args.pair_source)
+
+    checked = []
+    seen = set()
+
+    for t, r, w, kind in pairs:
+        if not (0 <= int(t) < n and 0 <= int(r) < n):
+            raise ValueError(f"Pair out of range for N={n}: target={t}, ref={r}")
+        key = (int(t), int(r))
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append((int(t), int(r), float(w), str(kind)))
+
+    if args.max_pairs > 0:
+        checked = checked[: int(args.max_pairs)]
+
+    if not checked:
+        raise RuntimeError("No pairs selected.")
+
+    return checked
 
 
 # ============================================================
-# Torch projection and warp
+# Geometry helpers
 # ============================================================
 
-def torch_from_np_y(y_np, bit_depth, device):
-    maxv = float((1 << bit_depth) - 1)
-    t = torch.from_numpy(y_np.astype(np.float32) / maxv).to(device)
-    return t
+def rodrigues_np(rvec: np.ndarray) -> np.ndarray:
+    r = np.asarray(rvec, dtype=np.float64).reshape(3)
+    theta = float(np.linalg.norm(r))
+
+    if theta < 1e-12:
+        K = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]], dtype=np.float64)
+        return np.eye(3, dtype=np.float64) + K
+
+    k = r / theta
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]], dtype=np.float64)
+    return np.eye(3, dtype=np.float64) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
 
 
-def pad_2d_edge_torch(x, coded_h, coded_w, pad_left, pad_top):
-    # x: H,W
-    h, w = x.shape
-    pad_right = coded_w - w - pad_left
-    pad_bottom = coded_h - h - pad_top
-    if pad_right == 0 and pad_bottom == 0 and pad_left == 0 and pad_top == 0:
-        return x
-    x4 = x[None, None]
-    y4 = F.pad(x4, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate")
-    return y4[0, 0]
+def matrix_to_rodrigues_np(R: np.ndarray) -> np.ndarray:
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    tr = float(np.trace(R))
+    cos_theta = max(-1.0, min(1.0, (tr - 1.0) * 0.5))
+    theta = math.acos(cos_theta)
+
+    if theta < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+
+    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]], dtype=np.float64)
+    denom = 2.0 * math.sin(theta)
+
+    if abs(denom) < 1e-9:
+        # Near-pi fallback.
+        A = (R + np.eye(3)) * 0.5
+        axis = np.array([math.sqrt(max(A[0, 0], 0.0)), math.sqrt(max(A[1, 1], 0.0)), math.sqrt(max(A[2, 2], 0.0))], dtype=np.float64)
+        if R[2, 1] - R[1, 2] < 0:
+            axis[0] = -axis[0]
+        if R[0, 2] - R[2, 0] < 0:
+            axis[1] = -axis[1]
+        if R[1, 0] - R[0, 1] < 0:
+            axis[2] = -axis[2]
+        norm = np.linalg.norm(axis)
+        axis = axis / norm if norm > 1e-12 else np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        axis = axis / denom
+
+    return axis * theta
 
 
-def make_projection_precompute_torch(coded_w, coded_h, intr_tar, intr_ref, device):
-    fx_t = float(intr_tar["fx"])
-    fy_t = float(intr_tar["fy"])
-    cx_t = float(intr_tar["cx"])
-    cy_t = float(intr_tar["cy"])
+def all_rotation_matrices_np(rvecs: np.ndarray) -> np.ndarray:
+    return np.stack([rodrigues_np(r) for r in np.asarray(rvecs)], axis=0)
 
-    fx_r = float(intr_ref["fx"])
-    fy_r = float(intr_ref["fy"])
-    cx_r = float(intr_ref["cx"])
-    cy_r = float(intr_ref["cy"])
 
-    z_sign = float(intr_tar.get("z_sign", intr_ref.get("z_sign", 1.0)))
+def torch_rodrigues(rvecs: torch.Tensor) -> torch.Tensor:
+    dtype = rvecs.dtype
+    device = rvecs.device
+    n = rvecs.shape[0]
+    x, y, z = rvecs[:, 0], rvecs[:, 1], rvecs[:, 2]
+    zero = torch.zeros_like(x)
 
-    y, x = torch.meshgrid(
-        torch.arange(coded_h, dtype=torch.float32, device=device),
-        torch.arange(coded_w, dtype=torch.float32, device=device),
+    K = torch.stack([
+        torch.stack([zero, -z, y], dim=-1),
+        torch.stack([z, zero, -x], dim=-1),
+        torch.stack([-y, x, zero], dim=-1),
+    ], dim=-2)
+
+    theta2 = torch.sum(rvecs * rvecs, dim=-1)
+    theta = torch.sqrt(torch.clamp(theta2, min=1e-30))
+    small = theta2 < 1e-12
+
+    A = torch.where(small, 1.0 - theta2 / 6.0 + theta2 * theta2 / 120.0, torch.sin(theta) / theta)
+    B = torch.where(small, 0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0, (1.0 - torch.cos(theta)) / theta2)
+
+    I = torch.eye(3, dtype=dtype, device=device).expand(n, 3, 3)
+    return I + A[:, None, None] * K + B[:, None, None] * (K @ K)
+
+
+# ============================================================
+# Torch frame/projection
+# ============================================================
+
+def yuv_frame_index_for_poc(poc: int, frame_indices: np.ndarray, args: argparse.Namespace) -> int:
+    if args.frame_index_mode == "frame_indices":
+        return int(args.seq_start) + int(frame_indices[int(poc)])
+    return int(args.seq_start) + int(poc)
+
+
+class YFrameCache:
+    def __init__(self, seq_yuv: Path, target_yuv: Optional[Path], width: int, height: int, bitdepth: int):
+        self.seq_yuv = Path(seq_yuv)
+        self.target_yuv = Path(target_yuv) if target_yuv is not None else Path(seq_yuv)
+        self.width = int(width)
+        self.height = int(height)
+        self.bitdepth = int(bitdepth)
+        self.ref_cache: dict[int, np.ndarray] = {}
+        self.tar_cache: dict[int, np.ndarray] = {}
+
+    def ref_y(self, idx: int) -> np.ndarray:
+        idx = int(idx)
+        if idx not in self.ref_cache:
+            self.ref_cache[idx] = read_y_frame(self.seq_yuv, self.width, self.height, self.bitdepth, idx)
+        return self.ref_cache[idx]
+
+    def tar_y(self, idx: int) -> np.ndarray:
+        idx = int(idx)
+        if idx not in self.tar_cache:
+            self.tar_cache[idx] = read_y_frame(self.target_yuv, self.width, self.height, self.bitdepth, idx)
+        return self.tar_cache[idx]
+
+
+def torch_y_norm(y_np: np.ndarray, bitdepth: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    maxv = float((1 << bitdepth) - 1)
+    return torch.from_numpy(y_np.astype(np.float32) / maxv).to(device=device, dtype=dtype)
+
+
+def make_xy_norm_precompute(width: int, height: int, K: np.ndarray, z_sign: float, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+
+    yy, xx = torch.meshgrid(
+        torch.arange(height, dtype=dtype, device=device),
+        torch.arange(width, dtype=dtype, device=device),
         indexing="ij",
     )
 
-    x_norm = (x - cx_t) / fx_t
-    y_norm = (y - cy_t) / fy_t
-
     return {
-        "coded_w": int(coded_w),
-        "coded_h": int(coded_h),
-        "fx_ref": fx_r,
-        "fy_ref": fy_r,
-        "cx_ref": cx_r,
-        "cy_ref": cy_r,
-        "z_sign": z_sign,
-        "x_norm": x_norm,
-        "y_norm": y_norm,
+        "width": int(width),
+        "height": int(height),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "z_sign": float(z_sign),
+        "x_norm": (xx - cx) / fx,
+        "y_norm": (yy - cy) / fy,
     }
 
 
-def backward_map_torch(depth_linear, precomp, rt):
-    """
-    depth_linear: [H,W], target frame depth in linear units.
-    Returns:
-      map_x, map_y, valid
-    """
+def precompute_relative_pose_torch(rvecs: np.ndarray, tvecs: np.ndarray, pairs: list[tuple[int, int, float, str]], device: torch.device, dtype: torch.dtype) -> dict[tuple[int, int], dict[str, torch.Tensor]]:
+    r = torch.tensor(rvecs, device=device, dtype=dtype)
+    t = torch.tensor(tvecs, device=device, dtype=dtype)
+    R = torch_rodrigues(r)
+
+    out: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+
+    for target, ref, _, _ in pairs:
+        target = int(target)
+        ref = int(ref)
+        R_rel = R[ref] @ R[target].transpose(0, 1)
+        t_rel = t[ref] - R_rel @ t[target]
+        out[(target, ref)] = {"R_rel": R_rel, "t_rel": t_rel}
+
+    return out
+
+
+def backward_map_torch(depth_linear: torch.Tensor, precomp: dict[str, Any], rel: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     x_norm = precomp["x_norm"]
     y_norm = precomp["y_norm"]
-
-    fx = float(precomp["fx_ref"])
-    fy = float(precomp["fy_ref"])
-    cx = float(precomp["cx_ref"])
-    cy = float(precomp["cy_ref"])
+    fx = float(precomp["fx"])
+    fy = float(precomp["fy"])
+    cx = float(precomp["cx"])
+    cy = float(precomp["cy"])
     z_sign = float(precomp["z_sign"])
-    coded_w = int(precomp["coded_w"])
-    coded_h = int(precomp["coded_h"])
+    width = int(precomp["width"])
+    height = int(precomp["height"])
 
-    R = torch.as_tensor(rt["R"], dtype=torch.float32, device=depth_linear.device).reshape(3, 3)
-    t = torch.as_tensor(rt["t"], dtype=torch.float32, device=depth_linear.device).reshape(3)
-
+    R = rel["R_rel"]
+    t = rel["t_rel"]
     z = depth_linear
 
     kx = R[0, 0] * x_norm + R[0, 1] * y_norm + R[0, 2] * z_sign
@@ -567,7 +684,6 @@ def backward_map_torch(depth_linear, precomp, rt):
     Zp = z * kz + t[2]
 
     denom = torch.clamp(torch.abs(Zp), min=1e-8)
-
     map_x = fx * (Xp / denom) + cx
     map_y = fy * (Yp / denom) + cy
 
@@ -578,92 +694,49 @@ def backward_map_torch(depth_linear, precomp, rt):
         & (Zp * z_sign > 0.0)
         & (z > 0.0)
         & (map_x >= 0.0)
-        & (map_x <= coded_w - 1)
+        & (map_x <= width - 1)
         & (map_y >= 0.0)
-        & (map_y <= coded_h - 1)
+        & (map_y <= height - 1)
     )
 
     return map_x, map_y, valid
 
 
-def warp_y_torch(ref_y_norm, map_x, map_y, valid, invalid_fill="zero"):
-    """
-    ref_y_norm: [H,W], normalized [0,1]
-    map_x/map_y: target pixel -> reference pixel coordinate
-    """
+def warp_y_torch(ref_y_norm: torch.Tensor, map_x: torch.Tensor, map_y: torch.Tensor) -> torch.Tensor:
     h, w = ref_y_norm.shape
-
     gx = 2.0 * map_x / max(w - 1, 1) - 1.0
     gy = 2.0 * map_y / max(h - 1, 1) - 1.0
-
-    grid = torch.stack([gx, gy], dim=-1)[None]  # [1,H,W,2]
-    src = ref_y_norm[None, None]               # [1,1,H,W]
-
-    out = F.grid_sample(
-        src,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0]
-
-    if invalid_fill == "zero":
-        out = torch.where(valid, out, torch.zeros_like(out))
-    elif invalid_fill == "target":
-        # handled outside if needed
-        pass
-    else:
-        raise ValueError(f"Unsupported invalid_fill: {invalid_fill}")
-
-    return out
+    grid = torch.stack([gx, gy], dim=-1)[None]
+    src = ref_y_norm[None, None]
+    return F.grid_sample(src, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
 
 
 # ============================================================
-# SATD and regularization
+# SATD / regularization
 # ============================================================
 
-def hadamard4(device):
-    H = torch.tensor(
-        [
-            [1.0, 1.0, 1.0, 1.0],
-            [1.0, -1.0, 1.0, -1.0],
-            [1.0, 1.0, -1.0, -1.0],
-            [1.0, -1.0, -1.0, 1.0],
-        ],
-        dtype=torch.float32,
+def hadamard4(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.tensor(
+        [[1.0, 1.0, 1.0, 1.0], [1.0, -1.0, 1.0, -1.0], [1.0, 1.0, -1.0, -1.0], [1.0, -1.0, -1.0, 1.0]],
+        dtype=dtype,
         device=device,
     )
-    return H
 
 
-def satd4x4_loss(residual, valid=None, active_region=None, reduction="mean"):
-    """
-    residual: [H,W], normalized pixel residual.
-    valid: optional bool [H,W].
-    active_region: optional (ys, xs) slices.
-    """
-    if active_region is not None:
-        ys, xs = active_region
-        residual = residual[ys, xs]
-        if valid is not None:
-            valid = valid[ys, xs]
-
+def satd4x4_loss(residual: torch.Tensor, valid: Optional[torch.Tensor], reduction: str = "mean") -> tuple[torch.Tensor, int]:
     h, w = residual.shape
     h4 = (h // 4) * 4
     w4 = (w // 4) * 4
-
     residual = residual[:h4, :w4]
 
+    block_ok = None
     if valid is not None:
         valid = valid[:h4, :w4]
         vb = valid.reshape(h4 // 4, 4, w4 // 4, 4).permute(0, 2, 1, 3)
         block_ok = torch.all(vb, dim=(2, 3))
-    else:
-        block_ok = None
 
-    rb = residual.reshape(h4 // 4, 4, w4 // 4, 4).permute(0, 2, 1, 3)  # [Bh,Bw,4,4]
-
-    Hm = hadamard4(residual.device)
+    rb = residual.reshape(h4 // 4, 4, w4 // 4, 4).permute(0, 2, 1, 3)
+    Hm = hadamard4(residual.device, residual.dtype)
     coeff = torch.einsum("ij,bwjk,kl->bwil", Hm, rb, Hm.t())
     satd = torch.sum(torch.abs(coeff), dim=(2, 3)) * 0.5
 
@@ -672,951 +745,700 @@ def satd4x4_loss(residual, valid=None, active_region=None, reduction="mean"):
 
     if satd.numel() == 0:
         return residual.new_tensor(0.0), 0
-
     if reduction == "sum":
         return torch.sum(satd), int(satd.numel())
-
     return torch.mean(satd), int(satd.numel())
 
 
-def tv_l1(x):
-    """
-    x: [T,1,H,W] or [1,1,H,W]
-    """
+def tv_l1_2d(x: torch.Tensor) -> torch.Tensor:
     loss = x.new_tensor(0.0)
-
     if x.shape[-1] > 1:
         loss = loss + torch.mean(torch.abs(x[..., :, 1:] - x[..., :, :-1]))
     if x.shape[-2] > 1:
         loss = loss + torch.mean(torch.abs(x[..., 1:, :] - x[..., :-1, :]))
-
     return loss
 
 
-def temporal_tv_l1(x, active_frame_mask=None):
-    """
-    x: [T,1,H,W]
-    """
+def temp_l1(x: torch.Tensor, active_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if x.shape[0] <= 1:
         return x.new_tensor(0.0)
-
     diff = torch.abs(x[1:] - x[:-1])
-
-    if active_frame_mask is not None:
-        # Use only adjacent pairs where both frames are active.
-        m0 = active_frame_mask[:-1]
-        m1 = active_frame_mask[1:]
-        m = (m0 & m1).float().view(-1, 1, 1, 1)
+    if active_mask is not None:
+        m = (active_mask[1:] & active_mask[:-1]).float().view(-1, 1, 1, 1)
         if torch.sum(m) <= 0:
             return x.new_tensor(0.0)
         return torch.sum(diff * m) / torch.clamp(torch.sum(m) * diff.shape[1] * diff.shape[2] * diff.shape[3], min=1.0)
-
     return torch.mean(diff)
 
 
 # ============================================================
-# Depth model
+# Depth offset model
 # ============================================================
 
-class LowResInverseDepthOffset(torch.nn.Module):
-    def __init__(
-        self,
-        num_frames: int,
-        coded_h: int,
-        coded_w: int,
-        offset_stride: int,
-        max_delta_rho: float,
-        device,
-    ):
+class LowResDepthOffsetModel(torch.nn.Module):
+    def __init__(self, n_frames: int, height: int, width: int, stride: int, max_delta_rho: float, device: torch.device, dtype: torch.dtype):
         super().__init__()
-
-        self.num_frames = int(num_frames)
-        self.coded_h = int(coded_h)
-        self.coded_w = int(coded_w)
-        self.offset_stride = int(offset_stride)
+        self.n_frames = int(n_frames)
+        self.height = int(height)
+        self.width = int(width)
+        self.stride = int(stride)
         self.max_delta_rho = float(max_delta_rho)
+        h_lr = max(1, int(math.ceil(height / stride)))
+        w_lr = max(1, int(math.ceil(width / stride)))
+        self.raw = torch.nn.Parameter(torch.zeros(self.n_frames, 1, h_lr, w_lr, device=device, dtype=dtype))
 
-        h_lr = max(1, math.ceil(coded_h / offset_stride))
-        w_lr = max(1, math.ceil(coded_w / offset_stride))
-
-        self.raw = torch.nn.Parameter(torch.zeros(num_frames, 1, h_lr, w_lr, dtype=torch.float32, device=device))
-
-    def delta_full(self, frame_idx: int):
-        raw_one = self.raw[int(frame_idx):int(frame_idx) + 1]
-        delta_lr = torch.tanh(raw_one) * self.max_delta_rho
-
-        delta = F.interpolate(
-            delta_lr,
-            size=(self.coded_h, self.coded_w),
-            mode="bilinear",
-            align_corners=False,
-        )[0, 0]
-
-        return delta
-
-    def all_delta_lr(self):
+    def delta_lr_all(self) -> torch.Tensor:
         return torch.tanh(self.raw) * self.max_delta_rho
 
+    def delta_full(self, frame_idx: int) -> torch.Tensor:
+        x = self.delta_lr_all()[int(frame_idx):int(frame_idx) + 1]
+        y = F.interpolate(x, size=(self.height, self.width), mode="bilinear", align_corners=False)
+        return y[0, 0]
 
-def compute_refined_depth_linear(
-    base_depth_y_np,
-    depth_scale_real,
-    model,
-    frame_idx,
-    args,
-    device,
-):
-    """
-    base_depth_y_np: source-size depth sample Y, uint16 or float.
-    Returns:
-      refined depth linear padded tensor [coded_h,coded_w]
-      base depth linear padded tensor [coded_h,coded_w]
-      delta rho full tensor [coded_h,coded_w]
-    """
-    depth_y = torch.from_numpy(base_depth_y_np.astype(np.float32)).to(device)
-    depth_linear = depth_y * float(depth_scale_real)
 
-    depth_linear_pad = pad_2d_edge_torch(
-        depth_linear,
-        args.coded_height_resolved,
-        args.coded_width_resolved,
-        args.pad_left,
-        args.pad_top,
-    )
-
-    depth_linear_pad = torch.clamp(depth_linear_pad, min=float(args.depth_min_linear))
-    rho_base = 1.0 / depth_linear_pad
-
+def refined_depth_for_frame(depth_base_np: np.ndarray, model: LowResDepthOffsetModel, frame_idx: int, args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    d = torch.tensor(depth_base_np.astype(np.float32), device=device, dtype=dtype)
+    d = torch.clamp(d, min=float(args.depth_min))
+    rho = 1.0 / d
     delta = model.delta_full(frame_idx)
-    rho_refined = rho_base + delta
-
-    rho_min = 1.0 / max(float(args.depth_max_linear), 1e-8)
-    rho_max = 1.0 / max(float(args.depth_min_linear), 1e-8)
+    rho_refined = rho + delta
+    rho_min = 1.0 / max(float(args.depth_max), 1e-8)
+    rho_max = 1.0 / max(float(args.depth_min), 1e-8)
     rho_refined = torch.clamp(rho_refined, min=rho_min, max=rho_max)
-
-    depth_refined = 1.0 / rho_refined
-
-    return depth_refined, depth_linear_pad, delta
+    return 1.0 / rho_refined, d, delta
 
 
 # ============================================================
-# Cache
+# Training/eval
 # ============================================================
 
-class FrameCache:
-    def __init__(self, seq_yuv, target_yuv, depth_yuv, width, height, bit_depth):
-        self.seq_yuv = str(seq_yuv)
-        self.target_yuv = str(target_yuv) if target_yuv else str(seq_yuv)
-        self.depth_yuv = str(depth_yuv)
-        self.width = int(width)
-        self.height = int(height)
-        self.bit_depth = int(bit_depth)
-
-        self.ref_y_cache: Dict[int, np.ndarray] = {}
-        self.tar_y_cache: Dict[int, np.ndarray] = {}
-        self.depth_y_cache: Dict[int, np.ndarray] = {}
-
-    def get_ref_y(self, frame_idx: int):
-        frame_idx = int(frame_idx)
-        if frame_idx not in self.ref_y_cache:
-            y = read_y_frame(self.seq_yuv, frame_idx, self.width, self.height, self.bit_depth)
-            self.ref_y_cache[frame_idx] = y
-        return self.ref_y_cache[frame_idx]
-
-    def get_tar_y(self, frame_idx: int):
-        frame_idx = int(frame_idx)
-        if frame_idx not in self.tar_y_cache:
-            y = read_y_frame(self.target_yuv, frame_idx, self.width, self.height, self.bit_depth)
-            self.tar_y_cache[frame_idx] = y
-        return self.tar_y_cache[frame_idx]
-
-    def get_depth_y(self, frame_idx: int):
-        frame_idx = int(frame_idx)
-        if frame_idx not in self.depth_y_cache:
-            y = read_y_frame(self.depth_yuv, frame_idx, self.width, self.height, 10)
-            self.depth_y_cache[frame_idx] = y
-        return self.depth_y_cache[frame_idx]
+def calc_psnr_np(a: np.ndarray, b: np.ndarray, bitdepth: int, mask: Optional[np.ndarray] = None) -> Optional[float]:
+    d = a.astype(np.float64) - b.astype(np.float64)
+    if mask is not None:
+        m = mask.astype(bool)
+        if not np.any(m):
+            return None
+        d = d[m]
+    mse = float(np.mean(d * d))
+    if mse <= 0:
+        return 999.0
+    maxv = float((1 << bitdepth) - 1)
+    return 10.0 * math.log10(maxv * maxv / mse)
 
 
-# ============================================================
-# Optional pseudo MV loading
-# ============================================================
+def compute_pair_loss(pair, stage, frame_cache, model, xy_precomp, rel_pose, args, device, dtype):
+    target, ref, pair_weight, kind = pair
+    tar_yuv_idx = yuv_frame_index_for_poc(target, stage["frame_indices"], args)
+    ref_yuv_idx = yuv_frame_index_for_poc(ref, stage["frame_indices"], args)
 
-def load_pseudo_mv_for_pair(mv_dir: Optional[str], ref_idx: int, tar_idx: int):
-    """
-    Optional regularizer.
+    ref_y = torch_y_norm(frame_cache.ref_y(ref_yuv_idx), args.bitdepth, device, dtype)
+    tar_y = torch_y_norm(frame_cache.tar_y(tar_yuv_idx), args.bitdepth, device, dtype)
 
-    Expected file:
-      {mv_dir}/mv_{ref}_{tar}.npz
+    depth_refined, _, delta = refined_depth_for_frame(stage["depth"][target], model, target, args, device, dtype)
+    map_x, map_y, valid = backward_map_torch(depth_refined, xy_precomp, rel_pose[(target, ref)])
+    pred = warp_y_torch(ref_y, map_x, map_y)
 
-    Supported keys:
-      - map_x, map_y
-      or
-      - mv_x, mv_y
+    if args.invalid_fill == "zero":
+        pred = torch.where(valid, pred, torch.zeros_like(pred))
+    elif args.invalid_fill == "target":
+        pred = torch.where(valid, pred, tar_y)
 
-    Optional:
-      - mask
-    """
-    if not mv_dir:
-        return None
-
-    path = Path(mv_dir) / f"mv_{ref_idx}_{tar_idx}.npz"
-    if not path.exists():
-        return None
-
-    obj = np.load(path)
-
-    if "map_x" in obj and "map_y" in obj:
-        map_x = obj["map_x"].astype(np.float32)
-        map_y = obj["map_y"].astype(np.float32)
-    elif "mv_x" in obj and "mv_y" in obj:
-        mv_x = obj["mv_x"].astype(np.float32)
-        mv_y = obj["mv_y"].astype(np.float32)
-        h, w = mv_x.shape
-        yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
-        map_x = xx + mv_x
-        map_y = yy + mv_y
-    else:
-        raise RuntimeError(f"{path} must contain map_x/map_y or mv_x/mv_y")
-
-    mask = obj["mask"].astype(np.bool_) if "mask" in obj else np.ones_like(map_x, dtype=np.bool_)
-
-    return {
-        "map_x": map_x,
-        "map_y": map_y,
-        "mask": mask,
-        "path": str(path),
-    }
-
-
-def pseudo_mv_loss_torch(map_x, map_y, pseudo, active_region, device):
-    pmx = torch.from_numpy(pseudo["map_x"].astype(np.float32)).to(device)
-    pmy = torch.from_numpy(pseudo["map_y"].astype(np.float32)).to(device)
-    m = torch.from_numpy(pseudo["mask"].astype(np.bool_)).to(device)
-
-    ys, xs = active_region
-    map_x_a = map_x[ys, xs]
-    map_y_a = map_y[ys, xs]
-    pmx_a = pmx[ys, xs]
-    pmy_a = pmy[ys, xs]
-    m_a = m[ys, xs]
-
-    valid = m_a & torch.isfinite(pmx_a) & torch.isfinite(pmy_a)
-
-    if torch.count_nonzero(valid) < 16:
-        return map_x.new_tensor(0.0)
-
-    dx = map_x_a[valid] - pmx_a[valid]
-    dy = map_y_a[valid] - pmy_a[valid]
-    e = torch.sqrt(dx * dx + dy * dy + 1e-6)
-
-    # Charbonnier-like robust loss
-    return torch.mean(e)
-
-
-# ============================================================
-# One training loss pass
-# ============================================================
-
-def compute_pair_loss(
-    pair,
-    frame_cache,
-    model,
-    intrs,
-    frames,
-    depth_scale_real,
-    args,
-    device,
-    precomp_cache,
-    rt_cache,
-    pseudo_cache,
-):
-    ref_idx, tar_idx = int(pair[0]), int(pair[1])
-
-    ref_y_np = frame_cache.get_ref_y(ref_idx)
-    tar_y_np = frame_cache.get_tar_y(tar_idx)
-    depth_y_np = frame_cache.get_depth_y(tar_idx)
-
-    ref_y = torch_from_np_y(ref_y_np, args.bit_depth, device)
-    tar_y = torch_from_np_y(tar_y_np, args.bit_depth, device)
-
-    ref_y_pad = pad_2d_edge_torch(
-        ref_y,
-        args.coded_height_resolved,
-        args.coded_width_resolved,
-        args.pad_left,
-        args.pad_top,
-    )
-
-    tar_y_pad = pad_2d_edge_torch(
-        tar_y,
-        args.coded_height_resolved,
-        args.coded_width_resolved,
-        args.pad_left,
-        args.pad_top,
-    )
-
-    depth_refined, depth_base, delta = compute_refined_depth_linear(
-        base_depth_y_np=depth_y_np,
-        depth_scale_real=depth_scale_real,
-        model=model,
-        frame_idx=tar_idx,
-        args=args,
-        device=device,
-    )
-
-    pc_key = (ref_idx, tar_idx)
-    if pc_key not in precomp_cache:
-        precomp_cache[pc_key] = make_projection_precompute_torch(
-            args.coded_width_resolved,
-            args.coded_height_resolved,
-            intr_tar=intrs[tar_idx],
-            intr_ref=intrs[ref_idx],
-            device=device,
-        )
-
-    if pc_key not in rt_cache:
-        rt_cache[pc_key] = get_target_to_reference_rt(frames, ref_idx, tar_idx)
-
-    precomp = precomp_cache[pc_key]
-    rt = rt_cache[pc_key]
-
-    map_x, map_y, valid = backward_map_torch(depth_refined, precomp, rt)
-    pred = warp_y_torch(ref_y_pad, map_x, map_y, valid, invalid_fill="zero")
-
-    residual = tar_y_pad - pred
-
-    active = active_slice(args.width, args.height, args.pad_left, args.pad_top)
-
-    if args.satd_valid_only:
-        valid_for_satd = valid
-    else:
-        valid_for_satd = None
-
-    satd, satd_blocks = satd4x4_loss(
-        residual=residual,
-        valid=valid_for_satd,
-        active_region=active,
-        reduction=args.satd_reduction,
-    )
-
-    loss = args.lambda_satd * satd
-
-    # Optional pseudo MV geometry regularizer.
-    mv_loss = residual.new_tensor(0.0)
-    if args.pseudo_mv_dir and args.lambda_pseudo_mv > 0.0:
-        if pc_key not in pseudo_cache:
-            pseudo_cache[pc_key] = load_pseudo_mv_for_pair(args.pseudo_mv_dir, ref_idx, tar_idx)
-
-        pseudo = pseudo_cache[pc_key]
-        if pseudo is not None:
-            mv_loss = pseudo_mv_loss_torch(map_x, map_y, pseudo, active, device)
-            loss = loss + args.lambda_pseudo_mv * mv_loss
-
-    # Per-frame delta regularizers.
+    residual = tar_y - pred
+    satd, satd_blocks = satd4x4_loss(residual, valid if args.satd_valid_only else None, reduction=args.satd_reduction)
     delta_mag = torch.mean(torch.abs(delta))
-    delta_tv = tv_l1(delta[None, None])
+    delta_tv = tv_l1_2d(delta[None, None])
 
-    loss = loss + args.lambda_delta_mag * delta_mag
-    loss = loss + args.lambda_delta_tv * delta_tv
+    loss = float(pair_weight) * float(args.lambda_satd) * satd + float(args.lambda_delta_mag) * delta_mag + float(args.lambda_delta_tv) * delta_tv
 
-    with torch.no_grad():
-        valid_ratio_active = float(torch.mean(valid[active].float()).item())
-        pred_np = None
-        tar_np = None
-
-    stats = {
-        "ref": ref_idx,
-        "tar": tar_idx,
-        "satd": float(satd.detach().cpu().item()),
+    st = {
+        "target": int(target),
+        "ref": int(ref),
+        "kind": str(kind),
+        "weight": float(pair_weight),
+        "satd": float(satd.detach().cpu()),
         "satd_blocks": int(satd_blocks),
-        "mv_loss": float(mv_loss.detach().cpu().item()),
-        "delta_mag": float(delta_mag.detach().cpu().item()),
-        "delta_tv": float(delta_tv.detach().cpu().item()),
-        "valid_ratio_active": valid_ratio_active,
+        "delta_mag": float(delta_mag.detach().cpu()),
+        "delta_tv": float(delta_tv.detach().cpu()),
+        "valid_ratio": float(torch.mean(valid.float()).detach().cpu()),
     }
+    return loss, st
 
-    return loss, stats
 
-
-def compute_full_loss(
-    pairs,
-    frame_cache,
-    model,
-    intrs,
-    frames,
-    depth_scale_real,
-    args,
-    device,
-    precomp_cache,
-    rt_cache,
-    pseudo_cache,
-    active_frame_mask,
-):
-    total_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+def compute_total_loss(pairs, stage, frame_cache, model, xy_precomp, rel_pose, active_frame_mask, args, device, dtype):
+    total = torch.zeros((), device=device, dtype=dtype)
     pair_stats = []
-
     for pair in pairs:
-        l, st = compute_pair_loss(
-            pair=pair,
-            frame_cache=frame_cache,
-            model=model,
-            intrs=intrs,
-            frames=frames,
-            depth_scale_real=depth_scale_real,
-            args=args,
-            device=device,
-            precomp_cache=precomp_cache,
-            rt_cache=rt_cache,
-            pseudo_cache=pseudo_cache,
-        )
-        total_loss = total_loss + l
+        l, st = compute_pair_loss(pair, stage, frame_cache, model, xy_precomp, rel_pose, args, device, dtype)
+        total = total + l
         pair_stats.append(st)
 
-    # Temporal TV on low-res offset grid.
-    if args.lambda_delta_temp > 0.0:
-        delta_lr_all = model.all_delta_lr()
-        temp = temporal_tv_l1(delta_lr_all, active_frame_mask=active_frame_mask)
-        total_loss = total_loss + args.lambda_delta_temp * temp
-        temp_val = float(temp.detach().cpu().item())
+    extra = {}
+    if args.lambda_delta_temp > 0:
+        temp = temp_l1(model.delta_lr_all(), active_mask=active_frame_mask)
+        total = total + float(args.lambda_delta_temp) * temp
+        extra["delta_temp"] = float(temp.detach().cpu())
     else:
-        temp_val = 0.0
+        extra["delta_temp"] = 0.0
 
-    # Low-res spatial TV over entire model grid.
-    if args.lambda_delta_lr_tv > 0.0:
-        delta_lr_all = model.all_delta_lr()
-        lr_tv = tv_l1(delta_lr_all)
-        total_loss = total_loss + args.lambda_delta_lr_tv * lr_tv
-        lr_tv_val = float(lr_tv.detach().cpu().item())
+    if args.lambda_delta_lr_tv > 0:
+        lr_tv = tv_l1_2d(model.delta_lr_all())
+        total = total + float(args.lambda_delta_lr_tv) * lr_tv
+        extra["delta_lr_tv"] = float(lr_tv.detach().cpu())
     else:
-        lr_tv_val = 0.0
+        extra["delta_lr_tv"] = 0.0
 
-    return total_loss, pair_stats, {
-        "delta_temp": temp_val,
-        "delta_lr_tv": lr_tv_val,
-    }
+    return total, pair_stats, extra
 
-
-# ============================================================
-# Evaluation and output
-# ============================================================
 
 @torch.no_grad()
-def evaluate_pairs(
-    pairs,
-    frame_cache,
-    model,
-    intrs,
-    frames,
-    depth_scale_real,
-    args,
-    device,
-):
-    precomp_cache = {}
-    rt_cache = {}
-    pseudo_cache = {}
+def evaluate_pairs(pairs, stage, frame_cache, model, xy_precomp, rel_pose, args, device, dtype):
     out = []
+    maxv = float((1 << args.bitdepth) - 1)
 
     for pair in pairs:
-        ref_idx, tar_idx = int(pair[0]), int(pair[1])
-        ref_y_np = frame_cache.get_ref_y(ref_idx)
-        tar_y_np = frame_cache.get_tar_y(tar_idx)
-        depth_y_np = frame_cache.get_depth_y(tar_idx)
+        target, ref, pair_weight, kind = pair
+        tar_yuv_idx = yuv_frame_index_for_poc(target, stage["frame_indices"], args)
+        ref_yuv_idx = yuv_frame_index_for_poc(ref, stage["frame_indices"], args)
 
-        ref_y = torch_from_np_y(ref_y_np, args.bit_depth, device)
-        tar_y = torch_from_np_y(tar_y_np, args.bit_depth, device)
+        ref_y = torch_y_norm(frame_cache.ref_y(ref_yuv_idx), args.bitdepth, device, dtype)
+        tar_y = torch_y_norm(frame_cache.tar_y(tar_yuv_idx), args.bitdepth, device, dtype)
 
-        ref_y_pad = pad_2d_edge_torch(ref_y, args.coded_height_resolved, args.coded_width_resolved, args.pad_left, args.pad_top)
-        tar_y_pad = pad_2d_edge_torch(tar_y, args.coded_height_resolved, args.coded_width_resolved, args.pad_left, args.pad_top)
+        depth_base = torch.tensor(stage["depth"][target].astype(np.float32), device=device, dtype=dtype).clamp_min(float(args.depth_min))
+        map_x_b, map_y_b, valid_b = backward_map_torch(depth_base, xy_precomp, rel_pose[(target, ref)])
+        pred_b = warp_y_torch(ref_y, map_x_b, map_y_b)
 
-        pc_key = (ref_idx, tar_idx)
+        depth_refined, _, _ = refined_depth_for_frame(stage["depth"][target], model, target, args, device, dtype)
+        map_x_r, map_y_r, valid_r = backward_map_torch(depth_refined, xy_precomp, rel_pose[(target, ref)])
+        pred_r = warp_y_torch(ref_y, map_x_r, map_y_r)
 
-        precomp = make_projection_precompute_torch(
-            args.coded_width_resolved,
-            args.coded_height_resolved,
-            intr_tar=intrs[tar_idx],
-            intr_ref=intrs[ref_idx],
-            device=device,
-        )
+        if args.invalid_fill == "zero":
+            pred_b = torch.where(valid_b, pred_b, torch.zeros_like(pred_b))
+            pred_r = torch.where(valid_r, pred_r, torch.zeros_like(pred_r))
+        elif args.invalid_fill == "target":
+            pred_b = torch.where(valid_b, pred_b, tar_y)
+            pred_r = torch.where(valid_r, pred_r, tar_y)
 
-        rt = get_target_to_reference_rt(frames, ref_idx, tar_idx)
+        satd_b, nb = satd4x4_loss(tar_y - pred_b, valid_b if args.satd_valid_only else None, reduction="mean")
+        satd_r, nr = satd4x4_loss(tar_y - pred_r, valid_r if args.satd_valid_only else None, reduction="mean")
 
-        # Base depth eval
-        depth_y_t = torch.from_numpy(depth_y_np.astype(np.float32)).to(device)
-        depth_base = depth_y_t * float(depth_scale_real)
-        depth_base_pad = pad_2d_edge_torch(
-            depth_base,
-            args.coded_height_resolved,
-            args.coded_width_resolved,
-            args.pad_left,
-            args.pad_top,
-        )
-        depth_base_pad = torch.clamp(depth_base_pad, min=float(args.depth_min_linear))
-
-        map_x_b, map_y_b, valid_b = backward_map_torch(depth_base_pad, precomp, rt)
-        pred_b = warp_y_torch(ref_y_pad, map_x_b, map_y_b, valid_b, invalid_fill="zero")
-
-        # Refined depth eval
-        depth_refined, _, _ = compute_refined_depth_linear(
-            base_depth_y_np=depth_y_np,
-            depth_scale_real=depth_scale_real,
-            model=model,
-            frame_idx=tar_idx,
-            args=args,
-            device=device,
-        )
-        map_x_r, map_y_r, valid_r = backward_map_torch(depth_refined, precomp, rt)
-        pred_r = warp_y_torch(ref_y_pad, map_x_r, map_y_r, valid_r, invalid_fill="zero")
-
-        active = active_slice(args.width, args.height, args.pad_left, args.pad_top)
-
-        satd_b, nb = satd4x4_loss(tar_y_pad - pred_b, valid_b if args.satd_valid_only else None, active, reduction="mean")
-        satd_r, nr = satd4x4_loss(tar_y_pad - pred_r, valid_r if args.satd_valid_only else None, active, reduction="mean")
-
-        pred_b_np = (pred_b.detach().cpu().numpy() * ((1 << args.bit_depth) - 1)).astype(np.float32)
-        pred_r_np = (pred_r.detach().cpu().numpy() * ((1 << args.bit_depth) - 1)).astype(np.float32)
-        tar_np = (tar_y_pad.detach().cpu().numpy() * ((1 << args.bit_depth) - 1)).astype(np.float32)
-
-        active_np = np.zeros_like(tar_np, dtype=bool)
-        active_np[active] = True
-
-        valid_b_np = valid_b.detach().cpu().numpy().astype(bool)
-        valid_r_np = valid_r.detach().cpu().numpy().astype(bool)
+        tar_np = (tar_y.detach().cpu().numpy() * maxv).astype(np.float32)
+        pb_np = (pred_b.detach().cpu().numpy() * maxv).astype(np.float32)
+        pr_np = (pred_r.detach().cpu().numpy() * maxv).astype(np.float32)
+        vb_np = valid_b.detach().cpu().numpy().astype(bool)
+        vr_np = valid_r.detach().cpu().numpy().astype(bool)
 
         out.append({
-            "ref": ref_idx,
-            "tar": tar_idx,
-            "base_psnr_active": json_safe(calc_psnr_np(pred_b_np, tar_np, args.bit_depth, mask=active_np)),
-            "refined_psnr_active": json_safe(calc_psnr_np(pred_r_np, tar_np, args.bit_depth, mask=active_np)),
-            "base_psnr_valid_active": json_safe(calc_psnr_np(pred_b_np, tar_np, args.bit_depth, mask=active_np & valid_b_np)),
-            "refined_psnr_valid_active": json_safe(calc_psnr_np(pred_r_np, tar_np, args.bit_depth, mask=active_np & valid_r_np)),
-            "base_satd": float(satd_b.detach().cpu().item()),
-            "refined_satd": float(satd_r.detach().cpu().item()),
-            "base_valid_ratio_active": float(np.mean(valid_b_np[active])),
-            "refined_valid_ratio_active": float(np.mean(valid_r_np[active])),
-            "satd_blocks_base": int(nb),
-            "satd_blocks_refined": int(nr),
+            "target": int(target),
+            "ref": int(ref),
+            "kind": str(kind),
+            "weight": float(pair_weight),
+            "base_satd": float(satd_b.detach().cpu()),
+            "refined_satd": float(satd_r.detach().cpu()),
+            "base_satd_blocks": int(nb),
+            "refined_satd_blocks": int(nr),
+            "base_psnr_full": json_safe_float(calc_psnr_np(pb_np, tar_np, args.bitdepth)),
+            "refined_psnr_full": json_safe_float(calc_psnr_np(pr_np, tar_np, args.bitdepth)),
+            "base_psnr_valid": json_safe_float(calc_psnr_np(pb_np, tar_np, args.bitdepth, mask=vb_np)),
+            "refined_psnr_valid": json_safe_float(calc_psnr_np(pr_np, tar_np, args.bitdepth, mask=vr_np)),
+            "base_valid_ratio": float(np.mean(vb_np)),
+            "refined_valid_ratio": float(np.mean(vr_np)),
         })
-
     return out
 
 
 @torch.no_grad()
-def write_refined_depth_yuv(
-    out_path,
-    depth_yuv,
-    model,
-    depth_scale_real,
-    args,
-    device,
-):
-    depth_frames = count_frames_yuv420(depth_yuv, args.width, args.height, 10)
-    maxv = 1023
+def make_refined_depth_np(stage, model, args, device, dtype) -> np.ndarray:
+    depth = stage["depth"].astype(np.float32)
+    out = depth.copy()
+    target_frames = getattr(args, "_target_frames", range(depth.shape[0]))
+    for fi in target_frames:
+        refined, _, _ = refined_depth_for_frame(depth[int(fi)], model, int(fi), args, device, dtype)
+        out[int(fi)] = refined.detach().cpu().numpy().astype(np.float32)
+    return out
 
-    with open(out_path, "wb") as fp:
-        for fi in range(depth_frames):
-            depth_y_np = read_y_frame(depth_yuv, fi, args.width, args.height, 10).astype(np.float32)
 
-            if fi < model.num_frames:
-                depth_refined, _, _ = compute_refined_depth_linear(
-                    base_depth_y_np=depth_y_np,
-                    depth_scale_real=depth_scale_real,
-                    model=model,
-                    frame_idx=fi,
-                    args=args,
-                    device=device,
-                )
+def derive_max_delta_rho(depth: np.ndarray, target_frames: list[int], args: argparse.Namespace) -> tuple[float, dict[str, Any]]:
+    if args.max_delta_rho > 0:
+        return float(args.max_delta_rho), {"mode": "absolute", "max_delta_rho": float(args.max_delta_rho)}
+    vals = []
+    for fi in target_frames:
+        d = np.maximum(depth[int(fi)].astype(np.float64), float(args.depth_min))
+        vals.append((1.0 / d).reshape(-1))
+    rho = np.concatenate(vals, axis=0)
+    p5 = float(np.percentile(rho, 5.0))
+    p95 = float(np.percentile(rho, 95.0))
+    robust_range = max(p95 - p5, 1e-12)
+    max_delta = float(args.max_delta_rho_ratio) * robust_range
+    return max_delta, {"mode": "ratio", "rho_p5": p5, "rho_p95": p95, "rho_robust_range": robust_range, "max_delta_rho_ratio": float(args.max_delta_rho_ratio), "max_delta_rho": float(max_delta)}
 
-                depth_refined_np = crop_active_np(
-                    depth_refined.detach().cpu().numpy(),
-                    args.width,
-                    args.height,
-                    args.pad_left,
-                    args.pad_top,
-                )
-                depth_y_out = depth_refined_np / float(depth_scale_real)
+
+# ============================================================
+# Output writing
+# ============================================================
+
+def write_camera_jsonl_canonical(path, source_npz, source_camera_jsonl, frame_indices, K, rvecs, tvecs, z_sign, depth_yuv_meta, refine_report_summary):
+    ensure_parent(path)
+    R_all = all_rotation_matrices_np(rvecs)
+    header = {
+        "type": "header",
+        "format": "fixedK_gop_nn_depth_satd_refine_v1",
+        "source_npz": os.path.abspath(source_npz),
+        "source_camera_jsonl": os.path.abspath(source_camera_jsonl) if source_camera_jsonl else None,
+        "frame_count": int(len(frame_indices)),
+        "frame_indices": frame_indices.astype(int).tolist(),
+        "intrinsic_mode": "rap_fixed_depth_satd_refine_camera_unchanged",
+        "intrinsic": {"fx": float(K[0, 0]), "fy": float(K[1, 1]), "cx": float(K[0, 2]), "cy": float(K[1, 2]), "z_sign": float(z_sign)},
+        "intrinsic_delta_order": [],
+        "intrinsic_delta_bits_per_frame": 0,
+        "pose_storage": {
+            "absolute_pose": "camera_from_world / W2C in fixed-K canonical camera coordinates",
+            "relative_pair_formula": "R_rel=R_ref@R_target.T; t_rel=t_ref-R_rel@t_target; X_ref=R_rel*X_target+t_rel",
+            "adjacent_current_to_previous_fields": "also written for compatibility",
+            "camera_refinement": "unchanged from source canonical input",
+        },
+        "depth_output": depth_yuv_meta,
+        "refinement": refine_report_summary,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(to_jsonable(header), ensure_ascii=False) + "\n")
+        for i in range(len(frame_indices)):
+            rec = {
+                "poc": int(i),
+                "frame_idx": int(frame_indices[i]),
+                "rvec_abs": rvecs[i].astype(float).tolist(),
+                "tvec_abs": tvecs[i].astype(float).tolist(),
+                "extrinsic_abs": np.concatenate([R_all[i], tvecs[i].reshape(3, 1)], axis=1).astype(float).tolist(),
+            }
+            if i == 0:
+                rec["rvec_current_to_previous"] = [0.0, 0.0, 0.0]
+                rec["tvec_current_to_previous"] = [0.0, 0.0, 0.0]
             else:
-                depth_y_out = depth_y_np
+                R_rel = R_all[i - 1] @ R_all[i].T
+                t_rel = tvecs[i - 1] - R_rel @ tvecs[i]
+                rec["rvec_current_to_previous"] = matrix_to_rodrigues_np(R_rel).astype(float).tolist()
+                rec["tvec_current_to_previous"] = t_rel.astype(float).tolist()
+            f.write(json.dumps(to_jsonable(rec), ensure_ascii=False) + "\n")
 
-            depth_y_out = np.clip(np.rint(depth_y_out), 0, maxv).astype(np.float32)
-            write_depth_yuv420p10_frame(fp, depth_y_out, maxv=maxv)
+
+def write_refined_geometry_npz(out_npz, stage, refined_depth, result, args):
+    ensure_parent(out_npz)
+    data = stage["data"]
+    payload = {k: data[k] for k in data.files}
+    payload["depth_before_satd_refine"] = stage["depth"].astype(np.float32)
+    payload["depth_canonical"] = refined_depth.astype(np.float32)
+    if args.update_depth_original:
+        payload["depth_original"] = refined_depth.astype(np.float32)
+    payload["K_fixed"] = stage["K"].astype(np.float32)
+    payload["K_refined"] = stage["K"].astype(np.float32)
+    payload["rvec_abs_refined"] = stage["rvecs"].astype(np.float32)
+    payload["tvec_abs_refined"] = stage["tvecs"].astype(np.float32)
+    payload["rvec_abs_final"] = stage["rvecs"].astype(np.float32)
+    payload["tvec_abs_final"] = stage["tvecs"].astype(np.float32)
+    payload["depth_satd_refine_result_json"] = np.asarray(json.dumps(to_jsonable(result), ensure_ascii=False), dtype=object)
+    if args.compressed_npz:
+        np.savez_compressed(out_npz, **payload)
+    else:
+        np.savez(out_npz, **payload)
+
+
+def write_manifest(out_manifest, source_npz, sidecars, out_paths, stage, result, depth_meta, args):
+    ensure_parent(out_manifest)
+    manifest = {
+        "source_npz": os.path.abspath(source_npz),
+        "source_camera_jsonl": os.path.abspath(sidecars["camera_jsonl"]) if sidecars.get("camera_jsonl") else None,
+        "source_depth_yuv": os.path.abspath(sidecars["depth_yuv"]) if sidecars.get("depth_yuv") else None,
+        "outputs": {k: os.path.abspath(v) for k, v in out_paths.items()},
+        "frame_count": int(stage["depth"].shape[0]),
+        "size": {"width": int(stage["depth"].shape[2]), "height": int(stage["depth"].shape[1])},
+        "K": stage["K"].astype(float).tolist(),
+        "camera_status": "unchanged from source canonical input",
+        "depth_yuv": depth_meta,
+        "depth_satd_refine": result,
+        "options": vars(args),
+    }
+    with open(out_manifest, "w", encoding="utf-8") as f:
+        json.dump(to_jsonable(manifest), f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+# ============================================================
+# Sequence YUV resolution
+# ============================================================
+
+def resolve_seq_yuv_for_npz(geometry_npz: Path, src_root: Path, args: argparse.Namespace) -> Optional[Path]:
+    base = derive_base_from_geometry_npz(geometry_npz)
+    if args.seq_yuv:
+        p = Path(args.seq_yuv).expanduser().resolve()
+        return p if p.is_file() else None
+    rel_key = str(geometry_npz.relative_to(src_root)) if src_root in geometry_npz.parents or geometry_npz == src_root else str(geometry_npz)
+    if args.seq_yuv_map_json:
+        with open(args.seq_yuv_map_json, "r", encoding="utf-8") as f:
+            mp = json.load(f)
+        for k in [str(geometry_npz), rel_key, base, geometry_npz.stem]:
+            if k in mp:
+                p = Path(mp[k]).expanduser().resolve()
+                return p if p.is_file() else None
+    if args.seq_yuv_root:
+        root = Path(args.seq_yuv_root).expanduser().resolve()
+        candidates = []
+        try:
+            rel_dir = geometry_npz.parent.relative_to(src_root)
+            candidates.extend([root / rel_dir / f"{base}.yuv", root / rel_dir / f"{base}{args.seq_yuv_suffix}"])
+        except Exception:
+            pass
+        candidates.extend([root / f"{base}.yuv", root / f"{base}{args.seq_yuv_suffix}"])
+        for c in candidates:
+            if c.is_file():
+                return c.resolve()
+        hits = sorted(root.rglob(f"*{base}*.yuv"))
+        if hits:
+            return hits[0].resolve()
+    return None
+
+
+def resolve_target_yuv(seq_yuv: Path, geometry_npz: Path, src_root: Path, args: argparse.Namespace) -> Optional[Path]:
+    if args.target_yuv:
+        p = Path(args.target_yuv).expanduser().resolve()
+        return p if p.is_file() else None
+    if args.target_yuv_root or args.target_yuv_map_json:
+        class Dummy:
+            pass
+        d = Dummy()
+        d.seq_yuv = ""
+        d.seq_yuv_root = args.target_yuv_root
+        d.seq_yuv_map_json = args.target_yuv_map_json
+        d.seq_yuv_suffix = args.target_yuv_suffix
+        p = resolve_seq_yuv_for_npz(geometry_npz, src_root, d)  # type: ignore[arg-type]
+        if p is not None:
+            return p
+    return seq_yuv
+
+
+# ============================================================
+# Per-file pipeline
+# ============================================================
+
+def run_one(geometry_npz: Path, src_root: Path, out_prefix: Path, args: argparse.Namespace) -> int:
+    out_paths = canonical_paths_from_prefix(out_prefix)
+    for p in out_paths.values():
+        if p.exists():
+            if args.force:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+            else:
+                raise RuntimeError(f"Output exists: {p}. Use --force.")
+        ensure_parent(p)
+
+    sidecars = find_canonical_sidecars(geometry_npz)
+    copied_header = load_first_jsonl_object(sidecars.get("camera_jsonl"))
+    source_manifest = load_manifest(sidecars.get("manifest"))
+
+    seq_yuv = resolve_seq_yuv_for_npz(geometry_npz, src_root, args)
+    if seq_yuv is None:
+        raise RuntimeError("Reference sequence YUV not found. Provide --seq-yuv, --seq-yuv-root, or --seq-yuv-map-json.")
+    target_yuv = resolve_target_yuv(seq_yuv, geometry_npz, src_root, args)
+    if target_yuv is None:
+        raise RuntimeError("Target sequence YUV not found.")
+
+    stage = load_canonical_npz(geometry_npz)
+    K = stage["K"]
+    rvecs = stage["rvecs"]
+    tvecs = stage["tvecs"]
+    depth = stage["depth"]
+    frame_indices = stage["frame_indices"]
+    n, h, w = depth.shape
+
+    if args.width is not None and int(args.width) != w:
+        raise ValueError(f"--width {args.width} != NPZ width {w}")
+    if args.height is not None and int(args.height) != h:
+        raise ValueError(f"--height {args.height} != NPZ height {h}")
+    if args.depth_max <= 0.0:
+        args.depth_max = float(np.nanmax(depth[np.isfinite(depth)])) if np.any(np.isfinite(depth)) else 1.0
+        args.depth_max = max(args.depth_max, args.depth_min * 2.0)
+
+    seq_count = count_frames_yuv420(seq_yuv, w, h, args.bitdepth)
+    target_count = count_frames_yuv420(target_yuv, w, h, args.bitdepth)
+    if seq_count <= 0 or target_count <= 0:
+        raise RuntimeError(f"YUV has no full frames: seq={seq_yuv}, target={target_yuv}")
+
+    pairs = build_pair_list(args, stage)
+    checked_pairs = []
+    for target, ref, weight, kind in pairs:
+        tar_idx = yuv_frame_index_for_poc(target, frame_indices, args)
+        ref_idx = yuv_frame_index_for_poc(ref, frame_indices, args)
+        if tar_idx < 0 or tar_idx >= target_count or ref_idx < 0 or ref_idx >= seq_count:
+            if args.skip_out_of_range_pairs:
+                log(f"SKIP pair target={target}, ref={ref}: YUV idx out of range tar={tar_idx}/{target_count}, ref={ref_idx}/{seq_count}")
+                continue
+            raise RuntimeError(f"Pair target={target}, ref={ref} out of YUV range: tar={tar_idx}/{target_count}, ref={ref_idx}/{seq_count}")
+        checked_pairs.append((target, ref, weight, kind))
+    if not checked_pairs:
+        raise RuntimeError("No valid pairs after YUV range check.")
+    pairs = checked_pairs
+    target_frames = sorted(set(int(t) for t, _, _, _ in pairs))
+    args._target_frames = target_frames
+
+    log(f"Loaded canonical NPZ: frames={n}, size={w}x{h}, pairs={len(pairs)}, target_frames={target_frames}")
+    log(f"seq_yuv={seq_yuv}")
+    log(f"target_yuv={target_yuv}")
+    log(f"K fixed: fx={K[0,0]:.6f}, fy={K[1,1]:.6f}, cx={K[0,2]:.6f}, cy={K[1,2]:.6f}")
+    log("Camera K/R|t will be copied unchanged.")
+
+    device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+    dtype = torch.float64 if args.torch_float64 else torch.float32
+    log(f"device={device}, dtype={dtype}")
+
+    max_delta_rho, rho_stats = derive_max_delta_rho(depth, target_frames, args)
+    log(f"max_delta_rho={max_delta_rho:.8e}, mode={rho_stats.get('mode')}")
+
+    model = LowResDepthOffsetModel(n, h, w, args.offset_stride, max_delta_rho, device, dtype).to(device)
+    active_np = np.zeros(n, dtype=np.bool_)
+    for fi in target_frames:
+        active_np[int(fi)] = True
+    active_mask = torch.from_numpy(active_np).to(device)
+
+    def grad_mask_hook(grad: torch.Tensor) -> torch.Tensor:
+        m = active_mask.to(dtype=grad.dtype).view(-1, 1, 1, 1)
+        return grad * m
+    model.raw.register_hook(grad_mask_hook)
+
+    xy_precomp = make_xy_norm_precompute(w, h, K, args.z_sign, device, dtype)
+    rel_pose = precompute_relative_pose_torch(rvecs, tvecs, pairs, device, dtype)
+    frame_cache = YFrameCache(seq_yuv, target_yuv, w, h, args.bitdepth)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) if args.optimizer == "adamw" else torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    log("Initial evaluation...")
+    initial_eval = evaluate_pairs(pairs, stage, frame_cache, model, xy_precomp, rel_pose, args, device, dtype)
+    for e in initial_eval:
+        log(f"INIT pair {e['target']}->{e['ref']}: SATD {e['base_satd']:.6f}->{e['refined_satd']:.6f}, PSNR full {e['base_psnr_full']}->{e['refined_psnr_full']}, valid {e['base_valid_ratio']:.4f}->{e['refined_valid_ratio']:.4f}")
+
+    history = []
+    for step in range(int(args.depth_steps)):
+        opt.zero_grad(set_to_none=True)
+        loss, pair_stats, extra = compute_total_loss(pairs, stage, frame_cache, model, xy_precomp, rel_pose, active_mask, args, device, dtype)
+        if not torch.isfinite(loss):
+            log(f"Depth step {step:04d}: non-finite loss={float(loss.detach().cpu())}; stop.")
+            break
+        loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
+        opt.step()
+        st = {"step": int(step), "loss": float(loss.detach().cpu()), "pair_stats": pair_stats, **extra}
+        history.append(st)
+        if step % max(1, int(args.log_every)) == 0 or step == int(args.depth_steps) - 1:
+            satd_avg = float(np.mean([x["satd"] for x in pair_stats])) if pair_stats else 0.0
+            valid_avg = float(np.mean([x["valid_ratio"] for x in pair_stats])) if pair_stats else 0.0
+            dmag_avg = float(np.mean([x["delta_mag"] for x in pair_stats])) if pair_stats else 0.0
+            dtv_avg = float(np.mean([x["delta_tv"] for x in pair_stats])) if pair_stats else 0.0
+            log(f"Depth step {step:04d}/{args.depth_steps}: loss={st['loss']:.6f}, satd={satd_avg:.6f}, valid={valid_avg:.4f}, dmag={dmag_avg:.3e}, dtv={dtv_avg:.3e}, temp={extra['delta_temp']:.3e}")
+
+    log("Final evaluation...")
+    final_eval = evaluate_pairs(pairs, stage, frame_cache, model, xy_precomp, rel_pose, args, device, dtype)
+    for e in final_eval:
+        log(f"FINAL pair {e['target']}->{e['ref']}: SATD {e['base_satd']:.6f}->{e['refined_satd']:.6f}, PSNR full {e['base_psnr_full']}->{e['refined_psnr_full']}, valid {e['base_valid_ratio']:.4f}->{e['refined_valid_ratio']:.4f}")
+
+    log("Materializing refined depth...")
+    refined_depth = make_refined_depth_np(stage, model, args, device, dtype)
+    depth_scale_meta = extract_depth_scale_meta(refined_depth, copied_header, source_manifest, args)
+    depth_meta = write_depth_yuv420p10le_linear(out_paths["depth_yuv"], refined_depth, depth_scale_meta)
+
+    delta_lr = model.delta_lr_all().detach().cpu().numpy().astype(np.float32)
+    delta_stats = {
+        "offset_stride": int(args.offset_stride),
+        "delta_lr_shape": list(delta_lr.shape),
+        "max_delta_rho": float(max_delta_rho),
+        "delta_lr_min": float(np.min(delta_lr)),
+        "delta_lr_max": float(np.max(delta_lr)),
+        "delta_lr_mean_abs": float(np.mean(np.abs(delta_lr))),
+        "target_frames": [int(x) for x in target_frames],
+    }
+
+    result = {
+        "method": {
+            "description": "Depth-only low-resolution inverse-depth SATD refinement. K and W2C R|t are fixed and copied unchanged.",
+            "depth_model": "rho_refined = 1/depth_canonical + bilinear_upsample(max_delta_rho*tanh(raw_delta_lr)); depth_refined=1/rho_refined",
+            "loss": "multi-pair 4x4 SATD of target_y - warp(ref_y, refined_depth, fixed_camera) plus L1/TV/temporal regularization",
+            "pose_convention": "camera_from_world / W2C: X_cam=R X_world+t",
+            "relative_formula": "R_rel=R_ref@R_target.T; t_rel=t_ref-R_rel@t_target",
+            "camera": "unchanged",
+        },
+        "input": {"geometry_npz": str(geometry_npz), "camera_jsonl": str(sidecars["camera_jsonl"]) if sidecars.get("camera_jsonl") else None, "depth_yuv": str(sidecars["depth_yuv"]) if sidecars.get("depth_yuv") else None, "seq_yuv": str(seq_yuv), "target_yuv": str(target_yuv)},
+        "size": {"width": int(w), "height": int(h)},
+        "frame_indices": frame_indices.astype(int).tolist(),
+        "stage_source_keys": stage["source_keys"],
+        "options": vars(args),
+        "K": K.astype(float).tolist(),
+        "camera_status": "unchanged from source canonical input",
+        "pairs": [{"target": int(t), "ref": int(r), "weight": float(wt), "kind": str(k)} for t, r, wt, k in pairs],
+        "rho_stats": rho_stats,
+        "delta_stats": delta_stats,
+        "initial_eval": initial_eval,
+        "final_eval": final_eval,
+        "history_tail": history[-20:],
+    }
+
+    summary = {"description": "depth SATD low-res inverse-depth refinement; canonical output naming preserved; camera unchanged", "pair_source": args.pair_source, "num_pairs": len(pairs), "target_frames": [int(x) for x in target_frames], "K": K.astype(float).tolist(), "camera_status": "unchanged", "rho_stats": rho_stats, "delta_stats": delta_stats}
+    write_camera_jsonl_canonical(out_paths["camera_jsonl"], geometry_npz, sidecars.get("camera_jsonl"), frame_indices, K, rvecs, tvecs, args.z_sign, depth_meta, summary)
+    result["outputs"] = {k: str(v) for k, v in out_paths.items()}
+    result["depth_yuv"] = depth_meta
+    write_refined_geometry_npz(out_paths["geometry_npz"], stage, refined_depth, result, args)
+    write_manifest(out_paths["manifest"], geometry_npz, sidecars, out_paths, stage, result, depth_meta, args)
+
+    print("============================================================")
+    print("Depth SATD refine done")
+    print("============================================================")
+    print(f"input geometry : {geometry_npz}")
+    print(f"seq yuv        : {seq_yuv}")
+    print(f"target yuv     : {target_yuv}")
+    print(f"frames         : {n}")
+    print(f"size           : {w}x{h}")
+    print("camera         : unchanged")
+    print(f"offset stride  : {args.offset_stride}")
+    print(f"target frames  : {target_frames}")
+    print(f"geometry npz   : {out_paths['geometry_npz']}")
+    print(f"camera jsonl   : {out_paths['camera_jsonl']}")
+    print(f"depth yuv      : {out_paths['depth_yuv']}")
+    print(f"manifest       : {out_paths['manifest']}")
+    print("============================================================")
+    return 0
 
 
 # ============================================================
 # CLI
 # ============================================================
 
-def parse_args():
-    p = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Batch depth-only SATD refinement for canonical fixedK GOP NN-depth outputs. Outputs preserve canonical filenames.")
+    ap.add_argument("--src-root", required=True)
+    ap.add_argument("--dst-root", required=True)
+    ap.add_argument("--pattern", default=f"*{GEOM_SUFFIX}")
+    ap.add_argument("--layout", choices=["preserve", "flat"], default="preserve")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--skip-invalid", action="store_true")
+    ap.add_argument("--continue-on-error", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--compressed-npz", action="store_true")
 
-    p.add_argument("--seq-yuv", required=True, help="Reference YUV420 sequence. Usually codec recon/reference sequence.")
-    p.add_argument("--target-yuv", default="", help="Target YUV420 sequence for loss. If omitted, --seq-yuv is used.")
-    p.add_argument("--depth-yuv", required=True, help="Reconstructed/base depth YUV420p10le.")
-    p.add_argument("--param-jsonl", required=True)
+    ap.add_argument("--seq-yuv", default="")
+    ap.add_argument("--seq-yuv-root", default="")
+    ap.add_argument("--seq-yuv-map-json", default="")
+    ap.add_argument("--seq-yuv-suffix", default=".yuv")
+    ap.add_argument("--target-yuv", default="")
+    ap.add_argument("--target-yuv-root", default="")
+    ap.add_argument("--target-yuv-map-json", default="")
+    ap.add_argument("--target-yuv-suffix", default=".yuv")
+    ap.add_argument("--bitdepth", type=int, choices=[8, 10], default=10)
+    ap.add_argument("--width", type=int, default=None)
+    ap.add_argument("--height", type=int, default=None)
+    ap.add_argument("--seq-start", type=int, default=0)
+    ap.add_argument("--frame-index-mode", choices=["local", "frame_indices"], default="local")
 
-    p.add_argument("--width", type=int, required=True)
-    p.add_argument("--height", type=int, required=True)
-    p.add_argument("--bit-depth", type=int, default=10)
+    ap.add_argument("--pairs", default="", help="target:ref[:weight], e.g. 16:0:2,16:32:2")
+    ap.add_argument("--pair-source", choices=["npz", "adjacent", "dyadic", "all"], default="npz")
+    ap.add_argument("--pair-weight", type=float, default=1.0)
+    ap.add_argument("--no-bidirectional-pairs", action="store_true")
+    ap.add_argument("--max-pairs", type=int, default=0)
+    ap.add_argument("--skip-out-of-range-pairs", action="store_true")
 
-    p.add_argument("--coded-width", type=int, default=0)
-    p.add_argument("--coded-height", type=int, default=0)
-    p.add_argument("--pad-left", type=int, default=0)
-    p.add_argument("--pad-top", type=int, default=0)
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--torch-float64", action="store_true")
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--depth-steps", type=int, default=300)
+    ap.add_argument("--lr", type=float, default=0.05)
+    ap.add_argument("--optimizer", choices=["adam", "adamw"], default="adam")
+    ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--grad-clip", type=float, default=10.0)
+    ap.add_argument("--log-every", type=int, default=20)
+    ap.add_argument("--offset-stride", type=int, default=64)
+    ap.add_argument("--max-delta-rho", type=float, default=0.0)
+    ap.add_argument("--max-delta-rho-ratio", type=float, default=0.01)
+    ap.add_argument("--lambda-satd", type=float, default=1.0)
+    ap.add_argument("--lambda-delta-mag", type=float, default=1.0)
+    ap.add_argument("--lambda-delta-tv", type=float, default=5.0)
+    ap.add_argument("--lambda-delta-lr-tv", type=float, default=0.0)
+    ap.add_argument("--lambda-delta-temp", type=float, default=1.0)
+    ap.add_argument("--satd-valid-only", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--satd-reduction", choices=["mean", "sum"], default="mean")
+    ap.add_argument("--invalid-fill", choices=["zero", "target"], default="zero")
+    ap.add_argument("--z-sign", type=float, default=1.0)
+    ap.add_argument("--depth-min", type=float, default=1e-6)
+    ap.add_argument("--depth-max", type=float, default=0.0)
+    ap.add_argument("--recompute-depth-scale", action="store_true")
+    ap.add_argument("--depth-scale-precision", type=int, default=100000)
+    ap.add_argument("--depth-scale-percentile", type=float, default=99.9)
+    ap.add_argument("--update-depth-original", action="store_true")
 
-    p.add_argument("--pairs", default="", help="Comma separated ref:tar pairs, e.g. 0:16,32:16")
-    p.add_argument("--pairs-json", default="", help="JSON list or {'pairs':[[ref,tar],...]}")
-
-    p.add_argument("--seq-start", type=int, default=0, help="Reserved. Pair indices are currently interpreted as direct frame indices.")
-
-    p.add_argument("--offset-stride", type=int, default=64, help="Low-res offset grid stride in coded luma pixels.")
-    p.add_argument("--max-delta-rho", type=float, default=0.0, help="Absolute max inverse-depth offset. If 0, derived from --max-delta-rho-ratio.")
-    p.add_argument("--max-delta-rho-ratio", type=float, default=0.01, help="Max delta rho = ratio * robust rho range.")
-
-    p.add_argument("--depth-min-linear", type=float, default=1e-6)
-    p.add_argument("--depth-max-linear", type=float, default=0.0, help="If 0, uses 1023 * depth_scale_real.")
-
-    p.add_argument("--num-steps", type=int, default=300)
-    p.add_argument("--lr", type=float, default=0.05)
-    p.add_argument("--optimizer", choices=["adam", "adamw"], default="adam")
-
-    p.add_argument("--lambda-satd", type=float, default=1.0)
-    p.add_argument("--lambda-delta-mag", type=float, default=1.0)
-    p.add_argument("--lambda-delta-tv", type=float, default=5.0)
-    p.add_argument("--lambda-delta-lr-tv", type=float, default=0.0)
-    p.add_argument("--lambda-delta-temp", type=float, default=1.0)
-
-    p.add_argument("--satd-valid-only", action="store_true", help="Use only fully valid 4x4 blocks for SATD.")
-    p.add_argument("--satd-reduction", choices=["mean", "sum"], default="mean")
-
-    p.add_argument("--pseudo-mv-dir", default="", help="Optional dir containing mv_ref_tar.npz for pseudo MV regularizer.")
-    p.add_argument("--lambda-pseudo-mv", type=float, default=0.0)
-
-    p.add_argument("--device", default="cuda", help="cuda, cuda:0, or cpu.")
-    p.add_argument("--seed", type=int, default=1234)
-
-    p.add_argument("--log-interval", type=int, default=10)
-
-    p.add_argument("--out-depth-yuv", required=True)
-    p.add_argument("--out-json", required=True)
-    p.add_argument("--out-delta-npz", default="")
-
-    return p.parse_args()
-
-
-def validate_and_resolve_args(args):
-    if args.width <= 0 or args.height <= 0:
-        raise ValueError("width/height must be positive")
-    if args.width % 2 or args.height % 2:
-        raise ValueError("YUV420 requires even width/height")
-    if args.bit_depth <= 0:
-        raise ValueError("bad bit depth")
+    args = ap.parse_args()
     if args.offset_stride <= 0:
-        raise ValueError("offset_stride must be positive")
-    if args.num_steps < 0:
-        raise ValueError("num_steps must be non-negative")
-    if args.depth_min_linear <= 0:
-        raise ValueError("depth_min_linear must be positive")
-
-    coded_w = int(args.coded_width) if args.coded_width else align_to(args.width + args.pad_left, 4)
-    coded_h = int(args.coded_height) if args.coded_height else align_to(args.height + args.pad_top, 4)
-
-    pad_right, pad_bottom = calc_padding(
-        args.width,
-        args.height,
-        coded_w,
-        coded_h,
-        args.pad_left,
-        args.pad_top,
-    )
-
-    validate_yuv420_padding(
-        args.width,
-        args.height,
-        coded_w,
-        coded_h,
-        args.pad_left,
-        args.pad_top,
-        pad_right,
-        pad_bottom,
-    )
-
-    args.coded_width_resolved = coded_w
-    args.coded_height_resolved = coded_h
-    args.pad_right_resolved = pad_right
-    args.pad_bottom_resolved = pad_bottom
-
-    if args.target_yuv == "":
-        args.target_yuv = args.seq_yuv
-
+        raise ValueError("--offset-stride must be positive")
+    if args.depth_steps < 0:
+        raise ValueError("--depth-steps must be non-negative")
+    if args.depth_min <= 0:
+        raise ValueError("--depth-min must be positive")
+    if args.max_delta_rho < 0:
+        raise ValueError("--max-delta-rho must be non-negative")
+    if args.max_delta_rho_ratio < 0:
+        raise ValueError("--max-delta-rho-ratio must be non-negative")
+    if args.depth_scale_precision <= 0:
+        raise ValueError("--depth-scale-precision must be positive")
+    if args.depth_scale_percentile <= 0 or args.depth_scale_percentile > 100:
+        raise ValueError("--depth-scale-percentile must be in (0,100]")
     return args
 
 
-def derive_max_delta_rho(args, frame_cache, target_frames, depth_scale_real):
-    vals = []
-
-    for fi in sorted(target_frames):
-        d_y = frame_cache.get_depth_y(fi).astype(np.float64)
-        d = np.maximum(d_y * float(depth_scale_real), float(args.depth_min_linear))
-        rho = 1.0 / d
-        vals.append(rho.reshape(-1))
-
-    if not vals:
-        raise RuntimeError("No target frames for delta-rho range derivation")
-
-    rho_all = np.concatenate(vals)
-    p5 = float(np.percentile(rho_all, 5.0))
-    p95 = float(np.percentile(rho_all, 95.0))
-    robust_range = max(p95 - p5, 1e-12)
-
-    return float(args.max_delta_rho_ratio) * robust_range, {
-        "rho_p5": p5,
-        "rho_p95": p95,
-        "rho_robust_range": robust_range,
-    }
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
+def main() -> None:
     args = parse_args()
-    args = validate_and_resolve_args(args)
-
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    print(f"[INFO] device: {device}")
-
-    pairs = load_pairs(args)
-    max_pair_idx = max(max(r, t) for r, t in pairs)
-    target_frames = sorted(set(t for _, t in pairs))
-
-    header, frames = load_param_jsonl(args.param_jsonl)
-    depth_scale_real = get_depth_scale_real_from_header(header)
-
-    if args.depth_max_linear <= 0:
-        args.depth_max_linear = 1023.0 * float(depth_scale_real)
-
-    intrs = build_frame_intrinsics(
-        header=header,
-        frames=frames,
-        max_idx=max(max_pair_idx, max(frames.keys())),
-        pad_left=args.pad_left,
-        pad_top=args.pad_top,
-    )
-
-    seq_count = count_frames_yuv420(args.seq_yuv, args.width, args.height, args.bit_depth)
-    target_count = count_frames_yuv420(args.target_yuv, args.width, args.height, args.bit_depth)
-    depth_count = count_frames_yuv420(args.depth_yuv, args.width, args.height, 10)
-
-    for r, t in pairs:
-        if r < 0 or r >= seq_count:
-            raise RuntimeError(f"ref frame {r} outside seq count {seq_count}")
-        if t < 0 or t >= target_count:
-            raise RuntimeError(f"target frame {t} outside target count {target_count}")
-        if t < 0 or t >= depth_count:
-            raise RuntimeError(f"target depth frame {t} outside depth count {depth_count}")
-
-    frame_cache = FrameCache(
-        seq_yuv=args.seq_yuv,
-        target_yuv=args.target_yuv,
-        depth_yuv=args.depth_yuv,
-        width=args.width,
-        height=args.height,
-        bit_depth=args.bit_depth,
-    )
-
-    if args.max_delta_rho > 0:
-        max_delta_rho = float(args.max_delta_rho)
-        rho_stats = {"mode": "absolute", "max_delta_rho": max_delta_rho}
-    else:
-        max_delta_rho, rho_stats = derive_max_delta_rho(args, frame_cache, target_frames, depth_scale_real)
-        rho_stats["mode"] = "ratio"
-        rho_stats["max_delta_rho"] = max_delta_rho
-        rho_stats["max_delta_rho_ratio"] = float(args.max_delta_rho_ratio)
-
-    print(f"[INFO] pairs: {pairs}")
-    print(f"[INFO] target frames: {target_frames}")
-    print(f"[INFO] depth_scale_real: {depth_scale_real}")
-    print(f"[INFO] depth linear range: [{args.depth_min_linear}, {args.depth_max_linear}]")
-    print(f"[INFO] max_delta_rho: {max_delta_rho:.8e}")
-    print(f"[INFO] coded size: {args.coded_width_resolved}x{args.coded_height_resolved}")
-    print(f"[INFO] offset stride: {args.offset_stride}")
-
-    # Use frame indices directly, so model num frames must cover max frame index.
-    model_num_frames = max(depth_count, max_pair_idx + 1)
-
-    model = LowResInverseDepthOffset(
-        num_frames=model_num_frames,
-        coded_h=args.coded_height_resolved,
-        coded_w=args.coded_width_resolved,
-        offset_stride=args.offset_stride,
-        max_delta_rho=max_delta_rho,
-        device=device,
-    ).to(device)
-
-    # Freeze non-target frames by gradient masking.
-    active_frame_mask_np = np.zeros(model_num_frames, dtype=np.bool_)
-    for fi in target_frames:
-        active_frame_mask_np[int(fi)] = True
-    active_frame_mask = torch.from_numpy(active_frame_mask_np).to(device)
-
-    def mask_grad_hook(grad):
-        m = active_frame_mask.float().view(-1, 1, 1, 1)
-        return grad * m
-
-    model.raw.register_hook(mask_grad_hook)
-
-    if args.optimizer == "adam":
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    else:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-
-    precomp_cache = {}
-    rt_cache = {}
-    pseudo_cache = {}
-
-    stats_history = []
-
-    print("[INFO] Initial evaluation...")
-    initial_eval = evaluate_pairs(
-        pairs=pairs,
-        frame_cache=frame_cache,
-        model=model,
-        intrs=intrs,
-        frames=frames,
-        depth_scale_real=depth_scale_real,
-        args=args,
-        device=device,
-    )
-    for e in initial_eval:
-        print(
-            f"  pair {e['ref']}->{e['tar']} | "
-            f"base SATD={e['base_satd']:.6f}, refined SATD={e['refined_satd']:.6f}, "
-            f"base PSNR={e['base_psnr_active']}, refined PSNR={e['refined_psnr_active']}"
-        )
-
-    for step in range(args.num_steps):
-        opt.zero_grad(set_to_none=True)
-
-        loss, pair_stats, extra_stats = compute_full_loss(
-            pairs=pairs,
-            frame_cache=frame_cache,
-            model=model,
-            intrs=intrs,
-            frames=frames,
-            depth_scale_real=depth_scale_real,
-            args=args,
-            device=device,
-            precomp_cache=precomp_cache,
-            rt_cache=rt_cache,
-            pseudo_cache=pseudo_cache,
-            active_frame_mask=active_frame_mask,
-        )
-
-        loss.backward()
-        opt.step()
-
-        st = {
-            "step": int(step),
-            "loss": float(loss.detach().cpu().item()),
-            "pair_stats": pair_stats,
-            **extra_stats,
-        }
-        stats_history.append(st)
-
-        if step % args.log_interval == 0 or step == args.num_steps - 1:
-            satd_avg = float(np.mean([p["satd"] for p in pair_stats])) if pair_stats else 0.0
-            valid_avg = float(np.mean([p["valid_ratio_active"] for p in pair_stats])) if pair_stats else 0.0
-            dmag_avg = float(np.mean([p["delta_mag"] for p in pair_stats])) if pair_stats else 0.0
-            dtv_avg = float(np.mean([p["delta_tv"] for p in pair_stats])) if pair_stats else 0.0
-
-            print(
-                f"[{step:04d}/{args.num_steps}] "
-                f"loss={st['loss']:.6f} "
-                f"satd={satd_avg:.6f} "
-                f"valid={valid_avg:.4f} "
-                f"dmag={dmag_avg:.3e} "
-                f"dtv={dtv_avg:.3e} "
-                f"temp={extra_stats['delta_temp']:.3e}"
-            )
-
-    print("[INFO] Final evaluation...")
-    final_eval = evaluate_pairs(
-        pairs=pairs,
-        frame_cache=frame_cache,
-        model=model,
-        intrs=intrs,
-        frames=frames,
-        depth_scale_real=depth_scale_real,
-        args=args,
-        device=device,
-    )
-
-    for e in final_eval:
-        print(
-            f"  pair {e['ref']}->{e['tar']} | "
-            f"base SATD={e['base_satd']:.6f}, refined SATD={e['refined_satd']:.6f}, "
-            f"base PSNR={e['base_psnr_active']}, refined PSNR={e['refined_psnr_active']}, "
-            f"valid {e['base_valid_ratio_active']:.4f}->{e['refined_valid_ratio_active']:.4f}"
-        )
-
-    print(f"[INFO] Writing refined depth YUV: {args.out_depth_yuv}")
-    write_refined_depth_yuv(
-        out_path=args.out_depth_yuv,
-        depth_yuv=args.depth_yuv,
-        model=model,
-        depth_scale_real=depth_scale_real,
-        args=args,
-        device=device,
-    )
-
-    if args.out_delta_npz:
-        delta_lr = model.all_delta_lr().detach().cpu().numpy()
-        np.savez_compressed(
-            args.out_delta_npz,
-            delta_rho_lr=delta_lr,
-            active_frame_mask=active_frame_mask_np,
-            max_delta_rho=np.array([max_delta_rho], dtype=np.float64),
-            offset_stride=np.array([args.offset_stride], dtype=np.int32),
-            pairs=np.asarray(pairs, dtype=np.int32),
-        )
-        print(f"[INFO] Wrote delta NPZ: {args.out_delta_npz}")
-
-    summary = {
-        "args": {
-            k: json_safe(v)
-            for k, v in vars(args).items()
-            if not k.endswith("_resolved")
-        },
-        "resolved": {
-            "coded_width": args.coded_width_resolved,
-            "coded_height": args.coded_height_resolved,
-            "pad_right": args.pad_right_resolved,
-            "pad_bottom": args.pad_bottom_resolved,
-        },
-        "pairs": [{"ref": int(r), "tar": int(t)} for r, t in pairs],
-        "target_frames": [int(x) for x in target_frames],
-        "depth_scale_real": depth_scale_real,
-        "rho_stats": rho_stats,
-        "initial_eval": initial_eval,
-        "final_eval": final_eval,
-        "history_tail": stats_history[-20:],
-        "outputs": {
-            "out_depth_yuv": args.out_depth_yuv,
-            "out_delta_npz": args.out_delta_npz,
-            "out_json": args.out_json,
-        },
-    }
-
-    with open(args.out_json, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-    print(f"[INFO] Wrote JSON: {args.out_json}")
-    print("Done.")
+    src_root = Path(args.src_root).resolve()
+    dst_root = Path(args.dst_root).resolve()
+    if not src_root.is_dir():
+        raise FileNotFoundError(f"src-root not found: {src_root}")
+    ensure_dir(dst_root)
+    npz_files = find_geometry_npz_files(src_root, args.pattern)
+    log(f"Source root : {src_root}")
+    log(f"Dest root   : {dst_root}")
+    log(f"Pattern     : {args.pattern}")
+    log(f"Found NPZ   : {len(npz_files)}")
+    if not npz_files:
+        return
+    success = skipped = failed = 0
+    for idx, geometry_npz in enumerate(npz_files, start=1):
+        rel = geometry_npz.relative_to(src_root)
+        log("=" * 72)
+        log(f"[{idx}/{len(npz_files)}] {rel}")
+        if args.skip_invalid and not validate_canonical_npz(geometry_npz):
+            skipped += 1
+            continue
+        out_prefix = make_out_prefix(geometry_npz, src_root, dst_root, args.layout)
+        if already_done(out_prefix) and not args.force:
+            log(f"SKIP already done: {canonical_paths_from_prefix(out_prefix)['manifest']}")
+            skipped += 1
+            continue
+        if args.dry_run:
+            log(f"DRY RUN output prefix: {out_prefix}")
+            skipped += 1
+            continue
+        try:
+            ret = run_one(geometry_npz, src_root, out_prefix, args)
+        except Exception as exc:
+            failed += 1
+            log(f"FAILED: {exc}")
+            if not args.continue_on_error:
+                raise
+            continue
+        if ret == 0:
+            success += 1
+            log("OK")
+        else:
+            failed += 1
+            log(f"FAILED returncode={ret}")
+            if not args.continue_on_error:
+                raise RuntimeError(f"Failed on {geometry_npz}")
+    log("=" * 72)
+    log(f"Done. success={success}, skipped={skipped}, failed={failed}")
 
 
 if __name__ == "__main__":
