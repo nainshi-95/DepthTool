@@ -10,6 +10,8 @@ Important behavior:
   2) From POC 16 onward, already reconstructed L0/L1 depth frames are
      forward-projected into the current camera. Their projected depths are
      combined and fitted as the block-level ``plane_warp`` candidate.
+  5) The same-position reconstructed plane from the selected RA depth
+     reference is also supplied directly as a ``temporal`` copy-delta candidate.
      Therefore RA temporal prediction now affects depth bits and mode ratios.
   3) Video prediction separately uses the reconstructed current depth to
      backward-project current pixels into L0/L1 reference pictures.
@@ -353,9 +355,11 @@ def adaptive_signed_residual_update(q, model, abs_max):
 
 
 def create_adaptive_models(args):
-    # Plain temporal candidate intentionally removed.
+    # Camera-projected candidate plus one same-position temporal candidate
+    # from the selected RA reconstructed depth reference.
     cand_symbols = [
         "plane_warp",
+        "temporal",
         "left",
         "top",
         "top_left",
@@ -1121,6 +1125,7 @@ def make_plane_warp_candidate(ctx, x, y, w, h, cx, cy, args, grid):
 
 def make_candidates(
     store,
+    temporal_store,
     x,
     y,
     w,
@@ -1151,6 +1156,18 @@ def make_candidates(
         if p is not None:
             conv["plane_warp"] = p
             cand.append(("plane_warp", p))
+
+    # Same-position temporal plane candidate.  The selected RA depth
+    # reference is the already reconstructed endpoint recorded as
+    # depth_reference in the coding plan.  The leaf containing the current
+    # block centre is translated to the current block centre and then tested
+    # by both copy and delta modes.  No camera projection is applied.
+    if args.same_position_temporal_candidate and temporal_store:
+        r = leaf_covering_point(temporal_store, cx, cy)
+        if r is not None:
+            p = plane_to_center(r.plane, cx, cy)
+            conv["temporal"] = p
+            cand.append(("temporal", p))
 
     items = [
         ("left", best_left(store, x, y, w, h)),
@@ -1340,8 +1357,6 @@ def eval_leaf(
     adaptive,
     plane_warp_ctx,
 ):
-    del prev_store  # Plain temporal candidate has been removed.
-
     block = padded[y : y + h, x : x + w]
 
     cx = x + (w - 1) / 2.0
@@ -1352,6 +1367,7 @@ def eval_leaf(
 
     cands = make_candidates(
         store=store,
+        temporal_store=prev_store,
         x=x,
         y=y,
         w=w,
@@ -2694,6 +2710,24 @@ def parse_args():
         help="disable camera-projected reference-depth candidate",
     )
     p.set_defaults(plane_warp_candidate=True)
+
+    p.add_argument(
+        "--same-position-temporal-candidate",
+        dest="same_position_temporal_candidate",
+        action="store_true",
+        help=(
+            "enable same-position reconstructed-plane candidate from the "
+            "selected RA depth reference (default)"
+        ),
+    )
+    p.add_argument(
+        "--no-same-position-temporal-candidate",
+        dest="same_position_temporal_candidate",
+        action="store_false",
+        help="disable the same-position RA temporal plane candidate",
+    )
+    p.set_defaults(same_position_temporal_candidate=True)
+
     p.add_argument("--plane-warp-samples", type=int, default=5)
     p.add_argument("--plane-warp-min-valid-ratio", type=float, default=0.5)
 
@@ -2910,11 +2944,20 @@ def main():
 
                 cam_cur = ensure_camera_or_raise(camera_lookup, fi, "current")
 
-                ref_store = (
-                    frame_store.get(depth_ref_idx)
-                    if depth_ref_idx is not None
-                    else None
-                )
+                # Same-position temporal candidate from the single RA
+                # depth_reference selected by the coding plan.  The camera-
+                # projected plane_warp candidate can still use both L0/L1.
+                temporal_store = None
+                if (
+                    args.same_position_temporal_candidate
+                    and depth_ref_idx is not None
+                ):
+                    if depth_ref_idx not in frame_store:
+                        raise RuntimeError(
+                            f"POC {fi}: reconstructed temporal plane store "
+                            f"{depth_ref_idx} is unavailable"
+                        )
+                    temporal_store = frame_store[depth_ref_idx]
 
                 # --------------------------------------------------------
                 # RA temporal depth prediction used by depth plane coding.
@@ -2990,7 +3033,7 @@ def main():
                     fi,
                     args,
                     grid,
-                    prev_store=ref_store,
+                    prev_store=temporal_store,
                     writer=writer,
                     adaptive=adaptive,
                     plane_warp_ctx=plane_warp_ctx,
@@ -3092,6 +3135,10 @@ def main():
                 sm["depth_prediction_type"] = (
                     "none" if plane_warp_ctx is None else plane_warp_ctx.source_type
                 )
+                sm["same_position_temporal_enabled"] = int(
+                    args.same_position_temporal_candidate
+                )
+                sm["same_position_temporal_count"] = int(temporal_store is not None)
                 # Backward-compatible single-reference column.
                 sm["reference_frame"] = -1 if ref_l0 is None else int(ref_l0)
                 sm["temporal_layer"] = temporal_layer
@@ -3165,7 +3212,10 @@ def main():
         "camera_format": cam_header.get("format"),
         "camera_pose_mode": cam_header["pose_mode"],
         "projection_mode": "vggt_fast_pixel_coordinate_dual_intrinsic_no_ndc",
-        "ra_depth_prediction": "forward_project_reconstructed_L0_L1_depth_then_fit_plane",
+        "ra_depth_prediction": (
+            "forward_project_reconstructed_L0_L1_depth_then_fit_plane"
+            "+same_position_reconstructed_depth_reference_plane_candidate"
+        ),
         "depth_scale": cam_header["depth_scale"],
         "depth_scale_precision": cam_header["depth_scale_precision"],
         "depth_scale_real_used": depth_scale_real,
