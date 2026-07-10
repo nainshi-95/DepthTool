@@ -797,13 +797,16 @@ def hadamard_matrix(n: int, device: torch.device, dtype: torch.dtype) -> torch.T
     return _HADAMARD_CACHE[key]
 
 
-def block_satd_loss_parallel(residual: torch.Tensor, valid: Optional[torch.Tensor], block_size: int, reduction: str = "mean", normalize: str = "sqrt") -> tuple[torch.Tensor, int]:
+def block_satd_loss_parallel(residual: torch.Tensor, valid: torch.Tensor, block_size: int, reduction: str = "mean", normalize: str = "sqrt") -> tuple[torch.Tensor, int, int]:
     """
     Fully parallel GPU SATD over non-overlapping BxB blocks.
 
     residual: [H,W]
-    valid: optional bool [H,W]. If provided, only all-valid blocks are used.
+    valid: bool [H,W]. Only blocks whose every pixel is valid are used.
     block_size: 4/8/16/32/...
+
+    Returns:
+      loss, used_blocks, total_blocks
     """
     B = int(block_size)
     h, w = residual.shape
@@ -811,11 +814,12 @@ def block_satd_loss_parallel(residual: torch.Tensor, valid: Optional[torch.Tenso
     wB = (w // B) * B
     residual = residual[:hB, :wB].contiguous()
 
-    block_ok = None
-    if valid is not None:
-        valid = valid[:hB, :wB].contiguous()
-        vb = valid.view(hB // B, B, wB // B, B).permute(0, 2, 1, 3)
-        block_ok = torch.all(vb, dim=(2, 3))
+    if valid is None:
+        raise ValueError("valid mask is required: SATD data loss must use only all-valid blocks")
+    valid = valid[:hB, :wB].contiguous().bool()
+    vb = valid.view(hB // B, B, wB // B, B).permute(0, 2, 1, 3)
+    block_ok = torch.all(vb, dim=(2, 3))
+    total_blocks = int(block_ok.numel())
 
     rb = residual.view(hB // B, B, wB // B, B).permute(0, 2, 1, 3).contiguous()  # [Bh,Bw,B,B]
     Hm = hadamard_matrix(B, residual.device, residual.dtype)
@@ -832,14 +836,14 @@ def block_satd_loss_parallel(residual: torch.Tensor, valid: Optional[torch.Tenso
     else:
         raise ValueError(f"Unsupported --satd-normalize: {normalize}")
 
-    if block_ok is not None:
-        satd = satd[block_ok]
+    satd = satd[block_ok]
 
-    if satd.numel() == 0:
-        return residual.new_tensor(0.0), 0
+    used_blocks = int(satd.numel())
+    if used_blocks == 0:
+        return residual.new_tensor(0.0), 0, total_blocks
     if reduction == "sum":
-        return torch.sum(satd), int(satd.numel())
-    return torch.mean(satd), int(satd.numel())
+        return torch.sum(satd), used_blocks, total_blocks
+    return torch.mean(satd), used_blocks, total_blocks
 
 
 def tv_l1_2d(x: torch.Tensor) -> torch.Tensor:
@@ -944,10 +948,9 @@ def compute_pair_loss_fast(
     pred = warp_y_torch(ref_y, map_x, map_y, valid, target_y_norm=tar_y, invalid_fill=args.invalid_fill)
     residual = tar_y - pred
 
-    valid_for_satd = valid if args.satd_valid_only else None
-    satd, satd_blocks = block_satd_loss_parallel(
+    satd, satd_blocks, satd_total_blocks = block_satd_loss_parallel(
         residual,
-        valid_for_satd,
+        valid,
         block_size=args.satd_block_size,
         reduction=args.satd_reduction,
         normalize=args.satd_normalize,
@@ -968,6 +971,8 @@ def compute_pair_loss_fast(
         "weight": float(pair_weight),
         "satd": float(satd.detach().cpu()),
         "satd_blocks": int(satd_blocks),
+        "satd_total_blocks": int(satd_total_blocks),
+        "satd_valid_block_ratio": float(satd_blocks / max(1, satd_total_blocks)),
         "delta_mag": float(delta_mag.detach().cpu()),
         "delta_tv": float(delta_tv.detach().cpu()),
         "valid_ratio": valid_ratio,
@@ -1037,8 +1042,8 @@ def evaluate_pairs_fast(
         map_x_r, map_y_r, valid_r = backward_map_torch(depth_refined, xy_precomp, rel_pose[(target, ref)])
         pred_r = warp_y_torch(ref_y, map_x_r, map_y_r, valid_r, target_y_norm=tar_y, invalid_fill=args.invalid_fill)
 
-        satd_b, nb = block_satd_loss_parallel(tar_y - pred_b, valid_b if args.satd_valid_only else None, args.satd_block_size, reduction="mean", normalize=args.satd_normalize)
-        satd_r, nr = block_satd_loss_parallel(tar_y - pred_r, valid_r if args.satd_valid_only else None, args.satd_block_size, reduction="mean", normalize=args.satd_normalize)
+        satd_b, nb, ntb = block_satd_loss_parallel(tar_y - pred_b, valid_b, args.satd_block_size, reduction="mean", normalize=args.satd_normalize)
+        satd_r, nr, ntr = block_satd_loss_parallel(tar_y - pred_r, valid_r, args.satd_block_size, reduction="mean", normalize=args.satd_normalize)
 
         tar_np = (tar_y.detach().cpu().numpy() * maxv).astype(np.float32)
         pb_np = (pred_b.detach().cpu().numpy() * maxv).astype(np.float32)
@@ -1057,6 +1062,10 @@ def evaluate_pairs_fast(
             "refined_satd": float(satd_r.detach().cpu()),
             "base_satd_blocks": int(nb),
             "refined_satd_blocks": int(nr),
+            "base_satd_total_blocks": int(ntb),
+            "refined_satd_total_blocks": int(ntr),
+            "base_satd_valid_block_ratio": float(nb / max(1, ntb)),
+            "refined_satd_valid_block_ratio": float(nr / max(1, ntr)),
             "base_psnr_full": json_safe_float(calc_psnr_np(pb_np, tar_np, args.bitdepth)),
             "refined_psnr_full": json_safe_float(calc_psnr_np(pr_np, tar_np, args.bitdepth)),
             "base_psnr_valid": json_safe_float(calc_psnr_np(pb_np, tar_np, args.bitdepth, mask=vb_np)),
@@ -1540,7 +1549,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lambda-delta-temp", type=float, default=1.0)
 
     ap.add_argument("--satd-block-size", type=int, default=16, help="GPU-parallel SATD block size at train resolution. Must be power of two: 8/16/32 recommended.")
-    ap.add_argument("--satd-valid-only", action=argparse.BooleanOptionalAction, default=True, help="Use only all-valid SATD blocks.")
+    ap.add_argument("--satd-valid-only", action=argparse.BooleanOptionalAction, default=True, help="Deprecated compatibility option. SATD data loss is always all-valid-block only.")
     ap.add_argument("--satd-reduction", choices=["mean", "sum"], default="mean")
     ap.add_argument("--satd-normalize", choices=["sqrt", "n", "none"], default="sqrt")
     ap.add_argument("--invalid-fill", choices=["zero", "target"], default="zero")
