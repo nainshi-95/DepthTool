@@ -2,29 +2,26 @@
 # -*- coding: utf-8 -*-
 """
 Inverse-depth plane compression simulation with hierarchical RA coding,
-VGGT/canonical camparam_v2 JSONL, camera-projected depth candidates, and
+VGGT/canonical camparam_v2 JSONL, analytic temporal plane transformation, and
 bidirectional video prediction.
 
 Important behavior:
   1) POC 0 and each RA endpoint (for example POC 32) are coded as anchors.
-  2) From POC 16 onward, already reconstructed L0/L1 depth frames are
-     forward-projected into the current camera. Their projected depths are
-     combined and fitted as the block-level ``plane_warp`` candidate.
-  5) The same-position reconstructed plane from the selected RA depth
-     reference is also supplied directly as a ``temporal`` copy-delta candidate.
-     Therefore RA temporal prediction now affects depth bits and mode ratios.
-  3) Video prediction separately uses the reconstructed current depth to
+  2) From POC 16 onward, every L0/L1 reconstructed leaf is projected into
+     the current camera once. For each current block, the reference leaf whose
+     projected polygon has the largest overlap with the current block is used.
+     Its camera-space 3D plane is transformed analytically and rendered directly
+     over the current block. No full-frame depth splatting is used for these
+     depth-plane candidates.
+  3) The following candidates are independently tested by copy/delta RDO:
+       plane_warp_avg, plane_warp_l0, plane_warp_l1,
+       temporal_avg, temporal_l0, temporal_l1.
+  4) Video prediction separately uses the reconstructed current depth to
      backward-project current pixels into L0/L1 reference pictures.
-  4) Projection follows the VGGT pixel-coordinate convention directly:
-       X = [(x-cx)/fx*z, (y-cy)/fy*z, z_sign*z]
-       X_ref = R * X_cur + t
-       u_ref = fx_ref * X_ref.x / abs(X_ref.z) + cx_ref
-       v_ref = fy_ref * X_ref.y / abs(X_ref.z) + cy_ref
-  5) Fixed-point depth is decoded as:
+  5) Projection follows the VGGT pixel-coordinate convention directly, and
+     fixed-point depth is decoded as:
        depth_linear = depth_y * depth_scale / depth_scale_precision
-     JSONL tvec values are already in this real depth unit. The divide/multiply
-     shown in parameter-quantization scripts only normalizes t for coding and
-     must not be applied a second time during projection.
+     JSONL tvec values are already in the same real-depth unit.
 """
 
 import argparse
@@ -103,11 +100,23 @@ class CSNode:
 
 @dataclass
 class PlaneWarpContext:
-    # Full-frame camera-projected depth predictor in stored depth-sample units.
-    # Only valid samples are used to fit the candidate plane.
-    pred_depth_y: np.ndarray
-    pred_valid: np.ndarray
+    # Reconstructed reference-plane stores and cameras used for analytic
+    # per-block 3D plane transformation. L1 is absent for sequential P frames.
+    l0_store: List[LeafRecord]
+    cam_l0: Dict[str, Any]
+    cam_cur: Dict[str, Any]
+    frame_w: int
+    frame_h: int
+    l1_store: Optional[List[LeafRecord]] = None
+    cam_l1: Optional[Dict[str, Any]] = None
     source_type: str = ""
+
+    # Built lazily once per reference/current camera pair. Each cached record
+    # contains the reference leaf, its current-view projected polygon, and its
+    # already transformed current-camera 3D plane.
+    projected_leaf_cache: Dict[str, List[Dict[str, Any]]] = field(
+        default_factory=dict
+    )
 
 
 # ============================================================
@@ -355,11 +364,15 @@ def adaptive_signed_residual_update(q, model, abs_max):
 
 
 def create_adaptive_models(args):
-    # Camera-projected candidate plus one same-position temporal candidate
-    # from the selected RA reconstructed depth reference.
+    # Analytic camera-plane candidates and same-position temporal candidates
+    # are kept separate for L0, L1, and their bidirectional average.
     cand_symbols = [
-        "plane_warp",
-        "temporal",
+        "plane_warp_avg",
+        "plane_warp_l0",
+        "plane_warp_l1",
+        "temporal_avg",
+        "temporal_l0",
+        "temporal_l1",
         "left",
         "top",
         "top_left",
@@ -967,6 +980,298 @@ def project_camera_points(points_cam, cam):
     return u, v, depth, front
 
 
+
+def polygon_area(poly):
+    """Unsigned area of an ordered 2D polygon."""
+    p = np.asarray(poly, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] < 3 or p.shape[1] != 2:
+        return 0.0
+    x = p[:, 0]
+    y = p[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _clip_polygon_half_plane(poly, inside, intersect):
+    if not poly:
+        return []
+
+    out = []
+    prev = poly[-1]
+    prev_inside = inside(prev)
+
+    for cur in poly:
+        cur_inside = inside(cur)
+
+        if cur_inside:
+            if not prev_inside:
+                out.append(intersect(prev, cur))
+            out.append(cur)
+        elif prev_inside:
+            out.append(intersect(prev, cur))
+
+        prev = cur
+        prev_inside = cur_inside
+
+    return out
+
+
+def clip_polygon_to_rect(poly, x0, y0, x1, y1):
+    """Sutherland-Hodgman clipping against an axis-aligned rectangle."""
+    eps = 1e-12
+    pts = [np.asarray(p, dtype=np.float64) for p in np.asarray(poly)]
+
+    def intersect_x(a, b, x_edge):
+        dx = float(b[0] - a[0])
+        if abs(dx) < eps:
+            return np.array([x_edge, a[1]], dtype=np.float64)
+        t = (x_edge - float(a[0])) / dx
+        return a + t * (b - a)
+
+    def intersect_y(a, b, y_edge):
+        dy = float(b[1] - a[1])
+        if abs(dy) < eps:
+            return np.array([a[0], y_edge], dtype=np.float64)
+        t = (y_edge - float(a[1])) / dy
+        return a + t * (b - a)
+
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[0] >= x0 - eps,
+        lambda a, b: intersect_x(a, b, x0),
+    )
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[0] <= x1 + eps,
+        lambda a, b: intersect_x(a, b, x1),
+    )
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[1] >= y0 - eps,
+        lambda a, b: intersect_y(a, b, y0),
+    )
+    pts = _clip_polygon_half_plane(
+        pts,
+        lambda p: p[1] <= y1 + eps,
+        lambda a, b: intersect_y(a, b, y1),
+    )
+
+    if len(pts) < 3:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.stack(pts, axis=0)
+
+
+def transform_camera_points(points_src, cam_src, cam_tgt):
+    """Transform 3D points from source-camera to target-camera coordinates."""
+    p = np.asarray(points_src, dtype=np.float64).reshape(-1, 3)
+    m = (
+        np.asarray(cam_tgt["W2C"], dtype=np.float64)
+        @ np.asarray(cam_src["C2W"], dtype=np.float64)
+    )
+    ph = np.concatenate(
+        [p, np.ones((p.shape[0], 1), dtype=np.float64)],
+        axis=1,
+    )
+    return (ph @ m.T)[:, :3]
+
+
+def project_reference_leaf_polygon(leaf, cam_ref, cam_cur, args):
+    """Project a reference leaf's outer pixel-cell rectangle to current view."""
+    # Pixel-cell boundaries keep a non-zero footprint even for a 1x1 leaf.
+    us = np.array(
+        [
+            leaf.x - 0.5,
+            leaf.x + leaf.w - 0.5,
+            leaf.x + leaf.w - 0.5,
+            leaf.x - 0.5,
+        ],
+        dtype=np.float64,
+    )
+    vs = np.array(
+        [
+            leaf.y - 0.5,
+            leaf.y - 0.5,
+            leaf.y + leaf.h - 0.5,
+            leaf.y + leaf.h - 0.5,
+        ],
+        dtype=np.float64,
+    )
+
+    depth_y = inv_plane_to_depth_value(leaf.plane, us, vs, args)
+    depth_real = depth_y * get_depth_scale_real(cam_ref)
+    rays = pixel_rays_camera(us, vs, cam_ref)
+    points_ref = rays * depth_real[:, None]
+    points_cur = transform_camera_points(points_ref, cam_ref, cam_cur)
+    pu, pv, _, front = project_camera_points(points_cur, cam_cur)
+
+    valid = (
+        front
+        & np.isfinite(pu)
+        & np.isfinite(pv)
+        & np.isfinite(points_cur).all(axis=1)
+        & (depth_real > 0.0)
+    )
+
+    # A projective transform maps the rectangle to a quadrilateral only when
+    # all four corners remain in front of the current camera.
+    if not np.all(valid):
+        return None
+
+    poly = np.stack([pu, pv], axis=1).astype(np.float64)
+    area = polygon_area(poly)
+    if not np.isfinite(area) or area <= 1e-8:
+        return None
+
+    return poly
+
+
+def build_projected_leaf_cache(ref_store, cam_ref, cam_cur, args):
+    """Project and analytically transform each reference leaf exactly once."""
+    records = []
+
+    for leaf in ref_store or []:
+        plane3d_ref = image_inv_plane_to_3d_plane(
+            leaf,
+            cam_ref,
+            0,
+            0,
+            args,
+        )
+        if plane3d_ref is None:
+            continue
+
+        plane3d_cur = transform_plane_src_to_tgt(
+            plane3d_ref,
+            cam_ref,
+            cam_cur,
+        )
+        if plane3d_cur is None:
+            continue
+
+        poly = project_reference_leaf_polygon(
+            leaf,
+            cam_ref,
+            cam_cur,
+            args,
+        )
+        if poly is None:
+            continue
+
+        records.append(
+            {
+                "leaf": leaf,
+                "plane3d_cur": plane3d_cur,
+                "polygon": poly,
+                "polygon_area": polygon_area(poly),
+                "bbox": (
+                    float(np.min(poly[:, 0])),
+                    float(np.min(poly[:, 1])),
+                    float(np.max(poly[:, 0])),
+                    float(np.max(poly[:, 1])),
+                ),
+            }
+        )
+
+    return records
+
+
+def get_projected_leaf_cache(ctx, side, args):
+    if side not in ("l0", "l1"):
+        raise ValueError(f"bad reference side: {side}")
+
+    if side in ctx.projected_leaf_cache:
+        return ctx.projected_leaf_cache[side]
+
+    if side == "l0":
+        store = ctx.l0_store
+        cam_ref = ctx.cam_l0
+    else:
+        store = ctx.l1_store
+        cam_ref = ctx.cam_l1
+
+    if not store or cam_ref is None:
+        records = []
+    else:
+        records = build_projected_leaf_cache(
+            store,
+            cam_ref,
+            ctx.cam_cur,
+            args,
+        )
+
+    ctx.projected_leaf_cache[side] = records
+    return records
+
+
+def _plane_depth_at_pixel(plane3d_cur, cam_cur, x, y):
+    ray = pixel_rays_camera(
+        np.asarray([x], dtype=np.float64),
+        np.asarray([y], dtype=np.float64),
+        cam_cur,
+    )[0]
+    denom = float(np.dot(plane3d_cur[:3], ray))
+    if abs(denom) < 1e-12:
+        return float("inf")
+    depth = -float(plane3d_cur[3]) / denom
+    return depth if np.isfinite(depth) and depth > 0.0 else float("inf")
+
+
+def select_projected_leaf_for_block(records, cam_cur, x, y, w, h):
+    """Select the projected leaf with maximum polygon/block overlap area."""
+    if not records:
+        return None
+
+    # Current block's outer pixel-cell rectangle.
+    x0 = float(x) - 0.5
+    y0 = float(y) - 0.5
+    x1 = float(x + w) - 0.5
+    y1 = float(y + h) - 0.5
+    block_area = max(float(w * h), 1.0)
+    cx = x + (w - 1) / 2.0
+    cy = y + (h - 1) / 2.0
+
+    best = None
+    best_key = None
+
+    for rec in records:
+        bx0, by0, bx1, by1 = rec["bbox"]
+        if bx1 <= x0 or bx0 >= x1 or by1 <= y0 or by0 >= y1:
+            continue
+
+        clipped = clip_polygon_to_rect(
+            rec["polygon"],
+            x0,
+            y0,
+            x1,
+            y1,
+        )
+        overlap_area = polygon_area(clipped)
+        if overlap_area <= 1e-8:
+            continue
+
+        # Primary criterion is exactly the requested projected overlap area.
+        # When overlap areas tie, prefer the nearer transformed surface and
+        # then the footprint center nearer to the current block center.
+        center_depth = _plane_depth_at_pixel(
+            rec["plane3d_cur"],
+            cam_cur,
+            cx,
+            cy,
+        )
+        poly_center = np.mean(rec["polygon"], axis=0)
+        center_dist2 = float(
+            (poly_center[0] - cx) ** 2 + (poly_center[1] - cy) ** 2
+        )
+        key = (overlap_area, -center_depth, -center_dist2)
+
+        if best_key is None or key > best_key:
+            best_key = key
+            best = dict(rec)
+            best["overlap_area"] = overlap_area
+            best["overlap_ratio"] = overlap_area / block_area
+
+    return best
+
+
 def fit_3d_plane(points):
     if points.shape[0] < 3:
         return None
@@ -1073,54 +1378,203 @@ def render_3d_plane_to_depth_block(
     if valid_ratio < args.plane_warp_min_valid_ratio:
         return None
 
-    # Convert real camera depth back to stored 10-bit depth samples.
-    depth_y = depth_real / depth_scale_real
-    depth_y = np.clip(depth_y, args.depth_eps, args.max_value)
+    # Keep invalid samples invalid. They must not be filled with a median and
+    # then contaminate L0/L1 averaging or inverse-plane fitting.
+    depth_y = np.full((h, w), np.nan, dtype=np.float64)
+    depth_y[valid] = depth_real[valid] / depth_scale_real
+    depth_y[valid] = np.clip(
+        depth_y[valid],
+        args.depth_eps,
+        args.max_value,
+    )
 
-    if not np.all(valid):
-        med = np.median(depth_y[valid]) if np.any(valid) else args.max_value
-        depth_y[~valid] = med
-
-    return depth_y
+    return depth_y, valid
 
 
-def make_plane_warp_candidate(ctx, x, y, w, h, cx, cy, args, grid):
-    """Fit a block plane from the decoded-reference depth projection.
+def make_analytic_plane_warp_candidate(
+    ctx,
+    side,
+    x,
+    y,
+    w,
+    h,
+    cx,
+    cy,
+    args,
+    grid,
+):
+    """Use the reference leaf whose current-view footprint best overlaps.
 
-    No current/ground-truth depth sample is used to create this candidate.
-    Invalid projection holes are excluded from the least-squares fit.
+    Reference leaves are projected once per frame pair and cached in ``ctx``.
+    For this current block, the leaf with the largest projected polygon/block
+    intersection is selected, and its already transformed 3D plane is rendered
+    analytically over the block.
     """
     if ctx is None:
         return None
 
-    pred = np.asarray(ctx.pred_depth_y, dtype=np.float64)
-    valid = np.asarray(ctx.pred_valid, dtype=bool)
-
-    if pred.shape != valid.shape:
-        raise ValueError(
-            f"plane-warp predictor shape mismatch: {pred.shape} vs {valid.shape}"
-        )
-
-    if y + h > pred.shape[0] or x + w > pred.shape[1]:
+    records = get_projected_leaf_cache(ctx, side, args)
+    match = select_projected_leaf_for_block(
+        records,
+        ctx.cam_cur,
+        x,
+        y,
+        w,
+        h,
+    )
+    if match is None:
         return None
 
-    block = pred[y : y + h, x : x + w]
-    block_valid = valid[y : y + h, x : x + w]
-
-    valid_ratio = float(np.mean(block_valid))
-    if valid_ratio < args.plane_warp_min_valid_ratio:
+    rendered = render_3d_plane_to_depth_block(
+        match["plane3d_cur"],
+        ctx.cam_cur,
+        x,
+        y,
+        w,
+        h,
+        ctx.frame_w,
+        ctx.frame_h,
+        args,
+    )
+    if rendered is None:
         return None
 
+    depth_block, valid = rendered
     xx, yy, _ = grid.get(w, h)
-    return fit_inv_depth_plane_from_depth_block_masked(
-        block,
-        block_valid,
+    plane = fit_inv_depth_plane_from_depth_block_masked(
+        depth_block,
+        valid,
         xx,
         yy,
         cx,
         cy,
         args,
     )
+    if plane is None:
+        return None
+
+    return {
+        "plane": plane,
+        "depth": depth_block,
+        "valid": valid,
+        "matched_leaf": match["leaf"],
+        "overlap_area": match["overlap_area"],
+        "overlap_ratio": match["overlap_ratio"],
+    }
+
+
+def make_plane_warp_candidates(ctx, x, y, w, h, cx, cy, args, grid):
+    if ctx is None:
+        return []
+
+    l0 = make_analytic_plane_warp_candidate(
+        ctx,
+        "l0",
+        x,
+        y,
+        w,
+        h,
+        cx,
+        cy,
+        args,
+        grid,
+    )
+
+    l1 = None
+    if ctx.l1_store is not None and ctx.cam_l1 is not None:
+        l1 = make_analytic_plane_warp_candidate(
+            ctx,
+            "l1",
+            x,
+            y,
+            w,
+            h,
+            cx,
+            cy,
+            args,
+            grid,
+        )
+
+    out = []
+
+    # Average only samples that are valid in at least one direction. Invalid
+    # samples never enter the arithmetic mean or the fitted inverse plane.
+    if l0 is not None and l1 is not None:
+        valid0 = l0["valid"]
+        valid1 = l1["valid"]
+        both = valid0 & valid1
+        only0 = valid0 & ~valid1
+        only1 = valid1 & ~valid0
+        valid_avg = valid0 | valid1
+
+        avg_depth = np.full((h, w), np.nan, dtype=np.float64)
+        avg_depth[only0] = l0["depth"][only0]
+        avg_depth[only1] = l1["depth"][only1]
+        avg_depth[both] = 0.5 * (
+            l0["depth"][both] + l1["depth"][both]
+        )
+
+        xx, yy, _ = grid.get(w, h)
+        avg_plane = fit_inv_depth_plane_from_depth_block_masked(
+            avg_depth,
+            valid_avg,
+            xx,
+            yy,
+            cx,
+            cy,
+            args,
+        )
+        if avg_plane is not None:
+            out.append(("plane_warp_avg", avg_plane))
+
+    if l0 is not None:
+        out.append(("plane_warp_l0", l0["plane"]))
+
+    if l1 is not None:
+        out.append(("plane_warp_l1", l1["plane"]))
+
+    return out
+
+
+def make_same_position_temporal_candidates(ctx, cx, cy):
+    if ctx is None:
+        return []
+
+    p0 = None
+    p1 = None
+
+    r0 = leaf_covering_point(ctx.l0_store, cx, cy)
+    if r0 is not None:
+        p0 = plane_to_center(r0.plane, cx, cy)
+
+    if ctx.l1_store is not None:
+        r1 = leaf_covering_point(ctx.l1_store, cx, cy)
+        if r1 is not None:
+            p1 = plane_to_center(r1.plane, cx, cy)
+
+    out = []
+
+    if p0 is not None and p1 is not None:
+        out.append(
+            (
+                "temporal_avg",
+                Plane(
+                    0.5 * (p0.a + p1.a),
+                    0.5 * (p0.b + p1.b),
+                    0.5 * (p0.c + p1.c),
+                    cx,
+                    cy,
+                ),
+            )
+        )
+
+    if p0 is not None:
+        out.append(("temporal_l0", p0))
+
+    if p1 is not None:
+        out.append(("temporal_l1", p1))
+
+    return out
 
 
 def make_candidates(
@@ -1137,11 +1591,13 @@ def make_candidates(
     args,
     grid,
 ):
+    del temporal_store  # references are carried explicitly in plane_warp_ctx
+
     cand = []
     conv = {}
 
     if args.plane_warp_candidate and plane_warp_ctx is not None:
-        p = make_plane_warp_candidate(
+        for name, p in make_plane_warp_candidates(
             plane_warp_ctx,
             x,
             y,
@@ -1151,23 +1607,18 @@ def make_candidates(
             cy,
             args,
             grid,
-        )
+        ):
+            conv[name] = p
+            cand.append((name, p))
 
-        if p is not None:
-            conv["plane_warp"] = p
-            cand.append(("plane_warp", p))
-
-    # Same-position temporal plane candidate.  The selected RA depth
-    # reference is the already reconstructed endpoint recorded as
-    # depth_reference in the coding plan.  The leaf containing the current
-    # block centre is translated to the current block centre and then tested
-    # by both copy and delta modes.  No camera projection is applied.
-    if args.same_position_temporal_candidate and temporal_store:
-        r = leaf_covering_point(temporal_store, cx, cy)
-        if r is not None:
-            p = plane_to_center(r.plane, cx, cy)
-            conv["temporal"] = p
-            cand.append(("temporal", p))
+    if args.same_position_temporal_candidate and plane_warp_ctx is not None:
+        for name, p in make_same_position_temporal_candidates(
+            plane_warp_ctx,
+            cx,
+            cy,
+        ):
+            conv[name] = p
+            cand.append((name, p))
 
     items = [
         ("left", best_left(store, x, y, w, h)),
@@ -1185,7 +1636,6 @@ def make_candidates(
     if "left" in conv and "top" in conv:
         l = conv["left"]
         t = conv["top"]
-
         cand.append(
             (
                 "avg_left_top",
@@ -2524,9 +2974,9 @@ def _append_ra_midpoints(lo, hi, layer, order, plan_by_frame, coded_rank):
     if mid <= lo or mid >= hi:
         return
 
-    # Both endpoints are already coded. They become L0/L1 references.
-    # The more recently coded endpoint is retained as the single plane-warp
-    # reference used by the optional depth-plane candidate.
+    # Both endpoints are already coded and become L0/L1 references.
+    # depth_reference is retained only as a backward-compatible summary field;
+    # analytic temporal coding below uses both endpoints independently.
     depth_ref = lo if coded_rank[lo] > coded_rank[hi] else hi
 
     order.append(mid)
@@ -2701,13 +3151,13 @@ def parse_args():
         "--plane-warp-candidate",
         dest="plane_warp_candidate",
         action="store_true",
-        help="enable camera-projected reference-depth plane candidate (default)",
+        help="enable analytic L0/L1/average camera-plane candidates (default)",
     )
     p.add_argument(
         "--no-plane-warp-candidate",
         dest="plane_warp_candidate",
         action="store_false",
-        help="disable camera-projected reference-depth candidate",
+        help="disable analytic camera-plane candidates",
     )
     p.set_defaults(plane_warp_candidate=True)
 
@@ -2716,8 +3166,8 @@ def parse_args():
         dest="same_position_temporal_candidate",
         action="store_true",
         help=(
-            "enable same-position reconstructed-plane candidate from the "
-            "selected RA depth reference (default)"
+            "enable same-position L0/L1/average reconstructed-plane "
+            "candidates (default)"
         ),
     )
     p.add_argument(
@@ -2944,25 +3394,13 @@ def main():
 
                 cam_cur = ensure_camera_or_raise(camera_lookup, fi, "current")
 
-                # Same-position temporal candidate from the single RA
-                # depth_reference selected by the coding plan.  The camera-
-                # projected plane_warp candidate can still use both L0/L1.
-                temporal_store = None
-                if (
-                    args.same_position_temporal_candidate
-                    and depth_ref_idx is not None
-                ):
-                    if depth_ref_idx not in frame_store:
-                        raise RuntimeError(
-                            f"POC {fi}: reconstructed temporal plane store "
-                            f"{depth_ref_idx} is unavailable"
-                        )
-                    temporal_store = frame_store[depth_ref_idx]
-
                 # --------------------------------------------------------
-                # RA temporal depth prediction used by depth plane coding.
-                # Anchors have no temporal candidate. B pictures use both
-                # already reconstructed reference depths; sequential P uses L0.
+                # RA temporal depth candidates.
+                #
+                # Both same-position temporal candidates and camera-plane
+                # candidates use reconstructed leaf planes from the actual RA
+                # L0/L1 references. Camera candidates are transformed
+                # analytically per block, matching the successful LD path.
                 # --------------------------------------------------------
                 plane_warp_ctx = None
                 depth_pred_stats = {
@@ -2972,60 +3410,63 @@ def main():
                     "depth_pred_both_valid_ratio": 0.0,
                 }
 
-                if args.plane_warp_candidate and prediction_type in ("P", "B"):
-                    if ref_l0 is None or ref_l0 not in frame_recon_depth:
+                temporal_candidate_enabled = (
+                    args.plane_warp_candidate
+                    or args.same_position_temporal_candidate
+                )
+
+                if temporal_candidate_enabled and prediction_type in ("P", "B"):
+                    if ref_l0 is None or ref_l0 not in frame_store:
                         raise RuntimeError(
-                            f"POC {fi}: reconstructed L0 depth {ref_l0} is unavailable"
+                            f"POC {fi}: reconstructed L0 plane store {ref_l0} "
+                            "is unavailable"
                         )
 
                     cam_l0_depth = ensure_camera_or_raise(
-                        camera_lookup, ref_l0, "depth-L0-reference"
-                    )
-                    pred_depth_l0, valid_depth_l0 = forward_project_recon_depth_to_target(
-                        frame_recon_depth[ref_l0],
-                        cam_l0_depth,
-                        cam_cur,
-                        args.width,
-                        args.height,
+                        camera_lookup,
+                        ref_l0,
+                        "depth-L0-reference",
                     )
 
-                    pred_depth = pred_depth_l0
-                    valid_depth = valid_depth_l0
-                    both_depth = np.zeros_like(valid_depth_l0, dtype=bool)
-                    valid_depth_l1 = np.zeros_like(valid_depth_l0, dtype=bool)
-
+                    l1_store = None
+                    cam_l1_depth = None
                     if prediction_type == "B":
-                        if ref_l1 is None or ref_l1 not in frame_recon_depth:
+                        if ref_l1 is None or ref_l1 not in frame_store:
                             raise RuntimeError(
-                                f"POC {fi}: reconstructed L1 depth {ref_l1} is unavailable"
+                                f"POC {fi}: reconstructed L1 plane store {ref_l1} "
+                                "is unavailable"
                             )
+                        l1_store = frame_store[ref_l1]
                         cam_l1_depth = ensure_camera_or_raise(
-                            camera_lookup, ref_l1, "depth-L1-reference"
-                        )
-                        pred_depth_l1, valid_depth_l1 = forward_project_recon_depth_to_target(
-                            frame_recon_depth[ref_l1],
-                            cam_l1_depth,
-                            cam_cur,
-                            args.width,
-                            args.height,
-                        )
-                        pred_depth, valid_depth, both_depth = combine_projected_depths(
-                            pred_depth_l0,
-                            valid_depth_l0,
-                            pred_depth_l1,
-                            valid_depth_l1,
+                            camera_lookup,
+                            ref_l1,
+                            "depth-L1-reference",
                         )
 
                     plane_warp_ctx = PlaneWarpContext(
-                        pred_depth_y=pred_depth,
-                        pred_valid=valid_depth,
-                        source_type=("bi" if prediction_type == "B" else "l0"),
+                        l0_store=frame_store[ref_l0],
+                        cam_l0=cam_l0_depth,
+                        cam_cur=cam_cur,
+                        frame_w=args.width,
+                        frame_h=args.height,
+                        l1_store=l1_store,
+                        cam_l1=cam_l1_depth,
+                        source_type=(
+                            "analytic_plane_bi"
+                            if prediction_type == "B"
+                            else "analytic_plane_l0"
+                        ),
                     )
+
                     depth_pred_stats = {
-                        "depth_pred_valid_ratio": float(np.mean(valid_depth)),
-                        "depth_pred_l0_valid_ratio": float(np.mean(valid_depth_l0)),
-                        "depth_pred_l1_valid_ratio": float(np.mean(valid_depth_l1)),
-                        "depth_pred_both_valid_ratio": float(np.mean(both_depth)),
+                        "depth_pred_valid_ratio": 1.0,
+                        "depth_pred_l0_valid_ratio": 1.0,
+                        "depth_pred_l1_valid_ratio": (
+                            1.0 if prediction_type == "B" else 0.0
+                        ),
+                        "depth_pred_both_valid_ratio": (
+                            1.0 if prediction_type == "B" else 0.0
+                        ),
                     }
 
                 rec_depth_y, sm, cur_store = simulate_one_depth_frame(
@@ -3033,7 +3474,7 @@ def main():
                     fi,
                     args,
                     grid,
-                    prev_store=temporal_store,
+                    prev_store=None,
                     writer=writer,
                     adaptive=adaptive,
                     plane_warp_ctx=plane_warp_ctx,
@@ -3130,15 +3571,21 @@ def main():
                 sm["reference_l0"] = -1 if ref_l0 is None else int(ref_l0)
                 sm["reference_l1"] = -1 if ref_l1 is None else int(ref_l1)
                 sm["plane_reference_frame"] = (
-                    -1 if depth_ref_idx is None else int(depth_ref_idx)
+                    -1 if ref_l0 is None else int(ref_l0)
                 )
+                sm["plane_reference_l0"] = -1 if ref_l0 is None else int(ref_l0)
+                sm["plane_reference_l1"] = -1 if ref_l1 is None else int(ref_l1)
                 sm["depth_prediction_type"] = (
                     "none" if plane_warp_ctx is None else plane_warp_ctx.source_type
                 )
                 sm["same_position_temporal_enabled"] = int(
                     args.same_position_temporal_candidate
                 )
-                sm["same_position_temporal_count"] = int(temporal_store is not None)
+                sm["same_position_temporal_count"] = (
+                    0
+                    if plane_warp_ctx is None
+                    else 2 if plane_warp_ctx.l1_store is not None else 1
+                )
                 # Backward-compatible single-reference column.
                 sm["reference_frame"] = -1 if ref_l0 is None else int(ref_l0)
                 sm["temporal_layer"] = temporal_layer
@@ -3213,8 +3660,9 @@ def main():
         "camera_pose_mode": cam_header["pose_mode"],
         "projection_mode": "vggt_fast_pixel_coordinate_dual_intrinsic_no_ndc",
         "ra_depth_prediction": (
-            "forward_project_reconstructed_L0_L1_depth_then_fit_plane"
-            "+same_position_reconstructed_depth_reference_plane_candidate"
+            "projected_footprint_matched_analytic_L0_L1_leaf_planes"
+            "+valid_only_l0_l1_avg_plane_transform"
+            "+same_position_l0_l1_avg_plane_candidates"
         ),
         "depth_scale": cam_header["depth_scale"],
         "depth_scale_precision": cam_header["depth_scale_precision"],
