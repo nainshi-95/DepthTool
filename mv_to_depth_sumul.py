@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""VERSION: 2026-07-13-v4-adaptive-residual
+"""VERSION: 2026-07-13-v5-mv-sample-c-only-rdo
 
 Fixed-block depth predictor candidate RDO simulator.
 
@@ -16,10 +16,11 @@ and evaluates these predictors without block split:
   direct_zero, left, top, top_left, spatial_all,
   fw_ref_<POC>, fw_average.
 
-Spatial candidates are derived from the neighboring blocks' MV observations and
-camera parameters. Forward-warp candidates are built once per reconstructed
-reference/current pair in a low-resolution buffer. Reference depth is reconstructed
-depth, never GT depth.
+Spatial candidates borrow only the neighboring blocks' MV. Each borrowed MV is
+relocated to the current block center, and the current-size depth patch is sampled
+from the corresponding reconstructed reference frame at center + MV. Forward-warp
+candidates also use reconstructed reference depth only, never GT depth. Predictor
+residual RDO compares c-only and full a,b,c residual syntax.
 """
 from __future__ import annotations
 
@@ -469,6 +470,84 @@ def combine_fw(blocks):
     return out, valid
 
 
+def sample_recon_depth_patch_by_mv(
+    recon_y_ref: np.ndarray,
+    mv_x: float,
+    mv_y: float,
+    cx: float,
+    cy: float,
+    bw: int,
+    bh: int,
+    depth_scale: float,
+    min_depth: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample a current-block-sized patch from reconstructed reference depth.
+
+    The borrowed MV is treated as if it were located at the current block center.
+    Therefore the reference sampling center is (cx + mv_x, cy + mv_y), regardless
+    of the original neighboring block position from which the MV was borrowed.
+    Bilinear sampling is used, and samples outside the frame are invalid.
+    """
+    h, w = recon_y_ref.shape
+    xs = (np.arange(bw, dtype=np.float32) - (bw - 1) * 0.5 + cx + mv_x)
+    ys = (np.arange(bh, dtype=np.float32) - (bh - 1) * 0.5 + cy + mv_y)
+    map_x, map_y = np.meshgrid(xs, ys)
+    valid = (
+        np.isfinite(map_x) & np.isfinite(map_y)
+        & (map_x >= 0.0) & (map_x <= w - 1)
+        & (map_y >= 0.0) & (map_y <= h - 1)
+    )
+    src_z = np.asarray(recon_y_ref, np.float32) * float(depth_scale)
+    patch = cv2.remap(
+        src_z, map_x.astype(np.float32), map_y.astype(np.float32),
+        interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    ).astype(np.float64)
+    valid &= np.isfinite(patch) & (patch > min_depth)
+    patch[~valid] = 0.0
+    return patch, valid
+
+
+def make_mv_sample_candidate(
+    mv_rows: Sequence[MVRecord],
+    reconstructed_depth_frames: Dict[int, np.ndarray],
+    cx: float, cy: float, bw: int, bh: int,
+    depth_scale: float, min_depth: float, min_valid_ratio: float,
+    grid: GridCache,
+) -> Optional[Tuple[Plane, int, float, float]]:
+    """Create one predictor from neighboring MV rows and recon reference depth.
+
+    Rows are grouped by reference POC. For each group, the MV is averaged, moved to
+    the current block center, and used to sample the reconstructed reference frame.
+    The best-populated reference group is used. Returned metadata is
+    (plane, ref_poc, mean_mv_x, mean_mv_y).
+    """
+    groups: Dict[int, List[MVRecord]] = {}
+    for row in mv_rows:
+        if row.ref_poc in reconstructed_depth_frames:
+            groups.setdefault(row.ref_poc, []).append(row)
+    best = None
+    for ref_poc, group in groups.items():
+        mv_x = float(np.mean([r.mv_x for r in group]))
+        mv_y = float(np.mean([r.mv_y for r in group]))
+        patch, mask = sample_recon_depth_patch_by_mv(
+            reconstructed_depth_frames[ref_poc], mv_x, mv_y,
+            cx, cy, bw, bh, depth_scale, min_depth,
+        )
+        ratio = float(np.mean(mask))
+        if ratio < min_valid_ratio:
+            continue
+        plane = fit_plane(patch, cx, cy, grid, min_depth, mask)
+        if plane is None:
+            continue
+        score = (ratio, len(group))
+        if best is None or score > best[0]:
+            best = (score, plane, ref_poc, mv_x, mv_y)
+    if best is None:
+        return None
+    return best[1], int(best[2]), float(best[3]), float(best[4])
+
+
 
 class SimpleAdaptiveProb:
     """Very small categorical probability model.
@@ -635,6 +714,8 @@ class RDResult:
     candidate_bits: float
     residual_bits: float
     residual_bits_each: Tuple[float, float, float]
+    residual_type: str
+    c_only_flag_bits: float
     bits: float
     sse: float
     cost: float
@@ -738,7 +819,7 @@ def make_direct(actual: Plane, gt_y: np.ndarray, scale: float, qs, lam: float,
     rb = float(sum(rb_each))
     bits = mb + rb
     return RDResult("direct", "direct", Plane(0,0,0,actual.cx,actual.cy), rec,
-                    tuple(map(int,q)), -1, mb, 0.0, rb, rb_each, bits, sse,
+                    tuple(map(int,q)), -1, mb, 0.0, rb, rb_each, "abc", 0.0, bits, sse,
                     sse + lam * bits, ry, True, False)
 
 
@@ -752,27 +833,39 @@ def make_predictor_only(name: str, pred: Plane, idx: int, n: int, gt_y: np.ndarr
     cb = float(adaptive_candidate_bits_value)
     bits = mb + cb
     return RDResult("predictor_only", name, pred, pred, (0,0,0), idx,
-                    mb, cb, 0.0, (0.0, 0.0, 0.0), bits, sse, sse + lam * bits, ry, False, False)
+                    mb, cb, 0.0, (0.0, 0.0, 0.0), "none", 0.0, bits, sse, sse + lam * bits, ry, False, False)
 
 
 def make_predictor_residual(name: str, pred: Plane, actual: Plane, idx: int, n: int,
                             gt_y: np.ndarray, scale: float, coding: str, qs, lam: float,
                             grid: GridCache, min_depth: float, max_depth: float,
                             adaptive_mode_bits: float, adaptive_candidate_bits_value: float,
-                            residual_coder: AdaptiveResidualCoder) -> RDResult:
+                            residual_coder: AdaptiveResidualCoder, residual_type: str,
+                            c_only_flag_bits: float) -> RDResult:
     qs = np.asarray(qs, np.float64)
-    q = np.rint(np.array([actual.a-pred.a, actual.b-pred.b, actual.c-pred.c]) / qs).astype(np.int64)
+    full_q = np.rint(np.array([actual.a-pred.a, actual.b-pred.b, actual.c-pred.c]) / qs).astype(np.int64)
+    if residual_type == "c_only":
+        q = np.array([0, 0, full_q[2]], dtype=np.int64)
+        coded_mask = (False, False, True)
+    elif residual_type == "abc":
+        q = full_q
+        coded_mask = (True, True, True)
+    else:
+        raise ValueError(residual_type)
     d = q * qs
     rec = Plane(pred.a+float(d[0]), pred.b+float(d[1]), pred.c+float(d[2]), actual.cx, actual.cy)
     ry, _ = plane_to_recon_y(rec, gt_y, scale, grid, min_depth, max_depth)
     sse = float(np.sum((gt_y - ry) ** 2))
     mb = float(adaptive_mode_bits)
     cb = float(adaptive_candidate_bits_value)
-    rb_each = residual_coder.bits_each(q)
+    all_bits = residual_coder.bits_each(q)
+    rb_each = tuple(all_bits[i] if coded_mask[i] else 0.0 for i in range(3))
     rb = float(sum(rb_each))
-    bits = mb + cb + rb
+    fb = float(c_only_flag_bits)
+    bits = mb + cb + fb + rb
     return RDResult("predictor_residual", name, pred, rec, tuple(map(int,q)), idx,
-                    mb, cb, rb, rb_each, bits, sse, sse + lam * bits, ry, True, False)
+                    mb, cb, rb, rb_each, residual_type, fb, bits, sse,
+                    sse + lam * bits, ry, True, False)
 
 
 def make_buffer_reuse(gt_y: np.ndarray, z: np.ndarray, scale: float, cx: float, cy: float,
@@ -784,7 +877,7 @@ def make_buffer_reuse(gt_y: np.ndarray, z: np.ndarray, scale: float, cx: float, 
     sse = float(np.sum((gt_y - ry) ** 2))
     p = fit_plane(z, cx, cy, grid, min_depth, valid) or Plane(0,0,0,cx,cy)
     return RDResult("buffer_reuse", "depth_buffer", p, p, (0,0,0), -1,
-                    0.0, 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, sse, sse, ry, False, True)
+                    0.0, 0.0, 0.0, (0.0, 0.0, 0.0), "none", 0.0, 0.0, sse, sse, ry, False, True)
 
 
 def qp_steps(args):
@@ -856,6 +949,7 @@ def parse_args():
     p.add_argument("--min-mv-plane-points", type=int, default=3)
     p.add_argument("--min-parallax", type=float, default=1e-6)
     p.add_argument("--max-mv-reproj-error", type=float, default=1.5)
+    p.add_argument("--min-mv-sample-valid-ratio", type=float, default=0.25)
     p.add_argument("--min-forward-valid-ratio", type=float, default=0.25)
     p.add_argument("--candidate-idx-coding", choices=["fixed","truncated_unary"], default="truncated_unary")
     p.add_argument("--disable-buffer-reuse", action="store_true")
@@ -934,16 +1028,17 @@ def main():
             ("predictor_residual", a.disable_predictor_residual),
         ) if not disabled
     ]
-    candidate_symbols = ["left", "top", "top_left", "spatial_all", "fw_ref", "fw_average"]
+    candidate_symbols = ["mv_sample_left", "mv_sample_top", "mv_sample_top_left", "mv_sample_all", "fw_ref", "fw_average"]
 
     def new_probability_models():
         return (
             SimpleAdaptiveProb(mode_symbols, a.prob_update_step, a.prob_min, "mode"),
             SimpleAdaptiveProb(candidate_symbols, a.prob_update_step, a.prob_min, "candidate"),
             AdaptiveResidualCoder(a.prob_update_step, a.prob_min),
+            SimpleAdaptiveProb(["c_only", "abc"], a.prob_update_step, a.prob_min, "residual_shape"),
         )
 
-    sequence_mode_model, sequence_candidate_model, sequence_residual_coder = new_probability_models()
+    sequence_mode_model, sequence_candidate_model, sequence_residual_coder, sequence_residual_shape_model = new_probability_models()
 
     print(f"block={a.block_size}, no split, forward={lw}x{lh}, reuse={dbw}x{dbh}, QP={a.qp}")
     print(f"qsteps={qa:.6g},{qb:.6g},{qc:.6g}, lambda={lam:.6g}, depth_scale={scale:.12g}")
@@ -951,10 +1046,10 @@ def main():
     print(f"zero anchor POCs    : {zero_anchor_pocs_in_range or 'none'}")
     print(f"exclude as FW refs  : {a.exclude_zero_anchors_as_forward_refs}")
     print(f"coding order        : {a.coding_order} {coding_order[:16]}{'...' if len(coding_order)>16 else ''}")
-    print("spatial source      : neighboring-block MV-derived depth")
+    print("spatial source      : recon reference depth sampled at current center + borrowed neighboring MV")
     print("forward source      : reconstructed reference depth")
 
-    fields = ["poc","x","y","w","h","mode","mode_probability_before","candidate_count","candidate_idx","candidate","candidate_probability_before","mode_bits","candidate_bits","residual_bits","residual_bits_a","residual_bits_b","residual_bits_c","total_bits","residual_present","buffer_no_signal","q_a","q_b","q_c","pred_a","pred_b","pred_c","gt_a","gt_b","gt_c","recon_a","recon_b","recon_c","sse","cost","forward_refs"]
+    fields = ["poc","x","y","w","h","mode","mode_probability_before","candidate_count","candidate_idx","candidate","candidate_probability_before","mode_bits","candidate_bits","residual_bits","residual_bits_a","residual_bits_b","residual_bits_c","residual_type","c_only_flag_bits","total_bits","residual_present","buffer_no_signal","q_a","q_b","q_c","pred_a","pred_b","pred_c","gt_a","gt_b","gt_c","recon_a","recon_b","recon_c","sse","cost","forward_refs"]
     frames=[]; global_modes={}; global_cands={}; total_bits=0.0; total_sse=0.0
     simulated_frame_count = 0
     excluded_anchor_output_sse = 0.0
@@ -968,10 +1063,11 @@ def main():
 
         for ord_idx,poc in enumerate(coding_order):
             if a.prob_reset == "frame":
-                mode_model, candidate_model, residual_coder = new_probability_models()
+                mode_model, candidate_model, residual_coder, residual_shape_model = new_probability_models()
             else:
-                mode_model, candidate_model, residual_coder = (
-                    sequence_mode_model, sequence_candidate_model, sequence_residual_coder)
+                mode_model, candidate_model, residual_coder, residual_shape_model = (
+                    sequence_mode_model, sequence_candidate_model, sequence_residual_coder,
+                    sequence_residual_shape_model)
             if poc not in cams: raise KeyError(f"No camera for POC {poc}")
             gy=gt(poc); gz=gy*scale; recon=np.zeros_like(gy)
 
@@ -1009,6 +1105,7 @@ def main():
                     "final_mode_probabilities": mode_model.snapshot(),
                     "final_candidate_probabilities": candidate_model.snapshot(),
                     "final_residual_probabilities": residual_coder.snapshot(),
+                    "final_residual_shape_probabilities": residual_shape_model.snapshot(),
                 })
                 ratio=(ord_idx+1)/len(coding_order); width=30; fill=int(round(width*ratio))
                 print(
@@ -1064,24 +1161,30 @@ def main():
                     else:
                         spatial_mv_groups = []
                         spatial_mv_group_count = 0
-                        for name,key in (("left",(bxi-1,byi)),("top",(bxi,byi-1)),("top_left",(bxi-1,byi-1))):
+                        mv_sample_meta = {}
+                        for name,key in (("mv_sample_left",(bxi-1,byi)),
+                                         ("mv_sample_top",(bxi,byi-1)),
+                                         ("mv_sample_top_left",(bxi-1,byi-1))):
                             mv_group = block_mv_rows[poc].get(key, [])
-                            if mv_group:
-                                p = fit_plane_from_mv_rows(
-                                    mv_group, cams, cx, cy, a.min_parallax,
-                                    a.max_mv_reproj_error, a.min_depth, a.max_depth,
-                                    a.min_mv_plane_points)
-                                if p is not None:
-                                    cands.append((name,p))
-                                    spatial_mv_groups.extend(mv_group)
-                                    spatial_mv_group_count += 1
+                            if not mv_group:
+                                continue
+                            sampled = make_mv_sample_candidate(
+                                mv_group, reconstructed_depth_frames, cx, cy, bw, bh,
+                                scale, a.min_depth, a.min_mv_sample_valid_ratio, grid)
+                            if sampled is not None:
+                                p, sample_ref, sample_mvx, sample_mvy = sampled
+                                cands.append((name,p))
+                                mv_sample_meta[name] = (sample_ref, sample_mvx, sample_mvy)
+                                spatial_mv_groups.extend(mv_group)
+                                spatial_mv_group_count += 1
                         if spatial_mv_group_count >= 2:
-                            p = fit_plane_from_mv_rows(
-                                spatial_mv_groups, cams, cx, cy, a.min_parallax,
-                                a.max_mv_reproj_error, a.min_depth, a.max_depth,
-                                a.min_mv_plane_points)
-                            if p is not None:
-                                cands.append(("spatial_all",p))
+                            sampled = make_mv_sample_candidate(
+                                spatial_mv_groups, reconstructed_depth_frames, cx, cy, bw, bh,
+                                scale, a.min_depth, a.min_mv_sample_valid_ratio, grid)
+                            if sampled is not None:
+                                p, sample_ref, sample_mvx, sample_mvy = sampled
+                                cands.append(("mv_sample_all",p))
+                                mv_sample_meta["mv_sample_all"] = (sample_ref, sample_mvx, sample_mvy)
 
                         for ref in block_refs[poc].get((bxi,byi),[]):
                             if (
@@ -1134,11 +1237,17 @@ def main():
                                     lam,grid,a.min_depth,a.max_depth,
                                     mode_model.bits("predictor_only", available_modes), cbits))
                             if not a.disable_predictor_residual:
+                                residual_mode_bits = mode_model.bits("predictor_residual", available_modes)
                                 results.append(make_predictor_residual(
                                     name,pred,actual,idx,len(cands),gyb,scale,a.candidate_idx_coding,
                                     (qa,qb,qc),lam,grid,a.min_depth,a.max_depth,
-                                    mode_model.bits("predictor_residual", available_modes), cbits,
-                                    residual_coder))
+                                    residual_mode_bits, cbits, residual_coder, "c_only",
+                                    residual_shape_model.bits("c_only")))
+                                results.append(make_predictor_residual(
+                                    name,pred,actual,idx,len(cands),gyb,scale,a.candidate_idx_coding,
+                                    (qa,qb,qc),lam,grid,a.min_depth,a.max_depth,
+                                    residual_mode_bits, cbits, residual_coder, "abc",
+                                    residual_shape_model.bits("abc")))
 
                         if not results: raise RuntimeError(f"No RDO mode at POC={poc}, block=({bx},{by})")
                         best=min(results,key=lambda r:r.cost)
@@ -1161,7 +1270,13 @@ def main():
                         if best.mode in ("predictor_only", "predictor_residual"):
                             candidate_model.update(candidate_probability_class(best.name))
                         if best.residual_present:
-                            residual_coder.update(best.q)
+                            if best.mode == "predictor_residual":
+                                residual_shape_model.update(best.residual_type)
+                            if best.residual_type == "c_only":
+                                # Update only q_c; q_a/q_b were not signaled.
+                                residual_coder._one_bits(int(best.q[2]), residual_coder.c_zero, residual_coder.c_mag, True)
+                            else:
+                                residual_coder.update(best.q)
 
                         reuse.commit(bx,by,best.recon_y*scale)
 
@@ -1169,13 +1284,13 @@ def main():
                     fbits+=best.bits; fsse+=best.sse
                     fmodes[best.mode]=fmodes.get(best.mode,0)+1; fcands[best.name]=fcands.get(best.name,0)+1
                     global_modes[best.mode]=global_modes.get(best.mode,0)+1; global_cands[best.name]=global_cands.get(best.name,0)+1
-                    wr.writerow({"poc":poc,"x":bx,"y":by,"w":bw,"h":bh,"mode":best.mode,"mode_probability_before":mode_prob_before,"candidate_count":len(cands),"candidate_idx":best.candidate_idx,"candidate":best.name,"candidate_probability_before":candidate_prob_before,"mode_bits":best.mode_bits,"candidate_bits":best.candidate_bits,"residual_bits":best.residual_bits,"residual_bits_a":best.residual_bits_each[0],"residual_bits_b":best.residual_bits_each[1],"residual_bits_c":best.residual_bits_each[2],"total_bits":best.bits,"residual_present":int(best.residual_present),"buffer_no_signal":int(best.buffer_no_signal),"q_a":best.q[0],"q_b":best.q[1],"q_c":best.q[2],"pred_a":best.pred.a,"pred_b":best.pred.b,"pred_c":best.pred.c,"gt_a":actual.a,"gt_b":actual.b,"gt_c":actual.c,"recon_a":best.recon.a,"recon_b":best.recon.b,"recon_c":best.recon.c,"sse":best.sse,"cost":best.cost,"forward_refs":"|".join(map(str,refs))})
+                    wr.writerow({"poc":poc,"x":bx,"y":by,"w":bw,"h":bh,"mode":best.mode,"mode_probability_before":mode_prob_before,"candidate_count":len(cands),"candidate_idx":best.candidate_idx,"candidate":best.name,"candidate_probability_before":candidate_prob_before,"mode_bits":best.mode_bits,"candidate_bits":best.candidate_bits,"residual_bits":best.residual_bits,"residual_bits_a":best.residual_bits_each[0],"residual_bits_b":best.residual_bits_each[1],"residual_bits_c":best.residual_bits_each[2],"residual_type":best.residual_type,"c_only_flag_bits":best.c_only_flag_bits,"total_bits":best.bits,"residual_present":int(best.residual_present),"buffer_no_signal":int(best.buffer_no_signal),"q_a":best.q[0],"q_b":best.q[1],"q_c":best.q[2],"pred_a":best.pred.a,"pred_b":best.pred.b,"pred_c":best.pred.c,"gt_a":actual.a,"gt_b":actual.b,"gt_c":actual.c,"recon_a":best.recon.a,"recon_b":best.recon.b,"recon_c":best.recon.c,"sse":best.sse,"cost":best.cost,"forward_refs":"|".join(map(str,refs))})
 
             reconstructed_depth_frames[poc] = recon.copy()
             outfp.seek((poc-start) * frame_size(a.width, a.height))
             write_depth_frame(outfp,recon,a.width,a.height)
             mse=fsse/(a.width*a.height); psnr=float("inf") if mse==0 else 10*math.log10(1023**2/mse)
-            frames.append({"poc":poc,"num_blocks":nblocks,"frame_bits":fbits,"frame_bpp":fbits/(a.width*a.height),"frame_sse":fsse,"frame_mse":mse,"frame_psnr":psnr,"frame_reference_pocs":frame_refs,"forward_buffers_built":sorted(fw_cache.keys()),"mode_selection_counts":fmodes,"candidate_selection_counts":fcands,"buffer_reuse_ratio":fmodes.get("buffer_reuse",0)/nblocks,"predictor_only_ratio":fmodes.get("predictor_only",0)/nblocks,"predictor_residual_ratio":fmodes.get("predictor_residual",0)/nblocks,"direct_ratio":fmodes.get("direct",0)/nblocks,"final_mode_probabilities":mode_model.snapshot(),"final_candidate_probabilities":candidate_model.snapshot(),"final_residual_probabilities":residual_coder.snapshot()})
+            frames.append({"poc":poc,"num_blocks":nblocks,"frame_bits":fbits,"frame_bpp":fbits/(a.width*a.height),"frame_sse":fsse,"frame_mse":mse,"frame_psnr":psnr,"frame_reference_pocs":frame_refs,"forward_buffers_built":sorted(fw_cache.keys()),"mode_selection_counts":fmodes,"candidate_selection_counts":fcands,"buffer_reuse_ratio":fmodes.get("buffer_reuse",0)/nblocks,"predictor_only_ratio":fmodes.get("predictor_only",0)/nblocks,"predictor_residual_ratio":fmodes.get("predictor_residual",0)/nblocks,"direct_ratio":fmodes.get("direct",0)/nblocks,"final_mode_probabilities":mode_model.snapshot(),"final_candidate_probabilities":candidate_model.snapshot(),"final_residual_probabilities":residual_coder.snapshot(),"final_residual_shape_probabilities":residual_shape_model.snapshot()})
             total_bits+=fbits; total_sse+=fsse
             ratio=(ord_idx+1)/len(coding_order); width=30; fill=int(round(width*ratio))
             print(f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{len(coding_order)} POC={poc} bits={fbits:.1f} reuse={fmodes.get('buffer_reuse',0)/nblocks:.3f} predOnly={fmodes.get('predictor_only',0)/nblocks:.3f} PSNR={psnr:.3f}",end="",flush=True)
@@ -1211,6 +1326,7 @@ def main():
         "depth_buffer_size":[dbw,dbh],
         "depth_buffer_rule":"all covered cells valid -> implicit zero-bit reuse; otherwise run explicit RDO and commit winner",
         "reference_depth_source":"previously reconstructed depth frame only",
+        "mv_sample_rule":"borrow neighboring MV only; relocate it to current block center; sample same-size recon-reference patch at center+MV",
         "depth_scale_real":scale,
         "plane_equation":"1/z = a*(x-cx)+b*(y-cy)+c",
         "qp":a.qp,
@@ -1221,7 +1337,7 @@ def main():
             "buffer_reuse":"0 bits",
             "direct":"adaptive mode bits + adaptive residual syntax",
             "predictor_only":"adaptive mode bits + adaptive candidate bits",
-            "predictor_residual":"adaptive mode bits + adaptive candidate bits + adaptive residual syntax",
+            "predictor_residual":"adaptive mode bits + adaptive candidate bits + adaptive c_only flag + selected residual coefficients",
             "candidate_idx_coding":"adaptive -log2(p) with fw_ref class split among occurrences"
         },
         "probability_model":{
@@ -1238,10 +1354,13 @@ def main():
                 "c_separate_distribution": True,
                 "coding_order": ["q_a", "q_b", "q_c"],
                 "coefficient_syntax": "adaptive zero/nonzero; fixed 1-bit sign; adaptive magnitude class 1/2/3/4/gt4; ue(abs(q)-5) for gt4",
-                "final_probabilities": sequence_residual_coder.snapshot()
+                "final_probabilities": sequence_residual_coder.snapshot(),
+                "residual_shape_probabilities": sequence_residual_shape_model.snapshot(),
+                "c_only_rule": "send q_c only; q_a=q_b=0 and predictor slopes are preserved",
+                "abc_rule": "send q_a, q_b, q_c"
             }
         },
-        "candidate_types":["left(MV-derived)","top(MV-derived)","top_left(MV-derived)","spatial_all(MV-derived)","fw_ref_<POC>(recon-depth)","fw_average(recon-depth)"],
+        "candidate_types":["mv_sample_left(recon-depth sampled at current center + borrowed MV)","mv_sample_top(recon-depth sampled at current center + borrowed MV)","mv_sample_top_left(recon-depth sampled at current center + borrowed MV)","mv_sample_all(recon-depth sampled using pooled neighboring MVs)","fw_ref_<POC>(recon-depth)","fw_average(recon-depth)"],
         "mode_types":["buffer_reuse","predictor_only","predictor_residual","direct"],
         "total_bits":total_bits,
         "overall_bpp":overall_bpp,
