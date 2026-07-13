@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Fixed-block depth predictor candidate RDO simulator.
+"""VERSION: 2026-07-13-v3
+
+Fixed-block depth predictor candidate RDO simulator.
 
 Inputs
 ------
@@ -14,8 +16,10 @@ and evaluates these predictors without block split:
   direct_zero, left, top, top_left, spatial_all,
   fw_ref_<POC>, fw_average.
 
-Forward-warp candidates are built once per reference/current pair in a
-low-resolution buffer. Reference depth is always GT depth, by design.
+Spatial candidates are derived from the neighboring blocks' MV observations and
+camera parameters. Forward-warp candidates are built once per reconstructed
+reference/current pair in a low-resolution buffer. Reference depth is reconstructed
+depth, never GT depth.
 """
 from __future__ import annotations
 
@@ -188,8 +192,9 @@ def scaled_camera(cam: Camera, sx: float, sy: float) -> Camera:
 def load_mv_csv(path: str, nframes: int, bs: int):
     rows = [[] for _ in range(nframes)]
     refs = [{} for _ in range(nframes)]
+    block_rows = [{} for _ in range(nframes)]
     if not path:
-        return rows, refs
+        return rows, refs, block_rows
     req = {"poc", "x", "y", "w", "h", "list", "ref_poc", "mv_x", "mv_y"}
     with open(path, "r", newline="", encoding="utf-8-sig") as f:
         rd = csv.DictReader(f)
@@ -206,7 +211,123 @@ def load_mv_csv(path: str, nframes: int, bs: int):
                 a = refs[o.poc].setdefault(key, [])
                 if o.ref_poc not in a:
                     a.append(o.ref_poc)
-    return rows, refs
+                block_rows[o.poc].setdefault(key, []).append(o)
+    return rows, refs, block_rows
+
+
+def pixel_ray(u: float, v: float, cam: Camera) -> np.ndarray:
+    return np.array([
+        (u - cam.K[0, 2]) / cam.K[0, 0],
+        (v - cam.K[1, 2]) / cam.K[1, 1],
+        cam.z_sign,
+    ], dtype=np.float64)
+
+
+def project_point(X: np.ndarray, cam: Camera) -> Optional[np.ndarray]:
+    depth = cam.z_sign * float(X[2])
+    if not np.isfinite(depth) or depth <= 1e-10:
+        return None
+    return np.array([
+        cam.K[0, 0] * float(X[0]) / depth + cam.K[0, 2],
+        cam.K[1, 1] * float(X[1]) / depth + cam.K[1, 2],
+    ], dtype=np.float64)
+
+
+def solve_depth_from_mv(row: MVRecord, cams: Dict[int, Camera],
+                        min_parallax: float, max_reproj_error: float,
+                        min_depth: float, max_depth: float) -> Optional[Tuple[float,float,float,float]]:
+    if row.poc not in cams or row.ref_poc not in cams:
+        return None
+    cur = cams[row.poc]
+    ref = cams[row.ref_poc]
+    u = row.x + (row.w - 1) * 0.5
+    v = row.y + (row.h - 1) * 0.5
+    ur = u + row.mv_x
+    vr = v + row.mv_y
+    ray = pixel_ray(u, v, cur)
+    M = ref.W2C @ cur.C2W
+    R, t = M[:3,:3], M[:3,3]
+    q = R @ ray
+    fx, fy = float(ref.K[0,0]), float(ref.K[1,1])
+    cx, cy = float(ref.K[0,2]), float(ref.K[1,2])
+    zs = float(ref.z_sign)
+    du, dv = ur - cx, vr - cy
+    A = np.array([
+        du * zs * q[2] - fx * q[0],
+        dv * zs * q[2] - fy * q[1],
+    ], dtype=np.float64)
+    B = np.array([
+        fx * t[0] - du * zs * t[2],
+        fy * t[1] - dv * zs * t[2],
+    ], dtype=np.float64)
+    denom = float(A @ A)
+    if not np.isfinite(denom) or denom < min_parallax * min_parallax:
+        return None
+    z = float((A @ B) / denom)
+    if not np.isfinite(z) or z < min_depth or z > max_depth:
+        return None
+    pred = project_point(z * q + t, ref)
+    if pred is None:
+        return None
+    err = float(np.linalg.norm(pred - np.array([ur, vr], dtype=np.float64)))
+    if not np.isfinite(err) or err > max_reproj_error:
+        return None
+    return u, v, z, err
+
+
+def fit_plane_from_mv_rows(rows: Sequence[MVRecord], cams: Dict[int, Camera],
+                           cx: float, cy: float, min_parallax: float,
+                           max_reproj_error: float, min_depth: float,
+                           max_depth: float, min_points: int) -> Optional[Plane]:
+    pts = []
+    for row in rows:
+        solved = solve_depth_from_mv(row, cams, min_parallax, max_reproj_error,
+                                     min_depth, max_depth)
+        if solved is not None:
+            pts.append(solved)
+    if len(pts) < min_points:
+        return None
+    x = np.asarray([v[0] for v in pts], np.float64)
+    y = np.asarray([v[1] for v in pts], np.float64)
+    z = np.asarray([v[2] for v in pts], np.float64)
+    err = np.asarray([v[3] for v in pts], np.float64)
+    A = np.stack([x-cx, y-cy, np.ones_like(x)], axis=1)
+    inv = 1.0 / z
+    w = 1.0 / (1.0 + err*err)
+    sw = np.sqrt(np.maximum(w, 1e-12))
+    try:
+        c, _, rank, _ = np.linalg.lstsq(A*sw[:,None], inv*sw, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    if rank < 3 or not np.isfinite(c).all():
+        return Plane(0.0, 0.0, float(np.average(inv, weights=w)), cx, cy)
+    return Plane(float(c[0]), float(c[1]), float(c[2]), cx, cy)
+
+
+def build_ra_order(start: int, end: int, gop: int) -> List[int]:
+    if end <= start:
+        return []
+    order = [start]
+    seen = {start}
+    def mids(lo: int, hi: int):
+        if hi-lo <= 1:
+            return
+        mid = (lo+hi)//2
+        if mid in seen or mid <= lo or mid >= hi:
+            return
+        order.append(mid); seen.add(mid)
+        mids(lo, mid); mids(mid, hi)
+    lo = start
+    last = end-1
+    while lo < last:
+        hi = min(lo+gop, last)
+        if hi not in seen:
+            order.append(hi); seen.add(hi)
+        mids(lo, hi)
+        lo = hi
+    if sorted(order) != list(range(start,end)):
+        raise RuntimeError('RA order generation failed')
+    return order
 
 
 class GridCache:
@@ -635,11 +756,14 @@ def parse_args():
         action="store_true",
         help=(
             "Also prohibit POCs listed by --zero-anchor-pocs from being used as "
-            "GT-depth forward-warp references. Without this flag, skipped anchor "
-            "frames are still valid forward references because reference depth "
-            "is read directly from the GT depth sequence."
+            "reconstructed-depth forward-warp references."
         ),
     )
+    p.add_argument("--coding-order", choices=["ra","sequential"], default="ra")
+    p.add_argument("--ra-gop-size", type=int, default=32)
+    p.add_argument("--min-mv-plane-points", type=int, default=3)
+    p.add_argument("--min-parallax", type=float, default=1e-6)
+    p.add_argument("--max-mv-reproj-error", type=float, default=1.5)
     p.add_argument("--min-forward-valid-ratio", type=float, default=0.25)
     p.add_argument("--candidate-idx-coding", choices=["fixed","truncated_unary"], default="truncated_unary")
     p.add_argument("--disable-buffer-reuse", action="store_true")
@@ -677,6 +801,12 @@ def main():
         raise ValueError("--prob-update-step must be non-negative")
     if not (0.0 < a.prob_min < 1.0 / 6.0):
         raise ValueError("--prob-min must be in (0, 1/6)")
+    if a.min_mv_plane_points < 1:
+        raise ValueError("--min-mv-plane-points must be positive")
+    if a.min_parallax <= 0 or a.max_mv_reproj_error < 0:
+        raise ValueError("Invalid MV-depth reliability thresholds")
+    if a.ra_gop_size <= 0:
+        raise ValueError("--ra-gop-size must be positive")
     if a.disable_direct and a.disable_predictor_only and a.disable_predictor_residual:
         raise ValueError("All explicit coding modes are disabled")
 
@@ -697,11 +827,13 @@ def main():
     zero_anchor_pocs = parse_poc_set(a.zero_anchor_pocs)
     zero_anchor_pocs_in_range = sorted(p for p in zero_anchor_pocs if start <= p < end)
 
-    rows, block_refs = load_mv_csv(a.mv_csv, total, a.block_size)
+    rows, block_refs, block_mv_rows = load_mv_csv(a.mv_csv, total, a.block_size)
     qa, qb, qc = qp_steps(a); lam = derive_lambda(a)
     lw = int(math.ceil(a.width / a.forward_downsample)); lh = int(math.ceil(a.height / a.forward_downsample))
     dbw = int(math.ceil(a.width / a.depth_buffer_downsample)); dbh = int(math.ceil(a.height / a.depth_buffer_downsample))
     grid = GridCache()
+    coding_order = (build_ra_order(start, end, a.ra_gop_size)
+                    if a.coding_order == "ra" else list(range(start, end)))
 
     mode_symbols = [
         x for x, disabled in (
@@ -725,19 +857,23 @@ def main():
     print(f"adaptive probability: step={a.prob_update_step}, p_min={a.prob_min}, reset={a.prob_reset}")
     print(f"zero anchor POCs    : {zero_anchor_pocs_in_range or 'none'}")
     print(f"exclude as FW refs  : {a.exclude_zero_anchors_as_forward_refs}")
+    print(f"coding order        : {a.coding_order} {coding_order[:16]}{'...' if len(coding_order)>16 else ''}")
+    print("spatial source      : neighboring-block MV-derived depth")
+    print("forward source      : reconstructed reference depth")
 
     fields = ["poc","x","y","w","h","mode","mode_probability_before","candidate_count","candidate_idx","candidate","candidate_probability_before","mode_bits","candidate_bits","residual_bits","total_bits","residual_present","buffer_no_signal","q_a","q_b","q_c","pred_a","pred_b","pred_c","gt_a","gt_b","gt_c","recon_a","recon_b","recon_c","sse","cost","forward_refs"]
     frames=[]; global_modes={}; global_cands={}; total_bits=0.0; total_sse=0.0
     simulated_frame_count = 0
     excluded_anchor_output_sse = 0.0
 
-    with open(a.gt_depth_yuv,"rb") as fp, open(a.out_recon_yuv,"wb") as outfp, open(a.out_block_csv,"w",newline="",encoding="utf-8") as cfp:
+    reconstructed_depth_frames: Dict[int, np.ndarray] = {}
+    with open(a.gt_depth_yuv,"rb") as fp, open(a.out_recon_yuv,"wb+") as outfp, open(a.out_block_csv,"w",newline="",encoding="utf-8") as cfp:
         wr=csv.DictWriter(cfp,fieldnames=fields); wr.writeheader(); gt_cache={}
         def gt(poc):
             if poc not in gt_cache: gt_cache[poc]=read_y(fp,poc,a.width,a.height)
             return gt_cache[poc]
 
-        for ord_idx,poc in enumerate(range(start,end)):
+        for ord_idx,poc in enumerate(coding_order):
             if a.prob_reset == "frame":
                 mode_model, candidate_model = new_probability_models()
             else:
@@ -748,6 +884,8 @@ def main():
             # Explicitly excluded I/anchor frame: no block RDO, no depth buffer,
             # no probability update, and zero depth is written to the output.
             if poc in zero_anchor_pocs:
+                reconstructed_depth_frames[poc] = recon.copy()
+                outfp.seek((poc-start) * frame_size(a.width, a.height))
                 write_depth_frame(outfp, recon, a.width, a.height)
                 anchor_sse = float(np.sum(gy * gy))
                 anchor_mse = anchor_sse / (a.width * a.height)
@@ -777,9 +915,9 @@ def main():
                     "final_mode_probabilities": mode_model.snapshot(),
                     "final_candidate_probabilities": candidate_model.snapshot(),
                 })
-                ratio=(ord_idx+1)/(end-start); width=30; fill=int(round(width*ratio))
+                ratio=(ord_idx+1)/len(coding_order); width=30; fill=int(round(width*ratio))
                 print(
-                    f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{end-start} "
+                    f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{len(coding_order)} "
                     f"POC={poc} ANCHOR-SKIP bits=0 zero-filled",
                     end="", flush=True,
                 )
@@ -806,7 +944,11 @@ def main():
             if not frame_refs and default_ref in cams and ref_allowed(default_ref):
                 frame_refs = [default_ref]
             frame_refs=frame_refs[:a.max_forward_refs]
-            fw_cache={ref:forward_warp_lowres(gt(ref)*scale,cams[ref],cams[poc],lw,lh) for ref in frame_refs if 0<=ref<total}
+            fw_cache = {}
+            for ref in frame_refs:
+                if ref in reconstructed_depth_frames:
+                    fw_cache[ref] = forward_warp_lowres(
+                        reconstructed_depth_frames[ref] * scale, cams[ref], cams[poc], lw, lh)
             reuse=DepthReuseBuffer(a.width,a.height,a.depth_buffer_downsample,a.min_depth)
             rec_planes={}; fbits=0.0; fsse=0.0; fmodes={}; fcands={}; nblocks=0
             gw=int(math.ceil(a.width/a.block_size)); gh=int(math.ceil(a.height/a.block_size))
@@ -825,13 +967,26 @@ def main():
                         candidate_prob_before = 0.0
                         best=make_buffer_reuse(gyb,reuse.reconstruct(bx,by,bw,bh),scale,cx,cy,grid,a.min_depth)
                     else:
-                        spatial=[]
+                        spatial_mv_groups = []
+                        spatial_mv_group_count = 0
                         for name,key in (("left",(bxi-1,byi)),("top",(bxi,byi-1)),("top_left",(bxi-1,byi-1))):
-                            if key in rec_planes:
-                                p=recenter(rec_planes[key],cx,cy); cands.append((name,p)); spatial.append(p)
-                        if len(spatial)>=2:
-                            p=average_planes(spatial,cx,cy)
-                            if p is not None: cands.append(("spatial_all",p))
+                            mv_group = block_mv_rows[poc].get(key, [])
+                            if mv_group:
+                                p = fit_plane_from_mv_rows(
+                                    mv_group, cams, cx, cy, a.min_parallax,
+                                    a.max_mv_reproj_error, a.min_depth, a.max_depth,
+                                    a.min_mv_plane_points)
+                                if p is not None:
+                                    cands.append((name,p))
+                                    spatial_mv_groups.extend(mv_group)
+                                    spatial_mv_group_count += 1
+                        if spatial_mv_group_count >= 2:
+                            p = fit_plane_from_mv_rows(
+                                spatial_mv_groups, cams, cx, cy, a.min_parallax,
+                                a.max_mv_reproj_error, a.min_depth, a.max_depth,
+                                a.min_mv_plane_points)
+                            if p is not None:
+                                cands.append(("spatial_all",p))
 
                         for ref in block_refs[poc].get((bxi,byi),[]):
                             if (
@@ -845,8 +1000,9 @@ def main():
                             if ref not in refs: refs.append(ref)
                         refs=refs[:a.max_forward_refs]; fw_blocks=[]
                         for ref in refs:
-                            if ref not in fw_cache and 0<=ref<total and ref in cams:
-                                fw_cache[ref]=forward_warp_lowres(gt(ref)*scale,cams[ref],cams[poc],lw,lh)
+                            if ref not in fw_cache and ref in reconstructed_depth_frames and ref in cams:
+                                fw_cache[ref]=forward_warp_lowres(
+                                    reconstructed_depth_frames[ref]*scale,cams[ref],cams[poc],lw,lh)
                             if ref not in fw_cache: continue
                             zb,mb=extract_fw_block(*fw_cache[ref],bx,by,bw,bh,a.width,a.height)
                             if np.mean(mb)<a.min_forward_valid_ratio: continue
@@ -917,12 +1073,14 @@ def main():
                     global_modes[best.mode]=global_modes.get(best.mode,0)+1; global_cands[best.name]=global_cands.get(best.name,0)+1
                     wr.writerow({"poc":poc,"x":bx,"y":by,"w":bw,"h":bh,"mode":best.mode,"mode_probability_before":mode_prob_before,"candidate_count":len(cands),"candidate_idx":best.candidate_idx,"candidate":best.name,"candidate_probability_before":candidate_prob_before,"mode_bits":best.mode_bits,"candidate_bits":best.candidate_bits,"residual_bits":best.residual_bits,"total_bits":best.bits,"residual_present":int(best.residual_present),"buffer_no_signal":int(best.buffer_no_signal),"q_a":best.q[0],"q_b":best.q[1],"q_c":best.q[2],"pred_a":best.pred.a,"pred_b":best.pred.b,"pred_c":best.pred.c,"gt_a":actual.a,"gt_b":actual.b,"gt_c":actual.c,"recon_a":best.recon.a,"recon_b":best.recon.b,"recon_c":best.recon.c,"sse":best.sse,"cost":best.cost,"forward_refs":"|".join(map(str,refs))})
 
+            reconstructed_depth_frames[poc] = recon.copy()
+            outfp.seek((poc-start) * frame_size(a.width, a.height))
             write_depth_frame(outfp,recon,a.width,a.height)
             mse=fsse/(a.width*a.height); psnr=float("inf") if mse==0 else 10*math.log10(1023**2/mse)
             frames.append({"poc":poc,"num_blocks":nblocks,"frame_bits":fbits,"frame_bpp":fbits/(a.width*a.height),"frame_sse":fsse,"frame_mse":mse,"frame_psnr":psnr,"frame_reference_pocs":frame_refs,"forward_buffers_built":sorted(fw_cache.keys()),"mode_selection_counts":fmodes,"candidate_selection_counts":fcands,"buffer_reuse_ratio":fmodes.get("buffer_reuse",0)/nblocks,"predictor_only_ratio":fmodes.get("predictor_only",0)/nblocks,"predictor_residual_ratio":fmodes.get("predictor_residual",0)/nblocks,"direct_ratio":fmodes.get("direct",0)/nblocks,"final_mode_probabilities":mode_model.snapshot(),"final_candidate_probabilities":candidate_model.snapshot()})
             total_bits+=fbits; total_sse+=fsse
-            ratio=(ord_idx+1)/(end-start); width=30; fill=int(round(width*ratio))
-            print(f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{end-start} POC={poc} bits={fbits:.1f} reuse={fmodes.get('buffer_reuse',0)/nblocks:.3f} predOnly={fmodes.get('predictor_only',0)/nblocks:.3f} PSNR={psnr:.3f}",end="",flush=True)
+            ratio=(ord_idx+1)/len(coding_order); width=30; fill=int(round(width*ratio))
+            print(f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{len(coding_order)} POC={poc} bits={fbits:.1f} reuse={fmodes.get('buffer_reuse',0)/nblocks:.3f} predOnly={fmodes.get('predictor_only',0)/nblocks:.3f} PSNR={psnr:.3f}",end="",flush=True)
     print()
 
     simulated_pixels = a.width * a.height * simulated_frame_count
@@ -948,13 +1106,13 @@ def main():
         "exclude_zero_anchors_as_forward_refs":bool(a.exclude_zero_anchors_as_forward_refs),
         "zero_anchor_rule":"no block RDO, zero depth output, zero depth bits, no buffer/probability update",
         "block_size":a.block_size,
-        "block_split":False,
+        "block_split":False,"coding_order":a.coding_order,"coding_poc_order":coding_order,"ra_gop_size":a.ra_gop_size,
         "forward_downsample":a.forward_downsample,
         "forward_buffer_size":[lw,lh],
         "depth_buffer_downsample":a.depth_buffer_downsample,
         "depth_buffer_size":[dbw,dbh],
         "depth_buffer_rule":"all covered cells valid -> implicit zero-bit reuse; otherwise run explicit RDO and commit winner",
-        "reference_depth_source":"GT depth frame; skipped anchors remain usable unless --exclude-zero-anchors-as-forward-refs is set",
+        "reference_depth_source":"previously reconstructed depth frame only",
         "depth_scale_real":scale,
         "plane_equation":"1/z = a*(x-cx)+b*(y-cy)+c",
         "qp":a.qp,
@@ -978,7 +1136,7 @@ def main():
             "final_mode_probabilities":sequence_mode_model.snapshot(),
             "final_candidate_probabilities":sequence_candidate_model.snapshot()
         },
-        "candidate_types":["left","top","top_left","spatial_all","fw_ref_<POC>","fw_average"],
+        "candidate_types":["left(MV-derived)","top(MV-derived)","top_left(MV-derived)","spatial_all(MV-derived)","fw_ref_<POC>(recon-depth)","fw_average(recon-depth)"],
         "mode_types":["buffer_reuse","predictor_only","predictor_residual","direct"],
         "total_bits":total_bits,
         "overall_bpp":overall_bpp,
