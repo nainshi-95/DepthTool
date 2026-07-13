@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""VERSION: 2026-07-13-depth-y-psnr-only
+"""VERSION: 2026-07-13-projection-y-psnr-from-input-depth-v1
 
-Compare GT and externally reconstructed depth YUV420p10le sequences in the
-stored 10-bit Y-sample domain. No RDO, encoding simulation, plane fitting,
-motion prediction, or forward warping is performed.
+Projection Y-PSNR evaluator using an externally supplied depth-map YUV.
+
+No RDO, no depth encoding simulation, no plane fitting, no predictor generation,
+no residual coding, and no probability model are used.
+
+For each target POC:
+  1) choose one or more reference POCs,
+  2) read reference video Y,
+  3) read reference depth Y from --input-depth-yuv,
+  4) forward-project reference Y into the target camera using that depth,
+  5) compare projected Y against target video Y over valid projected pixels,
+  6) report frame and sequence projection Y-PSNR.
+
+POCs listed in --exclude-pocs, e.g. 0,32, are excluded from measurement.
 """
 from __future__ import annotations
 
@@ -13,34 +24,137 @@ import csv
 import json
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+import cv2
 import numpy as np
 
 
-def frame_size(width: int, height: int) -> int:
-    # YUV420p10le: every Y/U/V sample occupies 2 bytes.
-    return width * height * 3
+@dataclass
+class Camera:
+    poc: int
+    K: np.ndarray
+    W2C: np.ndarray
+    C2W: np.ndarray
+    z_sign: float
+
+
+def frame_size_420p10le(width: int, height: int) -> int:
+    y = width * height
+    uv = (width // 2) * (height // 2)
+    return 2 * (y + 2 * uv)
 
 
 def count_frames(path: str, width: int, height: int) -> int:
-    fs = frame_size(width, height)
+    fs = frame_size_420p10le(width, height)
     size = os.path.getsize(path)
-    if size % fs:
-        print(f"[WARN] {path}: trailing bytes ignored: {size % fs}")
+    trailing = size % fs
+    if trailing:
+        print(f"[WARN] trailing bytes ignored: {path}: {trailing}")
     return size // fs
 
 
-def read_y(fp, frame_idx: int, width: int, height: int, stored_bit_shift: int) -> np.ndarray:
-    fp.seek(frame_idx * frame_size(width, height))
+def read_y(fp, poc: int, width: int, height: int, stored_shift: int) -> np.ndarray:
+    fp.seek(poc * frame_size_420p10le(width, height))
     raw = fp.read(width * height * 2)
     if len(raw) != width * height * 2:
-        raise EOFError(f"Cannot read Y plane of frame {frame_idx}")
+        raise EOFError(f"Cannot read Y plane at POC {poc}")
     y = np.frombuffer(raw, dtype="<u2").reshape(height, width)
-    if stored_bit_shift:
-        y = np.right_shift(y, stored_bit_shift)
+    if stored_shift:
+        y = np.right_shift(y, stored_shift)
     return y.astype(np.float64)
+
+
+def rt4(rvec: Sequence[float], tvec: Sequence[float]) -> np.ndarray:
+    R, _ = cv2.Rodrigues(np.asarray(rvec, np.float64).reshape(3, 1))
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = np.asarray(tvec, np.float64).reshape(3)
+    return T
+
+
+def load_cameras(path: str) -> Tuple[Dict[str, Any], Dict[int, Camera]]:
+    header: Optional[Dict[str, Any]] = None
+    records: List[Dict[str, Any]] = []
+
+    with open(path, "r", encoding="utf-8") as fp:
+        for line in fp:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if obj.get("type") in ("header", "intrinsic"):
+                header = obj
+            elif "poc" in obj:
+                records.append(obj)
+
+    if header is None or not records:
+        raise RuntimeError("Invalid camera JSONL")
+
+    records.sort(key=lambda x: int(x["poc"]))
+    intr = header["intrinsic"]
+    base = np.array(
+        [intr["fx"], intr["fy"], intr["cx"], intr["cy"]],
+        dtype=np.float64,
+    )
+    fixed_intrinsic = (
+        header.get("intrinsic_mode") == "rap_fixed"
+        or header.get("intrinsic_delta_mode") == "fixed_zero_delta"
+    )
+    z_sign = 1.0 if float(intr.get("z_sign", 1.0)) >= 0.0 else -1.0
+    pose_mode = str(header.get("pose_mode", "current_to_previous"))
+
+    current_intrinsic = base.copy()
+    previous_w2c = np.eye(4, dtype=np.float64)
+    cameras: Dict[int, Camera] = {}
+
+    for order, record in enumerate(records):
+        poc = int(record["poc"])
+        delta = np.asarray(
+            record.get("intrinsic_delta", [0.0, 0.0, 0.0, 0.0]),
+            dtype=np.float64,
+        )
+        current_intrinsic = (
+            base.copy() if fixed_intrinsic else current_intrinsic + delta
+        )
+        K = np.array(
+            [
+                [current_intrinsic[0], 0.0, current_intrinsic[2]],
+                [0.0, current_intrinsic[1], current_intrinsic[3]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        Trec = rt4(record["rvec"], record["tvec"])
+        if pose_mode == "current_to_previous":
+            W2C = (
+                np.eye(4, dtype=np.float64)
+                if order == 0
+                else np.linalg.inv(Trec) @ previous_w2c
+            )
+        elif pose_mode in ("gop_local", "absolute"):
+            W2C = Trec
+        else:
+            raise ValueError(f"Unsupported pose_mode: {pose_mode}")
+
+        C2W = np.linalg.inv(W2C)
+        cameras[poc] = Camera(poc, K, W2C, C2W, z_sign)
+        previous_w2c = W2C
+
+    return header, cameras
+
+
+def get_depth_scale_real(header: Dict[str, Any]) -> float:
+    if "depth_scale_precision" in header:
+        precision = float(header["depth_scale_precision"])
+        if precision <= 0.0:
+            raise ValueError("depth_scale_precision must be positive")
+        return float(header["depth_scale"]) / precision
+    if "depth_scale_real" in header:
+        return float(header["depth_scale_real"])
+    return float(header["depth_scale"])
 
 
 def parse_poc_set(text: str) -> Set[int]:
@@ -48,13 +162,15 @@ def parse_poc_set(text: str) -> Set[int]:
     text = str(text).strip()
     if not text:
         return result
+
     for token in text.split(","):
         token = token.strip()
         if not token:
             continue
         if "-" in token:
-            lo_s, hi_s = token.split("-", 1)
-            lo, hi = int(lo_s), int(hi_s)
+            lo_text, hi_text = token.split("-", 1)
+            lo = int(lo_text)
+            hi = int(hi_text)
             if lo < 0 or hi < lo:
                 raise ValueError(f"Invalid POC range: {token}")
             result.update(range(lo, hi + 1))
@@ -66,187 +182,465 @@ def parse_poc_set(text: str) -> Set[int]:
     return result
 
 
-def metric_from_sse(sse: float, samples: int, peak: float) -> tuple[float, float]:
-    if samples <= 0:
-        return 0.0, float("inf")
-    mse = sse / samples
-    psnr = float("inf") if mse == 0 else 10.0 * math.log10((peak * peak) / mse)
-    return mse, psnr
+def load_refs_from_mv_csv(path: str, total_frames: int) -> List[List[int]]:
+    refs: List[List[int]] = [[] for _ in range(total_frames)]
+    if not path:
+        return refs
+
+    with open(path, "r", newline="", encoding="utf-8-sig") as fp:
+        reader = csv.DictReader(fp)
+        required = {"poc", "ref_poc"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise RuntimeError(f"MV CSV missing columns: {sorted(missing)}")
+
+        for line_no, row in enumerate(reader, start=2):
+            try:
+                poc = int(row["poc"])
+                ref_poc = int(row["ref_poc"])
+            except Exception as exc:
+                raise RuntimeError(f"Invalid MV CSV row {line_no}: {row}") from exc
+
+            if 0 <= poc < total_frames and ref_poc != poc:
+                if ref_poc not in refs[poc]:
+                    refs[poc].append(ref_poc)
+    return refs
 
 
-def prepare_output(path_text: str, overwrite: bool) -> Optional[Path]:
-    if not path_text:
-        return None
-    path = Path(path_text)
-    if path.exists():
-        if not overwrite:
-            raise FileExistsError(f"Output exists: {path}")
-        path.unlink()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+def build_ra_order(start: int, end: int, gop: int) -> List[int]:
+    if end <= start:
+        return []
+
+    order = [start]
+    seen = {start}
+
+    def add_midpoints(lo: int, hi: int) -> None:
+        if hi - lo <= 1:
+            return
+        mid = (lo + hi) // 2
+        if mid in seen or mid <= lo or mid >= hi:
+            return
+        order.append(mid)
+        seen.add(mid)
+        add_midpoints(lo, mid)
+        add_midpoints(mid, hi)
+
+    lo = start
+    last = end - 1
+    while lo < last:
+        hi = min(lo + gop, last)
+        if hi not in seen:
+            order.append(hi)
+            seen.add(hi)
+        add_midpoints(lo, hi)
+        lo = hi
+
+    if sorted(order) != list(range(start, end)):
+        raise RuntimeError("RA order generation failed")
+    return order
+
+
+def forward_project_y(
+    reference_y: np.ndarray,
+    reference_depth_y: np.ndarray,
+    reference_camera: Camera,
+    target_camera: Camera,
+    depth_scale: float,
+    min_depth: float,
+    max_depth: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Forward-project reference Y to target with nearest-pixel z-buffering."""
+    height, width = reference_y.shape
+
+    x, y = np.meshgrid(
+        np.arange(width, dtype=np.float64),
+        np.arange(height, dtype=np.float64),
+    )
+
+    depth = reference_depth_y * depth_scale
+    depth_valid = (
+        np.isfinite(depth)
+        & (depth >= min_depth)
+        & (depth <= max_depth)
+    )
+
+    rays = np.stack(
+        [
+            (x - reference_camera.K[0, 2]) / reference_camera.K[0, 0],
+            (y - reference_camera.K[1, 2]) / reference_camera.K[1, 1],
+            np.full_like(x, reference_camera.z_sign),
+        ],
+        axis=-1,
+    )
+    X_ref = rays * depth[..., None]
+
+    M = target_camera.W2C @ reference_camera.C2W
+    X_tar = X_ref @ M[:3, :3].T + M[:3, 3]
+
+    tar_depth = target_camera.z_sign * X_tar[..., 2]
+    front = depth_valid & np.isfinite(tar_depth) & (tar_depth > 1e-10)
+    safe_depth = np.where(front, tar_depth, 1.0)
+
+    u = target_camera.K[0, 0] * X_tar[..., 0] / safe_depth + target_camera.K[0, 2]
+    v = target_camera.K[1, 1] * X_tar[..., 1] / safe_depth + target_camera.K[1, 2]
+
+    ui = np.rint(u).astype(np.int64)
+    vi = np.rint(v).astype(np.int64)
+
+    valid = (
+        front
+        & np.isfinite(u)
+        & np.isfinite(v)
+        & (ui >= 0)
+        & (ui < width)
+        & (vi >= 0)
+        & (vi < height)
+    )
+
+    projected = np.zeros((height, width), dtype=np.float64)
+    projected_valid = np.zeros((height, width), dtype=bool)
+
+    if not np.any(valid):
+        return projected, projected_valid
+
+    dst_index = vi[valid] * width + ui[valid]
+    src_depth = tar_depth[valid]
+    src_y = reference_y[valid]
+
+    order = np.argsort(src_depth)
+    dst_index = dst_index[order]
+    src_y = src_y[order]
+
+    unique_index, first = np.unique(dst_index, return_index=True)
+    projected.reshape(-1)[unique_index] = src_y[first]
+    projected_valid.reshape(-1)[unique_index] = True
+
+    return projected, projected_valid
+
+
+def combine_projections(
+    projections: Sequence[Tuple[np.ndarray, np.ndarray]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    total = np.zeros_like(projections[0][0], dtype=np.float64)
+    count = np.zeros_like(total, dtype=np.float64)
+
+    for projected, valid in projections:
+        total[valid] += projected[valid]
+        count[valid] += 1.0
+
+    valid = count > 0.0
+    out = np.zeros_like(total)
+    out[valid] = total[valid] / count[valid]
+    return out, valid
+
+
+def calculate_metrics(
+    target_y: np.ndarray,
+    projected_y: np.ndarray,
+    valid: np.ndarray,
+    peak: float,
+) -> Dict[str, float]:
+    valid_pixels = int(np.count_nonzero(valid))
+    total_pixels = int(valid.size)
+
+    if valid_pixels == 0:
+        return {
+            "valid_pixels": 0,
+            "valid_ratio": 0.0,
+            "sse": 0.0,
+            "mse": 0.0,
+            "psnr": float("nan"),
+            "mae": 0.0,
+            "max_abs_error": 0.0,
+        }
+
+    diff = target_y[valid] - projected_y[valid]
+    sse = float(np.sum(diff * diff, dtype=np.float64))
+    mse = sse / valid_pixels
+    psnr = float("inf") if mse == 0.0 else 10.0 * math.log10((peak * peak) / mse)
+
+    return {
+        "valid_pixels": valid_pixels,
+        "valid_ratio": valid_pixels / total_pixels,
+        "sse": sse,
+        "mse": mse,
+        "psnr": psnr,
+        "mae": float(np.mean(np.abs(diff))),
+        "max_abs_error": float(np.max(np.abs(diff))),
+    }
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Direct Y-plane PSNR comparison for depth YUV420p10le"
+        description="Measure projection Y-PSNR using an input depth-map YUV directly."
     )
-    p.add_argument("--gt-depth-yuv", required=True)
-    p.add_argument("--recon-depth-yuv", required=True)
+    p.add_argument("--video-yuv", required=True)
+    p.add_argument("--input-depth-yuv", required=True)
+    p.add_argument("--camera-param", required=True)
+    p.add_argument("--mv-csv", default="")
+
     p.add_argument("--width", type=int, required=True)
     p.add_argument("--height", type=int, required=True)
     p.add_argument("--start-frame", type=int, default=0)
-    p.add_argument("--num-frames", type=int, default=0,
-                   help="0 means all mutually available frames")
-    p.add_argument("--exclude-pocs", default="",
-                   help="Excluded POCs/ranges, e.g. '0,32' or '0,32,64-96'")
-    p.add_argument("--gt-stored-bit-shift", type=int, choices=[0, 6], default=0)
-    p.add_argument("--recon-stored-bit-shift", type=int, choices=[0, 6], default=0)
+    p.add_argument("--num-frames", type=int, default=0)
+
+    p.add_argument("--exclude-pocs", default="0,32")
+    p.add_argument("--coding-order", choices=["ra", "sequential"], default="ra")
+    p.add_argument("--ra-gop-size", type=int, default=32)
+    p.add_argument("--default-ref-offset", type=int, default=1)
+    p.add_argument("--max-refs", type=int, default=2)
+    p.add_argument(
+        "--reference-mode",
+        choices=["first", "average"],
+        default="average",
+    )
+
+    p.add_argument("--video-stored-bit-shift", type=int, choices=[0, 6], default=0)
+    p.add_argument("--depth-stored-bit-shift", type=int, choices=[0, 6], default=0)
     p.add_argument("--peak-value", type=float, default=1023.0)
-    p.add_argument("--out-frame-csv", default="")
-    p.add_argument("--out-summary-json", default="")
-    p.add_argument("--include-excluded-rows", action="store_true")
+    p.add_argument("--min-depth", type=float, default=1e-8)
+    p.add_argument("--max-depth", type=float, default=1e9)
+    p.add_argument("--min-valid-ratio", type=float, default=0.0)
+
+    p.add_argument("--out-frame-csv", required=True)
+    p.add_argument("--out-summary-json", required=True)
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
 
 def main() -> None:
     a = parse_args()
+
     if a.width <= 0 or a.height <= 0 or a.width % 2 or a.height % 2:
-        raise ValueError("YUV420 width and height must be positive even numbers")
+        raise ValueError("Invalid YUV420 resolution")
     if a.start_frame < 0 or a.num_frames < 0:
         raise ValueError("Invalid frame range")
-    if a.peak_value <= 0:
-        raise ValueError("--peak-value must be positive")
+    if a.ra_gop_size <= 0 or a.default_ref_offset <= 0 or a.max_refs <= 0:
+        raise ValueError("Invalid coding/reference configuration")
+    if not (0.0 <= a.min_valid_ratio <= 1.0):
+        raise ValueError("--min-valid-ratio must be in [0,1]")
 
-    gt_count = count_frames(a.gt_depth_yuv, a.width, a.height)
-    recon_count = count_frames(a.recon_depth_yuv, a.width, a.height)
-    common_count = min(gt_count, recon_count)
-    if gt_count != recon_count:
-        print(f"[WARN] frame-count mismatch: GT={gt_count}, recon={recon_count}; using {common_count}")
+    outputs = [Path(a.out_frame_csv), Path(a.out_summary_json)]
+    for path in outputs:
+        if path.exists():
+            if not a.overwrite:
+                raise FileExistsError(f"Output exists: {path}")
+            path.unlink()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    header, cameras = load_cameras(a.camera_param)
+    depth_scale = get_depth_scale_real(header)
+
+    video_frames = count_frames(a.video_yuv, a.width, a.height)
+    depth_frames = count_frames(a.input_depth_yuv, a.width, a.height)
+    total_frames = min(video_frames, depth_frames)
+    if video_frames != depth_frames:
+        print(
+            f"[WARN] frame-count mismatch: video={video_frames}, "
+            f"depth={depth_frames}, using={total_frames}"
+        )
 
     start = a.start_frame
-    if start >= common_count:
-        raise ValueError(f"start frame {start} is outside common frame count {common_count}")
-    end = common_count if a.num_frames == 0 else min(common_count, start + a.num_frames)
-    excluded = parse_poc_set(a.exclude_pocs)
+    end = total_frames if a.num_frames == 0 else min(total_frames, start + a.num_frames)
+    if start >= end:
+        raise ValueError("Invalid frame range")
 
-    csv_path = prepare_output(a.out_frame_csv, a.overwrite)
-    json_path = prepare_output(a.out_summary_json, a.overwrite)
+    coding_order = (
+        build_ra_order(start, end, a.ra_gop_size)
+        if a.coding_order == "ra"
+        else list(range(start, end))
+    )
+    excluded = parse_poc_set(a.exclude_pocs)
+    refs_from_csv = load_refs_from_mv_csv(a.mv_csv, total_frames)
 
     fields = [
-        "poc", "excluded", "num_y_pixels", "sse_y", "mse_y", "psnr_y",
-        "mae_y", "max_abs_error_y"
+        "poc", "excluded", "measured", "reference_pocs", "reference_mode",
+        "valid_pixels", "valid_ratio", "sse_y", "mse_y", "psnr_y",
+        "mae_y", "max_abs_error_y", "skip_reason",
     ]
-    rows: List[Dict[str, object]] = []
-    total_sse = 0.0
-    included_pixels = 0
-    included_frames = 0
-    excluded_frames = 0
 
-    csv_fp = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
-    writer = csv.DictWriter(csv_fp, fieldnames=fields) if csv_fp else None
-    if writer:
+    frame_rows: List[Dict[str, Any]] = []
+    total_sse = 0.0
+    total_valid_pixels = 0
+    measured_frames = 0
+
+    with open(a.video_yuv, "rb") as video_fp, open(a.input_depth_yuv, "rb") as depth_fp, open(
+        a.out_frame_csv, "w", newline="", encoding="utf-8"
+    ) as csv_fp:
+        writer = csv.DictWriter(csv_fp, fieldnames=fields)
         writer.writeheader()
 
-    try:
-        with open(a.gt_depth_yuv, "rb") as gt_fp, open(a.recon_depth_yuv, "rb") as rec_fp:
-            n = end - start
-            for order, poc in enumerate(range(start, end), 1):
-                is_excluded = poc in excluded
-                if is_excluded and not a.include_excluded_rows:
-                    excluded_frames += 1
-                else:
-                    gt_y = read_y(gt_fp, poc, a.width, a.height, a.gt_stored_bit_shift)
-                    rec_y = read_y(rec_fp, poc, a.width, a.height, a.recon_stored_bit_shift)
-                    diff = gt_y - rec_y
-                    abs_diff = np.abs(diff)
-                    sse = float(np.sum(diff * diff, dtype=np.float64))
-                    pixels = a.width * a.height
-                    mse, psnr = metric_from_sse(sse, pixels, a.peak_value)
-                    row = {
-                        "poc": poc,
-                        "excluded": int(is_excluded),
-                        "num_y_pixels": pixels,
-                        "sse_y": sse,
-                        "mse_y": mse,
-                        "psnr_y": psnr,
-                        "mae_y": float(np.mean(abs_diff)),
-                        "max_abs_error_y": float(np.max(abs_diff)),
-                    }
-                    if writer:
-                        writer.writerow(row)
-                    if is_excluded:
-                        excluded_frames += 1
-                    else:
-                        rows.append(row)
-                        total_sse += sse
-                        included_pixels += pixels
-                        included_frames += 1
+        for order_idx, poc in enumerate(coding_order, start=1):
+            row: Dict[str, Any] = {
+                "poc": poc,
+                "excluded": int(poc in excluded),
+                "measured": 0,
+                "reference_pocs": "",
+                "reference_mode": a.reference_mode,
+                "valid_pixels": 0,
+                "valid_ratio": 0.0,
+                "sse_y": 0.0,
+                "mse_y": 0.0,
+                "psnr_y": "",
+                "mae_y": 0.0,
+                "max_abs_error_y": 0.0,
+                "skip_reason": "",
+            }
 
-                ratio = order / n
-                width = 30
-                fill = int(round(width * ratio))
-                status = "EXCLUDED" if is_excluded else f"PSNR-Y={psnr:.4f} dB"
-                print(f"\r[{'#'*fill}{'-'*(width-fill)}] {order}/{n} POC={poc} {status}",
-                      end="", flush=True)
-    finally:
-        if csv_fp:
-            csv_fp.close()
+            if poc in excluded:
+                row["skip_reason"] = "excluded_poc"
+            elif poc not in cameras:
+                row["skip_reason"] = "missing_target_camera"
+            else:
+                refs: List[int] = []
+                for ref in refs_from_csv[poc]:
+                    if (
+                        0 <= ref < total_frames
+                        and ref in cameras
+                        and ref != poc
+                        and ref not in refs
+                    ):
+                        refs.append(ref)
+
+                fallback = poc - a.default_ref_offset
+                if not refs and 0 <= fallback < total_frames and fallback in cameras:
+                    refs.append(fallback)
+
+                refs = refs[:a.max_refs]
+                if a.reference_mode == "first":
+                    refs = refs[:1]
+                row["reference_pocs"] = "|".join(map(str, refs))
+
+                if not refs:
+                    row["skip_reason"] = "no_reference"
+                else:
+                    target_y = read_y(
+                        video_fp, poc, a.width, a.height, a.video_stored_bit_shift
+                    )
+                    projections: List[Tuple[np.ndarray, np.ndarray]] = []
+
+                    for ref in refs:
+                        ref_y = read_y(
+                            video_fp, ref, a.width, a.height, a.video_stored_bit_shift
+                        )
+                        ref_depth_y = read_y(
+                            depth_fp, ref, a.width, a.height, a.depth_stored_bit_shift
+                        )
+                        projections.append(
+                            forward_project_y(
+                                ref_y,
+                                ref_depth_y,
+                                cameras[ref],
+                                cameras[poc],
+                                depth_scale,
+                                a.min_depth,
+                                a.max_depth,
+                            )
+                        )
+
+                    if a.reference_mode == "average" and len(projections) > 1:
+                        projected_y, valid = combine_projections(projections)
+                    else:
+                        projected_y, valid = projections[0]
+
+                    metrics = calculate_metrics(target_y, projected_y, valid, a.peak_value)
+                    row.update(
+                        {
+                            "valid_pixels": metrics["valid_pixels"],
+                            "valid_ratio": metrics["valid_ratio"],
+                            "sse_y": metrics["sse"],
+                            "mse_y": metrics["mse"],
+                            "psnr_y": metrics["psnr"],
+                            "mae_y": metrics["mae"],
+                            "max_abs_error_y": metrics["max_abs_error"],
+                        }
+                    )
+
+                    if metrics["valid_pixels"] == 0:
+                        row["skip_reason"] = "no_valid_projection"
+                    elif metrics["valid_ratio"] < a.min_valid_ratio:
+                        row["skip_reason"] = "below_min_valid_ratio"
+                    else:
+                        row["measured"] = 1
+                        measured_frames += 1
+                        total_sse += metrics["sse"]
+                        total_valid_pixels += int(metrics["valid_pixels"])
+
+            writer.writerow(row)
+            frame_rows.append(row)
+
+            progress = order_idx / len(coding_order)
+            bar_width = 30
+            filled = int(round(bar_width * progress))
+            if row["measured"]:
+                status = f"PSNR={float(row['psnr_y']):.4f}"
+            else:
+                status = row["skip_reason"]
+            print(
+                f"\r[{'#' * filled}{'-' * (bar_width - filled)}] "
+                f"{order_idx}/{len(coding_order)} POC={poc} {status}",
+                end="",
+                flush=True,
+            )
     print()
 
-    overall_mse, overall_psnr = metric_from_sse(total_sse, included_pixels, a.peak_value)
-    mean_frame_psnr = float(np.mean([float(r["psnr_y"]) for r in rows])) if rows else float("inf")
-    mean_frame_mae = float(np.mean([float(r["mae_y"]) for r in rows])) if rows else 0.0
-    max_abs_error = float(max((float(r["max_abs_error_y"]) for r in rows), default=0.0))
+    overall_mse = total_sse / total_valid_pixels if total_valid_pixels > 0 else 0.0
+    overall_psnr = (
+        float("nan")
+        if total_valid_pixels == 0
+        else float("inf")
+        if overall_mse == 0.0
+        else 10.0 * math.log10((a.peak_value * a.peak_value) / overall_mse)
+    )
+
+    frame_psnrs = [float(r["psnr_y"]) for r in frame_rows if r["measured"]]
+    mean_frame_psnr = float(np.mean(frame_psnrs)) if frame_psnrs else float("nan")
 
     summary = {
-        "metric": "direct depth-code Y-plane PSNR",
-        "metric_domain": "10-bit Y code values; not physical-depth PSNR and not projected texture/video PSNR",
-        "gt_depth_yuv": a.gt_depth_yuv,
-        "recon_depth_yuv": a.recon_depth_yuv,
+        "version": "2026-07-13-projection-y-psnr-from-input-depth-v1",
+        "metric": "projection Y PSNR",
+        "rdo_simulation": False,
+        "encoding_simulation": False,
+        "plane_fitting": False,
+        "depth_source": "--input-depth-yuv used directly as reference depth",
+        "video_yuv": a.video_yuv,
+        "input_depth_yuv": a.input_depth_yuv,
+        "camera_param": a.camera_param,
+        "mv_csv": a.mv_csv,
         "width": a.width,
         "height": a.height,
-        "gt_frame_count": gt_count,
-        "recon_frame_count": recon_count,
-        "common_frame_count": common_count,
         "start_frame": start,
         "end_frame_exclusive": end,
-        "included_frame_count": included_frames,
-        "excluded_frame_count": excluded_frames,
-        "exclude_pocs": sorted(excluded),
-        "gt_stored_bit_shift": a.gt_stored_bit_shift,
-        "recon_stored_bit_shift": a.recon_stored_bit_shift,
+        "coding_order": a.coding_order,
+        "coding_poc_order": coding_order,
+        "ra_gop_size": a.ra_gop_size,
+        "excluded_pocs": sorted(excluded),
+        "reference_mode": a.reference_mode,
+        "default_ref_offset": a.default_ref_offset,
+        "max_refs": a.max_refs,
+        "depth_scale_real": depth_scale,
         "peak_value": a.peak_value,
-        "included_y_pixel_count": included_pixels,
+        "measured_frame_count": measured_frames,
+        "aggregate_valid_pixels": total_valid_pixels,
         "overall_sse_y": total_sse,
         "overall_mse_y": overall_mse,
-        "overall_psnr_y": overall_psnr,
-        "overall_psnr_definition": "10*log10(peak^2/(sum included SSE/sum included Y pixels))",
-        "arithmetic_mean_frame_psnr_y": mean_frame_psnr,
-        "average_frame_mae_y": mean_frame_mae,
-        "maximum_abs_error_y": max_abs_error,
-        "per_frame_metrics": rows,
+        "overall_projection_psnr_y": overall_psnr,
+        "mean_frame_projection_psnr_y": mean_frame_psnr,
+        "overall_metric_scope": "valid projected Y pixels of non-excluded measured frames",
+        "frames": frame_rows,
+        "out_frame_csv": a.out_frame_csv,
     }
-    if json_path:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(f"GT depth YUV       : {a.gt_depth_yuv}")
-    print(f"Recon depth YUV    : {a.recon_depth_yuv}")
-    print(f"Frame range        : [{start}, {end})")
-    print(f"Excluded POCs      : {sorted(excluded) or 'none'}")
-    print(f"Included frames    : {included_frames}")
-    print(f"Excluded frames    : {excluded_frames}")
-    print(f"Overall SSE-Y      : {total_sse:.6f}")
-    print(f"Overall MSE-Y      : {overall_mse:.12f}")
-    print(f"Overall PSNR-Y     : {overall_psnr:.6f} dB")
-    print(f"Mean frame PSNR-Y  : {mean_frame_psnr:.6f} dB")
-    print(f"Average frame MAE-Y: {mean_frame_mae:.6f}")
-    print(f"Maximum abs error-Y: {max_abs_error:.6f}")
-    if csv_path:
-        print(f"Frame CSV          : {csv_path}")
-    if json_path:
-        print(f"Summary JSON       : {json_path}")
+    with open(a.out_summary_json, "w", encoding="utf-8") as fp:
+        json.dump(summary, fp, indent=2, ensure_ascii=False)
+
+    print(f"Measured frames               : {measured_frames}")
+    print(f"Aggregate valid pixels        : {total_valid_pixels}")
+    print(f"Overall projection MSE-Y      : {overall_mse:.12f}")
+    print(f"Overall projection PSNR-Y     : {overall_psnr:.6f} dB")
+    print(f"Mean frame projection PSNR-Y  : {mean_frame_psnr:.6f} dB")
+    print(f"Frame CSV                     : {a.out_frame_csv}")
+    print(f"Summary JSON                  : {a.out_summary_json}")
 
 
 if __name__ == "__main__":
