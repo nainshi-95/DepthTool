@@ -8,12 +8,14 @@ Input MV CSV columns:
 
 Behavior:
   1) Each 4x4 MV observation is converted to a closed-form depth estimate.
-  2) For every larger fitting block (default 16x16), all valid MV-derived
-     depth points inside the block are collected.
+  2) The current fit-block never uses its own MV observations. For each current
+     fit-block, only MV-derived depth points from the left, top, and top-left
+     fit-blocks are collected. This emulates a causal predictor available before
+     decoding the current block motion.
   3) A robust inverse-depth plane
          1 / z(x,y) = a * (x-cx) + b * (y-cy) + c
      is fitted using IRLS.
-  4) The fitted plane fills the entire fitting block.
+  4) The fitted/extrapolated plane fills the current fitting block.
   5) For bi-prediction, L0/L1 observations are treated as independent
      constraints. They are fused by robust fitting rather than simple averaging.
   6) Blocks with too few or geometrically unstable samples remain zero.
@@ -567,40 +569,68 @@ def build_block_fit_jobs(
     neighborhood: int,
     min_points: int,
 ) -> List[Dict[str, Any]]:
+    """Build causal predictor jobs from left/top/top-left fit-blocks only.
+
+    ``neighborhood`` is retained in the function signature and CLI for backward
+    compatibility, but is intentionally ignored in this predictor mode. The
+    current fit-block contributes no MV/depth observations.
+    """
+    del neighborhood
+
     if not observations:
         return []
 
-    xs_all = np.asarray([o.x for o in observations], dtype=np.float64)
-    ys_all = np.asarray([o.y for o in observations], dtype=np.float64)
-    ds_all = np.asarray([o.depth for o in observations], dtype=np.float64)
-    es_all = np.asarray([o.reproj_error for o in observations], dtype=np.float64)
+    # Bin every valid MV-derived depth point into the fit-block that contains
+    # its 4x4 center. This is substantially faster than scanning all points for
+    # every target block.
+    block_obs: Dict[Tuple[int, int], List[DepthObservation]] = {}
+    for o in observations:
+        gx = int(o.x) // fit_block
+        gy = int(o.y) // fit_block
+        block_obs.setdefault((gx, gy), []).append(o)
 
     jobs: List[Dict[str, Any]] = []
+    grid_w = (width + fit_block - 1) // fit_block
+    grid_h = (height + fit_block - 1) // fit_block
 
-    for by in range(0, height, fit_block):
+    for gy in range(grid_h):
+        by = gy * fit_block
         bh = min(fit_block, height - by)
         cy = by + (bh - 1) * 0.5
 
-        y0 = by - neighborhood
-        y1 = by + bh + neighborhood
-
-        for bx in range(0, width, fit_block):
+        for gx in range(grid_w):
+            bx = gx * fit_block
             bw = min(fit_block, width - bx)
             cx = bx + (bw - 1) * 0.5
 
-            x0 = bx - neighborhood
-            x1 = bx + bw + neighborhood
+            # Raster-causal neighboring fit-blocks. Never include (gx, gy).
+            source_keys = []
+            if gx > 0:
+                source_keys.append((gx - 1, gy))       # left
+            if gy > 0:
+                source_keys.append((gx, gy - 1))       # top
+            if gx > 0 and gy > 0:
+                source_keys.append((gx - 1, gy - 1))   # top-left
 
-            mask = (
-                (xs_all >= x0)
-                & (xs_all < x1)
-                & (ys_all >= y0)
-                & (ys_all < y1)
-            )
+            selected: List[DepthObservation] = []
+            source_counts = {"left": 0, "top": 0, "top_left": 0}
+            for key in source_keys:
+                vals = block_obs.get(key, [])
+                selected.extend(vals)
+                if key == (gx - 1, gy):
+                    source_counts["left"] += len(vals)
+                elif key == (gx, gy - 1):
+                    source_counts["top"] += len(vals)
+                else:
+                    source_counts["top_left"] += len(vals)
 
-            idx = np.flatnonzero(mask)
-            if idx.size < min_points:
+            if len(selected) < min_points:
                 continue
+
+            xs = np.asarray([o.x for o in selected], dtype=np.float64)
+            ys = np.asarray([o.y for o in selected], dtype=np.float64)
+            depths = np.asarray([o.depth for o in selected], dtype=np.float64)
+            errors = np.asarray([o.reproj_error for o in selected], dtype=np.float64)
 
             jobs.append(
                 {
@@ -610,10 +640,13 @@ def build_block_fit_jobs(
                     "bh": bh,
                     "cx": cx,
                     "cy": cy,
-                    "xs": xs_all[idx],
-                    "ys": ys_all[idx],
-                    "depths": ds_all[idx],
-                    "errors": es_all[idx],
+                    "xs": xs,
+                    "ys": ys,
+                    "depths": depths,
+                    "errors": errors,
+                    "source_left_points": source_counts["left"],
+                    "source_top_points": source_counts["top"],
+                    "source_top_left_points": source_counts["top_left"],
                 }
             )
 
@@ -703,7 +736,7 @@ def print_progress(frame_idx: int, num_frames: int, valid_obs: int, valid_ratio:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Estimate smoother depth from 4x4 MV CSV using 16x16 robust inverse-depth planes."
+        description="Predict each fit-block depth using only left/top/top-left fit-block MV-derived depths."
     )
     ap.add_argument("--mv-csv", required=True)
     ap.add_argument("--camera-param", required=True)
@@ -722,8 +755,11 @@ def main() -> None:
     ap.add_argument(
         "--neighborhood",
         type=int,
-        default=8,
-        help="Extra surrounding pixels used when collecting MV depth points.",
+        default=0,
+        help=(
+            "Deprecated compatibility option. In causal predictor mode, only "
+            "the left/top/top-left fit-blocks are used and this value is ignored."
+        ),
     )
     ap.add_argument("--min-points", type=int, default=4)
 
@@ -806,7 +842,8 @@ def main() -> None:
 
     print(f"device           : {device}")
     print(f"fit block        : {args.fit_block}x{args.fit_block}")
-    print(f"neighborhood     : {args.neighborhood}")
+    print("predictor source : left + top + top-left fit-blocks only")
+    print("current block MV : disabled")
     print(f"depth scale real : {depth_scale_real:.12g}")
 
     depth_frames: List[np.ndarray] = []
@@ -906,7 +943,9 @@ def main() -> None:
                 "height": args.height,
                 "num_frames": args.num_frames,
                 "fit_block": args.fit_block,
-                "neighborhood": args.neighborhood,
+                "predictor_neighbors": ["left", "top", "top_left"],
+                "current_block_mv_used": False,
+                "neighborhood_legacy_ignored": args.neighborhood,
                 "min_points": args.min_points,
                 "device": device,
                 "depth_scale_real": depth_scale_real,
