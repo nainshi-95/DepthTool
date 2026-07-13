@@ -583,6 +583,30 @@ def derive_lambda(args):
     return args.lambda_rd if args.lambda_rd is not None else args.lambda_scale * 2.0 ** ((args.qp - 12.0) / 3.0)
 
 
+
+def parse_poc_set(text: str) -> set[int]:
+    """Parse comma-separated POCs and inclusive ranges, e.g. 0,32,64-96."""
+    result: set[int] = set()
+    text = str(text).strip()
+    if not text:
+        return result
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            lo_s, hi_s = token.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+            if hi < lo:
+                raise ValueError(f"Invalid POC range: {token}")
+            result.update(range(lo, hi + 1))
+        else:
+            result.add(int(token))
+    if any(x < 0 for x in result):
+        raise ValueError("POCs must be non-negative")
+    return result
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="GT depth fixed-block candidate RDO simulator with predictor-only and implicit depth-buffer reuse")
     p.add_argument("--gt-depth-yuv", required=True)
@@ -597,6 +621,25 @@ def parse_args():
     p.add_argument("--depth-buffer-downsample", type=int, default=4)
     p.add_argument("--max-forward-refs", type=int, default=2)
     p.add_argument("--default-ref-offset", type=int, default=1)
+    p.add_argument(
+        "--zero-anchor-pocs",
+        default="",
+        help=(
+            "Comma-separated POCs/ranges to exclude from depth coding RDO and "
+            "write as all-zero depth frames, e.g. '0,32' or '0,32,64-96'. "
+            "These POCs cost zero depth bits and do not update probability models."
+        ),
+    )
+    p.add_argument(
+        "--exclude-zero-anchors-as-forward-refs",
+        action="store_true",
+        help=(
+            "Also prohibit POCs listed by --zero-anchor-pocs from being used as "
+            "GT-depth forward-warp references. Without this flag, skipped anchor "
+            "frames are still valid forward references because reference depth "
+            "is read directly from the GT depth sequence."
+        ),
+    )
     p.add_argument("--min-forward-valid-ratio", type=float, default=0.25)
     p.add_argument("--candidate-idx-coding", choices=["fixed","truncated_unary"], default="truncated_unary")
     p.add_argument("--disable-buffer-reuse", action="store_true")
@@ -651,6 +694,9 @@ def main():
     end = total if a.num_frames == 0 else min(total, start + a.num_frames)
     if start < 0 or start >= end: raise ValueError("Invalid frame range")
 
+    zero_anchor_pocs = parse_poc_set(a.zero_anchor_pocs)
+    zero_anchor_pocs_in_range = sorted(p for p in zero_anchor_pocs if start <= p < end)
+
     rows, block_refs = load_mv_csv(a.mv_csv, total, a.block_size)
     qa, qb, qc = qp_steps(a); lam = derive_lambda(a)
     lw = int(math.ceil(a.width / a.forward_downsample)); lh = int(math.ceil(a.height / a.forward_downsample))
@@ -677,9 +723,13 @@ def main():
     print(f"block={a.block_size}, no split, forward={lw}x{lh}, reuse={dbw}x{dbh}, QP={a.qp}")
     print(f"qsteps={qa:.6g},{qb:.6g},{qc:.6g}, lambda={lam:.6g}, depth_scale={scale:.12g}")
     print(f"adaptive probability: step={a.prob_update_step}, p_min={a.prob_min}, reset={a.prob_reset}")
+    print(f"zero anchor POCs    : {zero_anchor_pocs_in_range or 'none'}")
+    print(f"exclude as FW refs  : {a.exclude_zero_anchors_as_forward_refs}")
 
     fields = ["poc","x","y","w","h","mode","mode_probability_before","candidate_count","candidate_idx","candidate","candidate_probability_before","mode_bits","candidate_bits","residual_bits","total_bits","residual_present","buffer_no_signal","q_a","q_b","q_c","pred_a","pred_b","pred_c","gt_a","gt_b","gt_c","recon_a","recon_b","recon_c","sse","cost","forward_refs"]
     frames=[]; global_modes={}; global_cands={}; total_bits=0.0; total_sse=0.0
+    simulated_frame_count = 0
+    excluded_anchor_output_sse = 0.0
 
     with open(a.gt_depth_yuv,"rb") as fp, open(a.out_recon_yuv,"wb") as outfp, open(a.out_block_csv,"w",newline="",encoding="utf-8") as cfp:
         wr=csv.DictWriter(cfp,fieldnames=fields); wr.writeheader(); gt_cache={}
@@ -694,10 +744,67 @@ def main():
                 mode_model, candidate_model = sequence_mode_model, sequence_candidate_model
             if poc not in cams: raise KeyError(f"No camera for POC {poc}")
             gy=gt(poc); gz=gy*scale; recon=np.zeros_like(gy)
+
+            # Explicitly excluded I/anchor frame: no block RDO, no depth buffer,
+            # no probability update, and zero depth is written to the output.
+            if poc in zero_anchor_pocs:
+                write_depth_frame(outfp, recon, a.width, a.height)
+                anchor_sse = float(np.sum(gy * gy))
+                anchor_mse = anchor_sse / (a.width * a.height)
+                anchor_psnr = (
+                    float("inf") if anchor_mse == 0.0
+                    else 10.0 * math.log10(1023.0 ** 2 / anchor_mse)
+                )
+                excluded_anchor_output_sse += anchor_sse
+                frames.append({
+                    "poc": poc,
+                    "excluded_anchor": True,
+                    "zero_filled": True,
+                    "num_blocks": 0,
+                    "frame_bits": 0.0,
+                    "frame_bpp": 0.0,
+                    "frame_sse": anchor_sse,
+                    "frame_mse": anchor_mse,
+                    "frame_psnr": anchor_psnr,
+                    "frame_reference_pocs": [],
+                    "forward_buffers_built": [],
+                    "mode_selection_counts": {},
+                    "candidate_selection_counts": {},
+                    "buffer_reuse_ratio": 0.0,
+                    "predictor_only_ratio": 0.0,
+                    "predictor_residual_ratio": 0.0,
+                    "direct_ratio": 0.0,
+                    "final_mode_probabilities": mode_model.snapshot(),
+                    "final_candidate_probabilities": candidate_model.snapshot(),
+                })
+                ratio=(ord_idx+1)/(end-start); width=30; fill=int(round(width*ratio))
+                print(
+                    f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{end-start} "
+                    f"POC={poc} ANCHOR-SKIP bits=0 zero-filled",
+                    end="", flush=True,
+                )
+                continue
+
+            simulated_frame_count += 1
+
+            def ref_allowed(ref_poc: int) -> bool:
+                return not (
+                    a.exclude_zero_anchors_as_forward_refs
+                    and ref_poc in zero_anchor_pocs
+                )
+
             frame_refs=[]
             for r in rows[poc]:
-                if r.ref_poc!=poc and r.ref_poc in cams and r.ref_poc not in frame_refs: frame_refs.append(r.ref_poc)
-            if not frame_refs and poc-a.default_ref_offset in cams: frame_refs=[poc-a.default_ref_offset]
+                if (
+                    r.ref_poc != poc
+                    and r.ref_poc in cams
+                    and ref_allowed(r.ref_poc)
+                    and r.ref_poc not in frame_refs
+                ):
+                    frame_refs.append(r.ref_poc)
+            default_ref = poc - a.default_ref_offset
+            if not frame_refs and default_ref in cams and ref_allowed(default_ref):
+                frame_refs = [default_ref]
             frame_refs=frame_refs[:a.max_forward_refs]
             fw_cache={ref:forward_warp_lowres(gt(ref)*scale,cams[ref],cams[poc],lw,lh) for ref in frame_refs if 0<=ref<total}
             reuse=DepthReuseBuffer(a.width,a.height,a.depth_buffer_downsample,a.min_depth)
@@ -727,7 +834,13 @@ def main():
                             if p is not None: cands.append(("spatial_all",p))
 
                         for ref in block_refs[poc].get((bxi,byi),[]):
-                            if ref!=poc and ref in cams and ref not in refs: refs.append(ref)
+                            if (
+                                ref != poc
+                                and ref in cams
+                                and ref_allowed(ref)
+                                and ref not in refs
+                            ):
+                                refs.append(ref)
                         for ref in frame_refs:
                             if ref not in refs: refs.append(ref)
                         refs=refs[:a.max_forward_refs]; fw_blocks=[]
@@ -812,10 +925,76 @@ def main():
             print(f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{end-start} POC={poc} bits={fbits:.1f} reuse={fmodes.get('buffer_reuse',0)/nblocks:.3f} predOnly={fmodes.get('predictor_only',0)/nblocks:.3f} PSNR={psnr:.3f}",end="",flush=True)
     print()
 
-    pixels=a.width*a.height*(end-start); mse=total_sse/pixels; psnr=float("inf") if mse==0 else 10*math.log10(1023**2/mse)
-    summary={"gt_depth_yuv":a.gt_depth_yuv,"camera_param":a.camera_param,"mv_csv":a.mv_csv,"width":a.width,"height":a.height,"start_frame":start,"num_frames":end-start,"block_size":a.block_size,"block_split":False,"forward_downsample":a.forward_downsample,"forward_buffer_size":[lw,lh],"depth_buffer_downsample":a.depth_buffer_downsample,"depth_buffer_size":[dbw,dbh],"depth_buffer_rule":"all covered cells valid -> implicit zero-bit reuse; otherwise run explicit RDO and commit winner","reference_depth_source":"GT depth frame","depth_scale_real":scale,"plane_equation":"1/z = a*(x-cx)+b*(y-cy)+c","qp":a.qp,"qp_ref":a.qp_ref,"quantization":{"qa":qa,"qb":qb,"qc":qc,"formula":"base*2^((QP-QP_ref)/6)"},"lambda_rd":lam,"rate_model":{"buffer_reuse":"0 bits","direct":"1 mode bit + se(q_a,q_b,q_c)","predictor_only":"2 mode bits + candidate_idx","predictor_residual":"2 mode bits + candidate_idx + se(q_a,q_b,q_c)","candidate_idx_coding":"adaptive -log2(p) with fw_ref class split among occurrences"},"probability_model":{"update":"selected += step; every unselected symbol -= step; clip and normalize","update_step":a.prob_update_step,"p_min":a.prob_min,"reset":a.prob_reset,"mode_symbols":mode_symbols,"candidate_symbols":candidate_symbols,"final_mode_probabilities":sequence_mode_model.snapshot(),"final_candidate_probabilities":sequence_candidate_model.snapshot()},"candidate_types":["left","top","top_left","spatial_all","fw_ref_<POC>","fw_average"],"mode_types":["buffer_reuse","predictor_only","predictor_residual","direct"],"total_bits":total_bits,"overall_bpp":total_bits/pixels,"overall_sse":total_sse,"overall_mse":mse,"overall_psnr":psnr,"mode_selection_counts":global_modes,"candidate_selection_counts":global_cands,"frames":frames,"out_recon_yuv":a.out_recon_yuv,"out_block_csv":a.out_block_csv}
+    simulated_pixels = a.width * a.height * simulated_frame_count
+    if simulated_pixels > 0:
+        mse = total_sse / simulated_pixels
+        psnr = float("inf") if mse == 0 else 10 * math.log10(1023**2 / mse)
+        overall_bpp = total_bits / simulated_pixels
+    else:
+        mse = 0.0
+        psnr = float("inf")
+        overall_bpp = 0.0
+    summary={
+        "gt_depth_yuv":a.gt_depth_yuv,
+        "camera_param":a.camera_param,
+        "mv_csv":a.mv_csv,
+        "width":a.width,
+        "height":a.height,
+        "start_frame":start,
+        "num_frames":end-start,
+        "simulated_frame_count":simulated_frame_count,
+        "zero_anchor_pocs":sorted(zero_anchor_pocs),
+        "zero_anchor_pocs_in_range":zero_anchor_pocs_in_range,
+        "exclude_zero_anchors_as_forward_refs":bool(a.exclude_zero_anchors_as_forward_refs),
+        "zero_anchor_rule":"no block RDO, zero depth output, zero depth bits, no buffer/probability update",
+        "block_size":a.block_size,
+        "block_split":False,
+        "forward_downsample":a.forward_downsample,
+        "forward_buffer_size":[lw,lh],
+        "depth_buffer_downsample":a.depth_buffer_downsample,
+        "depth_buffer_size":[dbw,dbh],
+        "depth_buffer_rule":"all covered cells valid -> implicit zero-bit reuse; otherwise run explicit RDO and commit winner",
+        "reference_depth_source":"GT depth frame; skipped anchors remain usable unless --exclude-zero-anchors-as-forward-refs is set",
+        "depth_scale_real":scale,
+        "plane_equation":"1/z = a*(x-cx)+b*(y-cy)+c",
+        "qp":a.qp,
+        "qp_ref":a.qp_ref,
+        "quantization":{"qa":qa,"qb":qb,"qc":qc,"formula":"base*2^((QP-QP_ref)/6)"},
+        "lambda_rd":lam,
+        "rate_model":{
+            "buffer_reuse":"0 bits",
+            "direct":"adaptive mode bits + se(q_a,q_b,q_c)",
+            "predictor_only":"adaptive mode bits + adaptive candidate bits",
+            "predictor_residual":"adaptive mode bits + adaptive candidate bits + se(q_a,q_b,q_c)",
+            "candidate_idx_coding":"adaptive -log2(p) with fw_ref class split among occurrences"
+        },
+        "probability_model":{
+            "update":"selected += step; every unselected symbol -= step; clip and normalize",
+            "update_step":a.prob_update_step,
+            "p_min":a.prob_min,
+            "reset":a.prob_reset,
+            "mode_symbols":mode_symbols,
+            "candidate_symbols":candidate_symbols,
+            "final_mode_probabilities":sequence_mode_model.snapshot(),
+            "final_candidate_probabilities":sequence_candidate_model.snapshot()
+        },
+        "candidate_types":["left","top","top_left","spatial_all","fw_ref_<POC>","fw_average"],
+        "mode_types":["buffer_reuse","predictor_only","predictor_residual","direct"],
+        "total_bits":total_bits,
+        "overall_bpp":overall_bpp,
+        "overall_sse":total_sse,
+        "overall_mse":mse,
+        "overall_psnr":psnr,
+        "overall_metric_scope":"non-excluded simulated frames only",
+        "excluded_anchor_output_sse":excluded_anchor_output_sse,
+        "mode_selection_counts":global_modes,
+        "candidate_selection_counts":global_cands,
+        "frames":frames,
+        "out_recon_yuv":a.out_recon_yuv,
+        "out_block_csv":a.out_block_csv
+    }
     with open(a.out_summary_json,"w",encoding="utf-8") as f: json.dump(summary,f,indent=2,ensure_ascii=False)
-    print(f"Recon YUV : {a.out_recon_yuv}\nBlock CSV : {a.out_block_csv}\nSummary   : {a.out_summary_json}\nTotal bits: {total_bits:.3f}\nBPP       : {summary['overall_bpp']:.9f}\nPSNR      : {psnr:.6f} dB")
+    print(f"Recon YUV : {a.out_recon_yuv}\nBlock CSV : {a.out_block_csv}\nSummary   : {a.out_summary_json}\nTotal bits: {total_bits:.3f}\nBPP       : {overall_bpp:.9f}\nPSNR      : {psnr:.6f} dB")
 
 
 if __name__ == "__main__":
