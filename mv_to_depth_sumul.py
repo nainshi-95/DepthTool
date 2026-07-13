@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""VERSION: 2026-07-13-v3
+"""VERSION: 2026-07-13-v4-adaptive-residual
 
 Fixed-block depth predictor candidate RDO simulator.
 
@@ -24,6 +24,7 @@ depth, never GT depth.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -92,6 +93,15 @@ def signed_to_code_num(v: int) -> int:
 def se_bits(v: int) -> int:
     u = signed_to_code_num(int(v))
     return 2 * int(math.floor(math.log2(u + 1))) + 1
+
+
+
+def ue_bits(v: int) -> int:
+    """Unsigned Exp-Golomb bit count for a non-negative integer."""
+    v = int(v)
+    if v < 0:
+        raise ValueError("ue_bits expects a non-negative integer")
+    return 2 * int(math.floor(math.log2(v + 1))) + 1
 
 
 def frame_size(w: int, h: int) -> int:
@@ -522,6 +532,84 @@ class SimpleAdaptiveProb:
         return dict(self.probs)
 
 
+class AdaptiveResidualCoder:
+    """Adaptive residual syntax for q_a/q_b/q_c.
+
+    q_a and q_b share one probability distribution. q_c uses an independent
+    distribution. Each coefficient is coded as:
+      1) zero/nonzero adaptive symbol
+      2) if nonzero, one fixed sign bit
+      3) adaptive magnitude class: 1, 2, 3, 4, or gt4
+      4) for gt4, ue(abs(q)-5)
+
+    The coding order is q_a, q_b, q_c. Therefore q_b uses the a/b model after
+    q_a has already updated it, exactly as a causal decoder would.
+    """
+
+    MAG_SYMBOLS = ["1", "2", "3", "4", "gt4"]
+
+    def __init__(self, update_step: float, p_min: float):
+        self.ab_zero = SimpleAdaptiveProb(["zero", "nonzero"], update_step, p_min, "residual_ab_zero")
+        self.ab_mag = SimpleAdaptiveProb(self.MAG_SYMBOLS, update_step, p_min, "residual_ab_mag")
+        self.c_zero = SimpleAdaptiveProb(["zero", "nonzero"], update_step, p_min, "residual_c_zero")
+        self.c_mag = SimpleAdaptiveProb(self.MAG_SYMBOLS, update_step, p_min, "residual_c_mag")
+
+    @staticmethod
+    def magnitude_symbol(q: int) -> str:
+        m = abs(int(q))
+        if m <= 0:
+            raise ValueError("magnitude_symbol requires nonzero q")
+        return str(m) if m <= 4 else "gt4"
+
+    @staticmethod
+    def _one_bits(q: int, zero_model: SimpleAdaptiveProb, mag_model: SimpleAdaptiveProb, update: bool) -> float:
+        q = int(q)
+        nz = q != 0
+        zero_symbol = "nonzero" if nz else "zero"
+        bits = zero_model.bits(zero_symbol)
+        if update:
+            zero_model.update(zero_symbol)
+        if not nz:
+            return bits
+
+        bits += 1.0  # sign is fixed 50:50
+        mag = abs(q)
+        mag_symbol = AdaptiveResidualCoder.magnitude_symbol(q)
+        bits += mag_model.bits(mag_symbol)
+        if mag > 4:
+            bits += float(ue_bits(mag - 5))
+        if update:
+            mag_model.update(mag_symbol)
+        return bits
+
+    def bits_each(self, q: Sequence[int]) -> Tuple[float, float, float]:
+        if len(q) != 3:
+            raise ValueError("Residual vector must have three coefficients")
+        temp = copy.deepcopy(self)
+        ba = temp._one_bits(int(q[0]), temp.ab_zero, temp.ab_mag, True)
+        bb = temp._one_bits(int(q[1]), temp.ab_zero, temp.ab_mag, True)
+        bc = temp._one_bits(int(q[2]), temp.c_zero, temp.c_mag, True)
+        return float(ba), float(bb), float(bc)
+
+    def bits(self, q: Sequence[int]) -> float:
+        return float(sum(self.bits_each(q)))
+
+    def update(self, q: Sequence[int]) -> None:
+        if len(q) != 3:
+            raise ValueError("Residual vector must have three coefficients")
+        self._one_bits(int(q[0]), self.ab_zero, self.ab_mag, True)
+        self._one_bits(int(q[1]), self.ab_zero, self.ab_mag, True)
+        self._one_bits(int(q[2]), self.c_zero, self.c_mag, True)
+
+    def snapshot(self) -> Dict[str, Dict[str, float]]:
+        return {
+            "ab_zero_nonzero": self.ab_zero.snapshot(),
+            "ab_magnitude": self.ab_mag.snapshot(),
+            "c_zero_nonzero": self.c_zero.snapshot(),
+            "c_magnitude": self.c_mag.snapshot(),
+        }
+
+
 def candidate_probability_class(name: str) -> str:
     return "fw_ref" if name.startswith("fw_ref_") else name
 
@@ -546,6 +634,7 @@ class RDResult:
     mode_bits: float
     candidate_bits: float
     residual_bits: float
+    residual_bits_each: Tuple[float, float, float]
     bits: float
     sse: float
     cost: float
@@ -637,7 +726,7 @@ def plane_to_recon_y(p: Plane, gt_y: np.ndarray, scale: float, grid: GridCache,
 
 def make_direct(actual: Plane, gt_y: np.ndarray, scale: float, qs, lam: float,
                 grid: GridCache, min_depth: float, max_depth: float,
-                adaptive_mode_bits: float) -> RDResult:
+                adaptive_mode_bits: float, residual_coder: AdaptiveResidualCoder) -> RDResult:
     qs = np.asarray(qs, np.float64)
     q = np.rint(np.array([actual.a, actual.b, actual.c]) / qs).astype(np.int64)
     d = q * qs
@@ -645,10 +734,11 @@ def make_direct(actual: Plane, gt_y: np.ndarray, scale: float, qs, lam: float,
     ry, _ = plane_to_recon_y(rec, gt_y, scale, grid, min_depth, max_depth)
     sse = float(np.sum((gt_y - ry) ** 2))
     mb = float(adaptive_mode_bits)
-    rb = float(sum(se_bits(int(v)) for v in q))
+    rb_each = residual_coder.bits_each(q)
+    rb = float(sum(rb_each))
     bits = mb + rb
     return RDResult("direct", "direct", Plane(0,0,0,actual.cx,actual.cy), rec,
-                    tuple(map(int,q)), -1, mb, 0.0, rb, bits, sse,
+                    tuple(map(int,q)), -1, mb, 0.0, rb, rb_each, bits, sse,
                     sse + lam * bits, ry, True, False)
 
 
@@ -662,13 +752,14 @@ def make_predictor_only(name: str, pred: Plane, idx: int, n: int, gt_y: np.ndarr
     cb = float(adaptive_candidate_bits_value)
     bits = mb + cb
     return RDResult("predictor_only", name, pred, pred, (0,0,0), idx,
-                    mb, cb, 0.0, bits, sse, sse + lam * bits, ry, False, False)
+                    mb, cb, 0.0, (0.0, 0.0, 0.0), bits, sse, sse + lam * bits, ry, False, False)
 
 
 def make_predictor_residual(name: str, pred: Plane, actual: Plane, idx: int, n: int,
                             gt_y: np.ndarray, scale: float, coding: str, qs, lam: float,
                             grid: GridCache, min_depth: float, max_depth: float,
-                            adaptive_mode_bits: float, adaptive_candidate_bits_value: float) -> RDResult:
+                            adaptive_mode_bits: float, adaptive_candidate_bits_value: float,
+                            residual_coder: AdaptiveResidualCoder) -> RDResult:
     qs = np.asarray(qs, np.float64)
     q = np.rint(np.array([actual.a-pred.a, actual.b-pred.b, actual.c-pred.c]) / qs).astype(np.int64)
     d = q * qs
@@ -677,10 +768,11 @@ def make_predictor_residual(name: str, pred: Plane, actual: Plane, idx: int, n: 
     sse = float(np.sum((gt_y - ry) ** 2))
     mb = float(adaptive_mode_bits)
     cb = float(adaptive_candidate_bits_value)
-    rb = float(sum(se_bits(int(v)) for v in q))
+    rb_each = residual_coder.bits_each(q)
+    rb = float(sum(rb_each))
     bits = mb + cb + rb
     return RDResult("predictor_residual", name, pred, rec, tuple(map(int,q)), idx,
-                    mb, cb, rb, bits, sse, sse + lam * bits, ry, True, False)
+                    mb, cb, rb, rb_each, bits, sse, sse + lam * bits, ry, True, False)
 
 
 def make_buffer_reuse(gt_y: np.ndarray, z: np.ndarray, scale: float, cx: float, cy: float,
@@ -692,7 +784,7 @@ def make_buffer_reuse(gt_y: np.ndarray, z: np.ndarray, scale: float, cx: float, 
     sse = float(np.sum((gt_y - ry) ** 2))
     p = fit_plane(z, cx, cy, grid, min_depth, valid) or Plane(0,0,0,cx,cy)
     return RDResult("buffer_reuse", "depth_buffer", p, p, (0,0,0), -1,
-                    0.0, 0.0, 0.0, 0.0, sse, sse, ry, False, True)
+                    0.0, 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, sse, sse, ry, False, True)
 
 
 def qp_steps(args):
@@ -848,9 +940,10 @@ def main():
         return (
             SimpleAdaptiveProb(mode_symbols, a.prob_update_step, a.prob_min, "mode"),
             SimpleAdaptiveProb(candidate_symbols, a.prob_update_step, a.prob_min, "candidate"),
+            AdaptiveResidualCoder(a.prob_update_step, a.prob_min),
         )
 
-    sequence_mode_model, sequence_candidate_model = new_probability_models()
+    sequence_mode_model, sequence_candidate_model, sequence_residual_coder = new_probability_models()
 
     print(f"block={a.block_size}, no split, forward={lw}x{lh}, reuse={dbw}x{dbh}, QP={a.qp}")
     print(f"qsteps={qa:.6g},{qb:.6g},{qc:.6g}, lambda={lam:.6g}, depth_scale={scale:.12g}")
@@ -861,7 +954,7 @@ def main():
     print("spatial source      : neighboring-block MV-derived depth")
     print("forward source      : reconstructed reference depth")
 
-    fields = ["poc","x","y","w","h","mode","mode_probability_before","candidate_count","candidate_idx","candidate","candidate_probability_before","mode_bits","candidate_bits","residual_bits","total_bits","residual_present","buffer_no_signal","q_a","q_b","q_c","pred_a","pred_b","pred_c","gt_a","gt_b","gt_c","recon_a","recon_b","recon_c","sse","cost","forward_refs"]
+    fields = ["poc","x","y","w","h","mode","mode_probability_before","candidate_count","candidate_idx","candidate","candidate_probability_before","mode_bits","candidate_bits","residual_bits","residual_bits_a","residual_bits_b","residual_bits_c","total_bits","residual_present","buffer_no_signal","q_a","q_b","q_c","pred_a","pred_b","pred_c","gt_a","gt_b","gt_c","recon_a","recon_b","recon_c","sse","cost","forward_refs"]
     frames=[]; global_modes={}; global_cands={}; total_bits=0.0; total_sse=0.0
     simulated_frame_count = 0
     excluded_anchor_output_sse = 0.0
@@ -875,9 +968,10 @@ def main():
 
         for ord_idx,poc in enumerate(coding_order):
             if a.prob_reset == "frame":
-                mode_model, candidate_model = new_probability_models()
+                mode_model, candidate_model, residual_coder = new_probability_models()
             else:
-                mode_model, candidate_model = sequence_mode_model, sequence_candidate_model
+                mode_model, candidate_model, residual_coder = (
+                    sequence_mode_model, sequence_candidate_model, sequence_residual_coder)
             if poc not in cams: raise KeyError(f"No camera for POC {poc}")
             gy=gt(poc); gz=gy*scale; recon=np.zeros_like(gy)
 
@@ -914,6 +1008,7 @@ def main():
                     "direct_ratio": 0.0,
                     "final_mode_probabilities": mode_model.snapshot(),
                     "final_candidate_probabilities": candidate_model.snapshot(),
+                    "final_residual_probabilities": residual_coder.snapshot(),
                 })
                 ratio=(ord_idx+1)/len(coding_order); width=30; fill=int(round(width*ratio))
                 print(
@@ -1029,7 +1124,7 @@ def main():
                             results.append(make_direct(
                                 actual, gyb, scale, (qa,qb,qc), lam, grid,
                                 a.min_depth, a.max_depth,
-                                mode_model.bits("direct", available_modes)))
+                                mode_model.bits("direct", available_modes), residual_coder))
 
                         for idx,(name,pred) in enumerate(cands):
                             cbits = adaptive_candidate_bits(candidate_model, name, available_candidate_names)
@@ -1042,7 +1137,8 @@ def main():
                                 results.append(make_predictor_residual(
                                     name,pred,actual,idx,len(cands),gyb,scale,a.candidate_idx_coding,
                                     (qa,qb,qc),lam,grid,a.min_depth,a.max_depth,
-                                    mode_model.bits("predictor_residual", available_modes), cbits))
+                                    mode_model.bits("predictor_residual", available_modes), cbits,
+                                    residual_coder))
 
                         if not results: raise RuntimeError(f"No RDO mode at POC={poc}, block=({bx},{by})")
                         best=min(results,key=lambda r:r.cost)
@@ -1064,6 +1160,8 @@ def main():
                         mode_model.update(best.mode)
                         if best.mode in ("predictor_only", "predictor_residual"):
                             candidate_model.update(candidate_probability_class(best.name))
+                        if best.residual_present:
+                            residual_coder.update(best.q)
 
                         reuse.commit(bx,by,best.recon_y*scale)
 
@@ -1071,13 +1169,13 @@ def main():
                     fbits+=best.bits; fsse+=best.sse
                     fmodes[best.mode]=fmodes.get(best.mode,0)+1; fcands[best.name]=fcands.get(best.name,0)+1
                     global_modes[best.mode]=global_modes.get(best.mode,0)+1; global_cands[best.name]=global_cands.get(best.name,0)+1
-                    wr.writerow({"poc":poc,"x":bx,"y":by,"w":bw,"h":bh,"mode":best.mode,"mode_probability_before":mode_prob_before,"candidate_count":len(cands),"candidate_idx":best.candidate_idx,"candidate":best.name,"candidate_probability_before":candidate_prob_before,"mode_bits":best.mode_bits,"candidate_bits":best.candidate_bits,"residual_bits":best.residual_bits,"total_bits":best.bits,"residual_present":int(best.residual_present),"buffer_no_signal":int(best.buffer_no_signal),"q_a":best.q[0],"q_b":best.q[1],"q_c":best.q[2],"pred_a":best.pred.a,"pred_b":best.pred.b,"pred_c":best.pred.c,"gt_a":actual.a,"gt_b":actual.b,"gt_c":actual.c,"recon_a":best.recon.a,"recon_b":best.recon.b,"recon_c":best.recon.c,"sse":best.sse,"cost":best.cost,"forward_refs":"|".join(map(str,refs))})
+                    wr.writerow({"poc":poc,"x":bx,"y":by,"w":bw,"h":bh,"mode":best.mode,"mode_probability_before":mode_prob_before,"candidate_count":len(cands),"candidate_idx":best.candidate_idx,"candidate":best.name,"candidate_probability_before":candidate_prob_before,"mode_bits":best.mode_bits,"candidate_bits":best.candidate_bits,"residual_bits":best.residual_bits,"residual_bits_a":best.residual_bits_each[0],"residual_bits_b":best.residual_bits_each[1],"residual_bits_c":best.residual_bits_each[2],"total_bits":best.bits,"residual_present":int(best.residual_present),"buffer_no_signal":int(best.buffer_no_signal),"q_a":best.q[0],"q_b":best.q[1],"q_c":best.q[2],"pred_a":best.pred.a,"pred_b":best.pred.b,"pred_c":best.pred.c,"gt_a":actual.a,"gt_b":actual.b,"gt_c":actual.c,"recon_a":best.recon.a,"recon_b":best.recon.b,"recon_c":best.recon.c,"sse":best.sse,"cost":best.cost,"forward_refs":"|".join(map(str,refs))})
 
             reconstructed_depth_frames[poc] = recon.copy()
             outfp.seek((poc-start) * frame_size(a.width, a.height))
             write_depth_frame(outfp,recon,a.width,a.height)
             mse=fsse/(a.width*a.height); psnr=float("inf") if mse==0 else 10*math.log10(1023**2/mse)
-            frames.append({"poc":poc,"num_blocks":nblocks,"frame_bits":fbits,"frame_bpp":fbits/(a.width*a.height),"frame_sse":fsse,"frame_mse":mse,"frame_psnr":psnr,"frame_reference_pocs":frame_refs,"forward_buffers_built":sorted(fw_cache.keys()),"mode_selection_counts":fmodes,"candidate_selection_counts":fcands,"buffer_reuse_ratio":fmodes.get("buffer_reuse",0)/nblocks,"predictor_only_ratio":fmodes.get("predictor_only",0)/nblocks,"predictor_residual_ratio":fmodes.get("predictor_residual",0)/nblocks,"direct_ratio":fmodes.get("direct",0)/nblocks,"final_mode_probabilities":mode_model.snapshot(),"final_candidate_probabilities":candidate_model.snapshot()})
+            frames.append({"poc":poc,"num_blocks":nblocks,"frame_bits":fbits,"frame_bpp":fbits/(a.width*a.height),"frame_sse":fsse,"frame_mse":mse,"frame_psnr":psnr,"frame_reference_pocs":frame_refs,"forward_buffers_built":sorted(fw_cache.keys()),"mode_selection_counts":fmodes,"candidate_selection_counts":fcands,"buffer_reuse_ratio":fmodes.get("buffer_reuse",0)/nblocks,"predictor_only_ratio":fmodes.get("predictor_only",0)/nblocks,"predictor_residual_ratio":fmodes.get("predictor_residual",0)/nblocks,"direct_ratio":fmodes.get("direct",0)/nblocks,"final_mode_probabilities":mode_model.snapshot(),"final_candidate_probabilities":candidate_model.snapshot(),"final_residual_probabilities":residual_coder.snapshot()})
             total_bits+=fbits; total_sse+=fsse
             ratio=(ord_idx+1)/len(coding_order); width=30; fill=int(round(width*ratio))
             print(f"\r[{'#'*fill}{'-'*(width-fill)}] {ord_idx+1}/{len(coding_order)} POC={poc} bits={fbits:.1f} reuse={fmodes.get('buffer_reuse',0)/nblocks:.3f} predOnly={fmodes.get('predictor_only',0)/nblocks:.3f} PSNR={psnr:.3f}",end="",flush=True)
@@ -1121,9 +1219,9 @@ def main():
         "lambda_rd":lam,
         "rate_model":{
             "buffer_reuse":"0 bits",
-            "direct":"adaptive mode bits + se(q_a,q_b,q_c)",
+            "direct":"adaptive mode bits + adaptive residual syntax",
             "predictor_only":"adaptive mode bits + adaptive candidate bits",
-            "predictor_residual":"adaptive mode bits + adaptive candidate bits + se(q_a,q_b,q_c)",
+            "predictor_residual":"adaptive mode bits + adaptive candidate bits + adaptive residual syntax",
             "candidate_idx_coding":"adaptive -log2(p) with fw_ref class split among occurrences"
         },
         "probability_model":{
@@ -1134,7 +1232,14 @@ def main():
             "mode_symbols":mode_symbols,
             "candidate_symbols":candidate_symbols,
             "final_mode_probabilities":sequence_mode_model.snapshot(),
-            "final_candidate_probabilities":sequence_candidate_model.snapshot()
+            "final_candidate_probabilities":sequence_candidate_model.snapshot(),
+            "residual_syntax": {
+                "ab_shared_distribution": True,
+                "c_separate_distribution": True,
+                "coding_order": ["q_a", "q_b", "q_c"],
+                "coefficient_syntax": "adaptive zero/nonzero; fixed 1-bit sign; adaptive magnitude class 1/2/3/4/gt4; ue(abs(q)-5) for gt4",
+                "final_probabilities": sequence_residual_coder.snapshot()
+            }
         },
         "candidate_types":["left(MV-derived)","top(MV-derived)","top_left(MV-derived)","spatial_all(MV-derived)","fw_ref_<POC>(recon-depth)","fw_average(recon-depth)"],
         "mode_types":["buffer_reuse","predictor_only","predictor_residual","direct"],
