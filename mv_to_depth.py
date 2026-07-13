@@ -31,6 +31,8 @@ import argparse
 import csv
 import json
 import math
+import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +62,44 @@ class DepthEstimate:
     reprojection_error: float
     valid: bool
     source: str
+
+
+def progress_iter(iterable, total, desc="Processing", min_interval=0.5):
+    """Yield items while printing a dependency-free progress bar to stderr."""
+    start = time.perf_counter()
+    last = 0.0
+    total = max(int(total), 0)
+    width = 32
+
+    for idx, item in enumerate(iterable, start=1):
+        now = time.perf_counter()
+        if idx == 1 or idx == total or now - last >= min_interval:
+            elapsed = max(now - start, 1e-9)
+            rate = idx / elapsed
+            remaining = (total - idx) / rate if rate > 0 else float("inf")
+            frac = idx / total if total > 0 else 1.0
+            filled = min(width, int(round(frac * width)))
+            bar = "#" * filled + "-" * (width - filled)
+            eta = "--:--" if not math.isfinite(remaining) else time.strftime("%M:%S", time.gmtime(max(0.0, remaining)))
+            sys.stderr.write(
+                f"\r{desc} [{bar}] {idx}/{total} "
+                f"({frac * 100:6.2f}%) | {rate:8.1f} groups/s | ETA {eta}"
+            )
+            sys.stderr.flush()
+            last = now
+        yield item
+
+    if total == 0:
+        sys.stderr.write(f"\r{desc} [" + "#" * width + "] 0/0 (100.00%)\n")
+    else:
+        elapsed = max(time.perf_counter() - start, 1e-9)
+        rate = total / elapsed
+        sys.stderr.write(
+            f"\r{desc} [" + "#" * width + f"] {total}/{total} "
+            f"(100.00%) | {rate:8.1f} groups/s | elapsed "
+            f"{time.strftime('%M:%S', time.gmtime(elapsed))}\n"
+        )
+    sys.stderr.flush()
 
 
 def rodrigues_to_matrix(rvec: Sequence[float]) -> np.ndarray:
@@ -385,6 +425,148 @@ def estimate_depth_for_pixel(
     return joint if joint and joint.valid else None
 
 
+def estimate_rows_center_vectorized(records, camera_lookup, args):
+    """Vectorized single-reference depth solve at each 4x4 block center.
+
+    Returns arrays: depth, residual, conditioning, reprojection_error, valid.
+    Camera transforms are evaluated once per (poc, ref_poc) pair rather than
+    once per pixel/block.
+    """
+    n = len(records)
+    depth = np.full(n, np.nan, dtype=np.float64)
+    residual = np.full(n, np.inf, dtype=np.float64)
+    conditioning = np.zeros(n, dtype=np.float64)
+    reproj = np.full(n, np.inf, dtype=np.float64)
+    valid = np.zeros(n, dtype=bool)
+
+    pair_to_indices = defaultdict(list)
+    for i, rec in enumerate(records):
+        if rec.poc in camera_lookup and rec.ref_poc in camera_lookup and rec.ref_poc != rec.poc:
+            pair_to_indices[(rec.poc, rec.ref_poc)].append(i)
+
+    pair_items = list(pair_to_indices.items())
+    for (poc, ref_poc), idxs in progress_iter(
+        pair_items, len(pair_items), desc="Solving camera pairs"
+    ):
+        idx = np.asarray(idxs, dtype=np.int64)
+        cam_cur = camera_lookup[poc]
+        cam_ref = camera_lookup[ref_poc]
+        kc = np.asarray(cam_cur["K"], dtype=np.float64)
+        kr = np.asarray(cam_ref["K"], dtype=np.float64)
+        m = np.asarray(cam_ref["W2C"], dtype=np.float64) @ np.asarray(cam_cur["C2W"], dtype=np.float64)
+        r = m[:3, :3]
+        t = m[:3, 3]
+        z_sign_cur = float(cam_cur["z_sign"])
+        z_sign_ref = float(cam_ref["z_sign"])
+
+        u = np.fromiter((records[i].x + (records[i].w - 1) * 0.5 for i in idxs), dtype=np.float64)
+        v = np.fromiter((records[i].y + (records[i].h - 1) * 0.5 for i in idxs), dtype=np.float64)
+        mvx = np.fromiter((records[i].mv_x for i in idxs), dtype=np.float64) * args.mv_scale
+        mvy = np.fromiter((records[i].mv_y for i in idxs), dtype=np.float64) * args.mv_scale
+        u_obs = u + args.mv_sign * mvx
+        v_obs = v + args.mv_sign * mvy
+
+        dx = (u - kc[0, 2]) / kc[0, 0]
+        dy = (v - kc[1, 2]) / kc[1, 1]
+        rd0 = r[0, 0] * dx + r[0, 1] * dy + r[0, 2] * z_sign_cur
+        rd1 = r[1, 0] * dx + r[1, 1] * dy + r[1, 2] * z_sign_cur
+        rd2 = r[2, 0] * dx + r[2, 1] * dy + r[2, 2] * z_sign_cur
+
+        du = u_obs - kr[0, 2]
+        dv = v_obs - kr[1, 2]
+        ax = du * rd2 - kr[0, 0] * rd0
+        bx = kr[0, 0] * t[0] - du * t[2]
+        ay = dv * rd2 - kr[1, 1] * rd1
+        by = kr[1, 1] * t[1] - dv * t[2]
+
+        cond = ax * ax + ay * ay
+        good = np.isfinite(cond) & (cond >= args.min_conditioning)
+        z = np.full_like(cond, np.nan)
+        z[good] = (ax[good] * bx[good] + ay[good] * by[good]) / cond[good]
+        res = np.full_like(cond, np.inf)
+        res[good] = np.sqrt(0.5 * ((ax[good] * z[good] - bx[good]) ** 2 + (ay[good] * z[good] - by[good]) ** 2))
+
+        xp = z * rd0 + t[0]
+        yp = z * rd1 + t[1]
+        zp = z * rd2 + t[2]
+        front = np.isfinite(zp) & (zp * z_sign_ref > 1e-12)
+        denom = np.maximum(np.abs(zp), 1e-12)
+        pu = kr[0, 0] * xp / denom + kr[0, 2]
+        pv = kr[1, 1] * yp / denom + kr[1, 2]
+        err = np.hypot(pu - u_obs, pv - v_obs)
+
+        ok = (
+            good & front & np.isfinite(z) & np.isfinite(err)
+            & (z >= args.min_depth) & (z <= args.max_depth)
+            & (err <= args.max_reprojection_error)
+        )
+        depth[idx] = z
+        residual[idx] = res
+        conditioning[idx] = cond
+        reproj[idx] = err
+        valid[idx] = ok
+
+    return depth, residual, conditioning, reproj, valid
+
+
+def fill_center_constant_fast(records, camera_lookup, depth_real, args):
+    """Fast path: solve each CSV row once, then combine uni/bi rows by block."""
+    z, res, cond, err, ok = estimate_rows_center_vectorized(records, camera_lookup, args)
+    groups = defaultdict(list)
+    for i, rec in enumerate(records):
+        groups[(rec.poc, rec.x, rec.y, rec.w, rec.h)].append(i)
+
+    source_counts = defaultdict(int)
+    uni_groups = bi_groups = written_groups = invalid_groups = out_groups = 0
+    items = list(groups.items())
+    for (poc, x, y, w, h), idxs in progress_iter(items, len(items), desc="Filling 4x4 blocks"):
+        if not (0 <= poc < args.num_frames) or w <= 0 or h <= 0:
+            out_groups += 1
+            continue
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(args.width, x + w), min(args.height, y + h)
+        if x0 >= x1 or y0 >= y1:
+            out_groups += 1
+            continue
+        good = [i for i in idxs if ok[i]]
+        if len(idxs) == 1:
+            uni_groups += 1
+        else:
+            bi_groups += 1
+        if not good:
+            invalid_groups += 1
+            continue
+
+        if len(good) == 1:
+            chosen = float(z[good[0]])
+            source = f"ref_{records[good[0]].ref_poc}"
+        else:
+            depths = np.asarray([z[i] for i in good], dtype=np.float64)
+            if args.bi_mode == "average":
+                chosen = float(np.mean(depths)); source = "bi_average"
+            elif args.bi_mode == "best":
+                scores = np.asarray([cond[i] / (1.0 + err[i] ** 2 + res[i] ** 2) for i in good])
+                j = good[int(np.argmax(scores))]
+                chosen = float(z[j]); source = f"ref_{records[j].ref_poc}"
+            else:
+                rel_spread = float((np.max(depths) - np.min(depths)) / max(np.mean(np.abs(depths)), 1e-12))
+                if args.bi_mode == "joint" or rel_spread <= args.bi_relative_threshold:
+                    weights = np.asarray([max(cond[i], args.min_conditioning) for i in good], dtype=np.float64)
+                    chosen = float(np.sum(weights * depths) / np.sum(weights))
+                    source = "robust_joint" if args.bi_mode == "robust_joint" else "joint"
+                else:
+                    scores = np.asarray([cond[i] / (1.0 + err[i] ** 2 + res[i] ** 2) for i in good])
+                    j = good[int(np.argmax(scores))]
+                    chosen = float(z[j]); source = f"ref_{records[j].ref_poc}"
+
+        depth_real[poc, y0:y1, x0:x1] = chosen
+        pixels = (y1 - y0) * (x1 - x0)
+        source_counts[source] += pixels
+        written_groups += 1
+
+    return groups, source_counts, uni_groups, bi_groups, written_groups, invalid_groups, out_groups
+
+
 def group_motion_records(records: Iterable[MotionRecord]) -> Dict[Tuple[int, int, int, int, int], List[MotionRecord]]:
     groups: Dict[Tuple[int, int, int, int, int], List[MotionRecord]] = defaultdict(list)
     for rec in records:
@@ -416,7 +598,7 @@ def main() -> None:
     p.add_argument("--num-frames", type=int, default=33)
     p.add_argument("--mv-scale", type=float, default=1.0)
     p.add_argument("--mv-sign", type=float, choices=[-1.0, 1.0], default=1.0)
-    p.add_argument("--sample-mode", choices=["per_pixel", "center_constant"], default="per_pixel")
+    p.add_argument("--sample-mode", choices=["per_pixel", "center_constant"], default="center_constant", help="center_constant is the fast vectorized default; per_pixel is much slower")
     p.add_argument("--bi-mode", choices=["robust_joint", "joint", "average", "best"], default="robust_joint")
     p.add_argument("--bi-relative-threshold", type=float, default=0.25)
     p.add_argument("--min-conditioning", type=float, default=1e-10)
@@ -454,52 +636,63 @@ def main() -> None:
         if bad:
             raise ValueError(f"Non-4x4 record: {bad}")
 
-    groups = group_motion_records(records)
     depth_real = np.zeros((args.num_frames, args.height, args.width), dtype=np.float32)
-    source_counts: Dict[str, int] = defaultdict(int)
-    uni_groups = bi_groups = written_groups = invalid_groups = out_groups = 0
 
-    for (poc, x, y, w, h), group in sorted(groups.items()):
-        if not (0 <= poc < args.num_frames) or w <= 0 or h <= 0:
-            out_groups += 1
-            continue
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(args.width, x + w), min(args.height, y + h)
-        if x0 >= x1 or y0 >= y1:
-            out_groups += 1
-            continue
-        usable = [r for r in group if r.ref_poc in camera_lookup and r.ref_poc != poc]
-        if not usable:
-            invalid_groups += 1
-            continue
-        if len(usable) == 1:
-            uni_groups += 1
-        else:
-            bi_groups += 1
+    if args.sample_mode == "center_constant":
+        (groups, source_counts, uni_groups, bi_groups, written_groups,
+         invalid_groups, out_groups) = fill_center_constant_fast(
+            records, camera_lookup, depth_real, args
+        )
+    else:
+        groups = group_motion_records(records)
+        source_counts: Dict[str, int] = defaultdict(int)
+        uni_groups = bi_groups = written_groups = invalid_groups = out_groups = 0
+        sorted_groups = sorted(groups.items())
 
-        written = 0
-        if args.sample_mode == "center_constant":
-            u = x + (w - 1) * 0.5
-            v = y + (h - 1) * 0.5
-            est = estimate_depth_for_pixel(usable, u, v, camera_lookup, args)
-            if est is not None and est.valid:
-                depth_real[poc, y0:y1, x0:x1] = est.depth
-                written = (y1 - y0) * (x1 - x0)
-                source_counts[est.source] += written
-        else:
-            for py in range(y0, y1):
-                for px in range(x0, x1):
-                    est = estimate_depth_for_pixel(usable, float(px), float(py), camera_lookup, args)
-                    if est is not None and est.valid:
-                        depth_real[poc, py, px] = est.depth
-                        source_counts[est.source] += 1
-                        written += 1
-
-        if written:
-            written_groups += 1
-        else:
-            invalid_groups += 1
-
+        for (poc, x, y, w, h), group in progress_iter(
+            sorted_groups,
+            total=len(sorted_groups),
+            desc="Recovering depth",
+        ):
+            if not (0 <= poc < args.num_frames) or w <= 0 or h <= 0:
+                out_groups += 1
+                continue
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(args.width, x + w), min(args.height, y + h)
+            if x0 >= x1 or y0 >= y1:
+                out_groups += 1
+                continue
+            usable = [r for r in group if r.ref_poc in camera_lookup and r.ref_poc != poc]
+            if not usable:
+                invalid_groups += 1
+                continue
+            if len(usable) == 1:
+                uni_groups += 1
+            else:
+                bi_groups += 1
+    
+            written = 0
+            if args.sample_mode == "center_constant":
+                u = x + (w - 1) * 0.5
+                v = y + (h - 1) * 0.5
+                est = estimate_depth_for_pixel(usable, u, v, camera_lookup, args)
+                if est is not None and est.valid:
+                    depth_real[poc, y0:y1, x0:x1] = est.depth
+                    written = (y1 - y0) * (x1 - x0)
+                    source_counts[est.source] += written
+            else:
+                for py in range(y0, y1):
+                    for px in range(x0, x1):
+                        est = estimate_depth_for_pixel(usable, float(px), float(py), camera_lookup, args)
+                        if est is not None and est.valid:
+                            depth_real[poc, py, px] = est.depth
+                            source_counts[est.source] += 1
+                            written += 1
+    
+            if written:
+                written_groups += 1
+            else:
+                invalid_groups += 1
     depth_code = np.zeros_like(depth_real, dtype="<u2")
     valid = np.isfinite(depth_real) & (depth_real > 0.0)
     depth_code[valid] = np.clip(np.rint(depth_real[valid] / depth_scale_real), 1, 1023).astype("<u2")
