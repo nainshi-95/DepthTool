@@ -374,12 +374,16 @@ def main() -> None:
                         pred, valid = blend(w0, w1)
                         m = metrics(gt.y, pred, valid, a.peak_value)
                         row.update(valid_pixels=m["valid_pixels"],valid_ratio=m["valid_ratio"],sse_y=m["sse"],mse_y=m["mse"],psnr_y=m["psnr"],mae_y=m["mae"],max_abs_error_y=m["max_abs_error"],satd_y=m["satd"],satd_per_valid_pixel=m["satd_per_valid_pixel"])
+                        # For every frame where backward warping was attempted,
+                        # invalid Y samples are written as zero rather than copied from GT.
+                        out.y.fill(0.0)
+                        out.y[valid] = np.clip(np.rint(pred[valid]), 0, 1023)
+
                         if m["valid_pixels"] == 0:
-                            row["skip_reason"] = "no_valid_projection_gt_inserted"
+                            row["skip_reason"] = "no_valid_projection_zero_y"
                         elif m["valid_ratio"] < a.min_valid_ratio:
-                            row["skip_reason"] = "below_min_valid_ratio_gt_inserted"
+                            row["skip_reason"] = "below_min_valid_ratio_zero_invalid_y"
                         else:
-                            out.y[valid] = np.clip(np.rint(pred[valid]),0,1023)
                             row["measured"] = 1; measured += 1; total_sse += m["sse"]; total_satd += m["satd"]; total_valid += int(m["valid_pixels"])
 
                 of.seek((poc-start)*frame_size(a.width,a.height)); write_frame(of,out,a.output_stored_bit_shift); rows[poc]=row
@@ -402,7 +406,7 @@ def main() -> None:
     mse=total_sse/total_valid if total_valid else 0.0
     psnr=float("nan") if total_valid==0 else float("inf") if mse==0 else 10*math.log10(a.peak_value*a.peak_value/mse)
     mean_psnr=float(np.mean([float(r["psnr_y"]) for r in ordered if r["measured"]])) if measured else float("nan")
-    summary={"version":"2026-07-13-backward-warp-projection-metrics-v2","warping":"backward mapping using target depth","bidirectional_blend":"1:1 where both valid, otherwise single valid direction","metric_scope":"valid warped Y pixels only","output_rule":"valid Y=warped; invalid Y/chroma=GT; excluded/unusable frames=GT","video_yuv":a.video_yuv,"input_depth_yuv":a.input_depth_yuv,"camera_param":a.camera_param,"mv_csv":a.mv_csv,"width":a.width,"height":a.height,"start_frame":start,"end_frame_exclusive":end,"coding_order":a.coding_order,"coding_poc_order":order,"output_poc_order":list(range(start,end)),"ra_gop_size":a.ra_gop_size,"excluded_pocs":sorted(excluded),"depth_source":"target POC depth","depth_scale_real":scale,"measured_frame_count":measured,"aggregate_valid_pixels":total_valid,"overall_sse_y":total_sse,"overall_mse_y":mse,"overall_projection_psnr_y":psnr,"mean_frame_projection_psnr_y":mean_psnr,"overall_satd_y":total_satd,"overall_satd_per_valid_pixel":total_satd/total_valid if total_valid else 0.0,"frames":ordered,"out_warped_yuv":a.out_warped_yuv,"out_frame_csv":a.out_frame_csv}
+    summary={"version":"2026-07-13-backward-warp-projection-metrics-v3-invalid-zero","warping":"backward mapping using target depth","bidirectional_blend":"1:1 where both valid, otherwise single valid direction","metric_scope":"union of L0/L1 valid warped Y pixels only","output_rule":"for attempted warps: valid Y=warped and invalid Y=0; chroma=GT; excluded/missing-camera/no-reference frames=GT","video_yuv":a.video_yuv,"input_depth_yuv":a.input_depth_yuv,"camera_param":a.camera_param,"mv_csv":a.mv_csv,"width":a.width,"height":a.height,"start_frame":start,"end_frame_exclusive":end,"coding_order":a.coding_order,"coding_poc_order":order,"output_poc_order":list(range(start,end)),"ra_gop_size":a.ra_gop_size,"excluded_pocs":sorted(excluded),"depth_source":"target POC depth","depth_scale_real":scale,"measured_frame_count":measured,"aggregate_valid_pixels":total_valid,"overall_sse_y":total_sse,"overall_mse_y":mse,"overall_projection_psnr_y":psnr,"mean_frame_projection_psnr_y":mean_psnr,"overall_satd_y":total_satd,"overall_satd_per_valid_pixel":total_satd/total_valid if total_valid else 0.0,"frames":ordered,"out_warped_yuv":a.out_warped_yuv,"out_frame_csv":a.out_frame_csv}
     with open(a.out_summary_json,"w",encoding="utf-8") as fp: json.dump(summary,fp,indent=2,ensure_ascii=False)
     print(f"Measured frames              : {measured}")
     print(f"Aggregate valid pixels       : {total_valid}")
