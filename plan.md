@@ -5,10 +5,13 @@
 #endif
 
 #if GlobalMotion
-static void dumpMotionInfoCsv(const CodingStructure& cs, const std::string& fileName, const int poc)
+static void dumpMotionInfoCsvPelOnly(
+  const CodingStructure& cs,
+  const std::string& fileName,
+  const int currPoc
+)
 {
   const Area lumaArea = cs.area.Y();
-
   const CMotionBuf mb = cs.getMotionBuf(lumaArea);
 
   const int miBlkW = 1 << g_miScaling.posx;   // normally 4
@@ -23,8 +26,7 @@ static void dumpMotionInfoCsv(const CodingStructure& cs, const std::string& file
 
   if (writeHeader)
   {
-    ofs << "poc,x,y,w,h,isInter,interDir,list,refIdx,"
-        << "mv_x_int,mv_y_int,mv_x_pel,mv_y_pel\n";
+    ofs << "poc,x,y,w,h,list,ref_poc,mv_x,mv_y\n";
   }
 
   for (int my = 0; my < mb.height; my++)
@@ -33,58 +35,67 @@ static void dumpMotionInfoCsv(const CodingStructure& cs, const std::string& file
     {
       const MotionInfo& mi = mb.at(mx, my);
 
+      // No isInter column. Just skip non-inter blocks.
+      if (!mi.isInter)
+      {
+        continue;
+      }
+
       const int x = lumaArea.x + (mx << g_miScaling.posx);
       const int y = lumaArea.y + (my << g_miScaling.posy);
 
       const int w = std::min(miBlkW, lumaArea.x + lumaArea.width  - x);
       const int h = std::min(miBlkH, lumaArea.y + lumaArea.height - y);
 
-      if (!mi.isInter)
+      const Slice* slice = nullptr;
+
+      if (cs.picture && mi.sliceIdx < cs.picture->m_slices.size())
       {
-        ofs << poc << ","
-            << x << "," << y << "," << w << "," << h << ","
-            << 0 << ","
-            << int(mi.interDir) << ","
-            << "NA" << ","
-            << -1 << ","
-            << 0 << "," << 0 << ","
-            << std::fixed << std::setprecision(6)
-            << 0.0 << "," << 0.0 << "\n";
-        continue;
+        slice = cs.picture->m_slices[mi.sliceIdx];
       }
+      else
+      {
+        slice = cs.slice;
+      }
+
+      CHECK(slice == nullptr, "Cannot resolve slice for MotionInfo dump");
+
+      auto writeOneList = [&](const RefPicList refList, const char* listName)
+      {
+        const int listIdx = int(refList);
+        const int refIdx = mi.refIdx[listIdx];
+
+        if (refIdx < 0)
+        {
+          return;
+        }
+
+        const Picture* refPic = slice->getRefPic(refList, refIdx);
+        CHECK(refPic == nullptr, "Cannot resolve reference picture for MotionInfo dump");
+
+        const int refPoc = refPic->m_poc;
+        const Mv& mv = mi.mv[listIdx];
+
+        const double mvXPel = double(mv.getHor()) / mvScale;
+        const double mvYPel = double(mv.getVer()) / mvScale;
+
+        ofs << currPoc << ","
+            << x << "," << y << "," << w << "," << h << ","
+            << listName << ","
+            << refPoc << ","
+            << std::fixed << std::setprecision(6)
+            << mvXPel << ","
+            << mvYPel << "\n";
+      };
 
       if (mi.interDir & 1)
       {
-        const Mv& mv = mi.mv[0];
-
-        ofs << poc << ","
-            << x << "," << y << "," << w << "," << h << ","
-            << 1 << ","
-            << int(mi.interDir) << ","
-            << "L0" << ","
-            << int(mi.refIdx[0]) << ","
-            << mv.getHor() << ","
-            << mv.getVer() << ","
-            << std::fixed << std::setprecision(6)
-            << double(mv.getHor()) / mvScale << ","
-            << double(mv.getVer()) / mvScale << "\n";
+        writeOneList(RPL0, "L0");
       }
 
       if (mi.interDir & 2)
       {
-        const Mv& mv = mi.mv[1];
-
-        ofs << poc << ","
-            << x << "," << y << "," << w << "," << h << ","
-            << 1 << ","
-            << int(mi.interDir) << ","
-            << "L1" << ","
-            << int(mi.refIdx[1]) << ","
-            << mv.getHor() << ","
-            << mv.getVer() << ","
-            << std::fixed << std::setprecision(6)
-            << double(mv.getHor()) / mvScale << ","
-            << double(mv.getVer()) / mvScale << "\n";
+        writeOneList(RPL1, "L1");
       }
     }
   }
