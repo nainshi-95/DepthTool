@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 
 
-PATCH_TEXT = r"""*** Begin Patch
+PATCH_TEXT = r'''*** Begin Patch
 *** Update File: projection_satd_depth_sim.py
 @@
 -  * five-point temporal plane resampling for L0/L1
@@ -511,7 +511,7 @@ PATCH_TEXT = r"""*** Begin Patch
 +            "mean_rel_depth": args.candidate_dedup_mean_rel_depth,
 +        },
 *** End Patch
-"""
+'''
 
 
 def run_command(cmd, cwd):
@@ -525,62 +525,65 @@ def run_command(cmd, cwd):
     return result.returncode, result.stdout, result.stderr
 
 
+def _parse_update_hunks(patch_text: str):
+    lines = patch_text.splitlines()
+    if not lines or lines[0].strip() != "*** Begin Patch":
+        raise ValueError("unsupported patch format")
+
+    hunks = []
+    current = None
+    in_hunk = False
+    for line in lines[1:]:
+        if line.startswith("*** Update File:"):
+            current = line.split(":", 1)[1].strip()
+            in_hunk = False
+        elif line.startswith("@@"):
+            if current is None:
+                raise ValueError("hunk found before file declaration")
+            hunks.append({"file": current, "old": [], "new": []})
+            in_hunk = True
+        elif line.startswith("*** End Patch"):
+            break
+        elif in_hunk:
+            if line.startswith("+"):
+                hunks[-1]["new"].append(line[1:])
+            elif line.startswith("-"):
+                hunks[-1]["old"].append(line[1:])
+            elif line.startswith(" "):
+                text = line[1:]
+                hunks[-1]["old"].append(text)
+                hunks[-1]["new"].append(text)
+            else:
+                # Empty/context lines in this patch format have no leading marker.
+                hunks[-1]["old"].append(line)
+                hunks[-1]["new"].append(line)
+    return hunks
+
+
+def _apply_hunks_to_text(source: str, patch_text: str) -> str:
+    result = source
+    for index, hunk in enumerate(_parse_update_hunks(patch_text), start=1):
+        old = "\n".join(hunk["old"])
+        new = "\n".join(hunk["new"])
+        count = result.count(old)
+        if count != 1:
+            raise RuntimeError(
+                f"hunk {index} could not be applied uniquely: "
+                f"expected 1 match, found {count}\n\n"
+                f"First old lines:\n" + "\n".join(hunk["old"][:8])
+            )
+        result = result.replace(old, new, 1)
+    return result
+
+
 def apply_patch(input_path: Path, output_path: Path) -> None:
     if not input_path.is_file():
         raise FileNotFoundError(f"input file not found: {input_path}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as tmp_dir_text:
-        tmp_dir = Path(tmp_dir_text)
-        work_file = tmp_dir / "projection_satd_depth_sim.py"
-        patch_file = tmp_dir / "change.patch"
-
-        shutil.copy2(input_path, work_file)
-        patch_file.write_text(PATCH_TEXT, encoding="utf-8")
-
-        applied = False
-        errors = []
-
-        patch_exe = shutil.which("patch")
-        if patch_exe:
-            code, stdout, stderr = run_command(
-                [patch_exe, "-p0", "-i", str(patch_file)],
-                cwd=tmp_dir,
-            )
-            if code == 0:
-                applied = True
-            else:
-                errors.append(
-                    "patch command failed:\n"
-                    f"stdout:\n{stdout}\n"
-                    f"stderr:\n{stderr}"
-                )
-
-        if not applied:
-            git_exe = shutil.which("git")
-            if git_exe:
-                code, stdout, stderr = run_command(
-                    [git_exe, "apply", "--unsafe-paths", str(patch_file)],
-                    cwd=tmp_dir,
-                )
-                if code == 0:
-                    applied = True
-                else:
-                    errors.append(
-                        "git apply failed:\n"
-                        f"stdout:\n{stdout}\n"
-                        f"stderr:\n{stderr}"
-                    )
-
-        if not applied:
-            raise RuntimeError(
-                "Could not apply the patch. Install either 'patch' or 'git', "
-                "and verify that the input file exactly matches the supplied base code.\n\n"
-                + "\n\n".join(errors)
-            )
-
-        shutil.copy2(work_file, output_path)
+    source = input_path.read_text(encoding="utf-8")
+    patched = _apply_hunks_to_text(source, PATCH_TEXT)
+    output_path.write_text(patched, encoding="utf-8")
 
 
 def parse_args():
