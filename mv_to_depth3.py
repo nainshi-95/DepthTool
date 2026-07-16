@@ -35,6 +35,7 @@ import argparse
 import csv
 import json
 import math
+from time import perf_counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -206,6 +207,10 @@ def scale_camera_lookup(
         out[poc] = {
             "poc": int(cam["poc"]),
             "K": K,
+            "fx": float(K[0, 0]),
+            "fy": float(K[1, 1]),
+            "cx": float(K[0, 2]),
+            "cy": float(K[1, 2]),
             "W2C": np.asarray(cam["W2C"], dtype=np.float64).copy(),
             "C2W": np.asarray(cam["C2W"], dtype=np.float64).copy(),
             "z_sign": float(cam["z_sign"]),
@@ -215,6 +220,89 @@ def scale_camera_lookup(
 
 def full_to_processing_coordinate(value: float, downsample_scale: int) -> float:
     return (float(value) + 0.5) / float(downsample_scale) - 0.5
+
+
+@dataclass(frozen=True)
+class RelativeCameraTransform:
+    """Cached transform from one camera coordinate system to another.
+
+    The scalar fields are intentionally duplicated from the matrices so the
+    per-MV closed-form solver can avoid constructing tiny NumPy arrays.
+    """
+
+    src_poc: int
+    dst_poc: int
+    R: np.ndarray
+    t: np.ndarray
+    r00: float
+    r01: float
+    r02: float
+    r10: float
+    r11: float
+    r12: float
+    r20: float
+    r21: float
+    r22: float
+    tx: float
+    ty: float
+    tz: float
+    src_fx: float
+    src_fy: float
+    src_cx: float
+    src_cy: float
+    src_z_sign: float
+    dst_fx: float
+    dst_fy: float
+    dst_cx: float
+    dst_cy: float
+    dst_z_sign: float
+
+
+def build_relative_transform_cache(
+    cameras: Dict[int, Dict[str, Any]],
+) -> Dict[Tuple[int, int], RelativeCameraTransform]:
+    """Build every camera-pair transform once.
+
+    A 33-picture GOP has only 1089 ordered pairs, so precomputing them is much
+    cheaper than repeating matrix multiplication for every 4x4 MV or every
+    candidate/reference geometry check.
+    """
+    cache: Dict[Tuple[int, int], RelativeCameraTransform] = {}
+    for src_poc, src in cameras.items():
+        src_c2w = np.asarray(src["C2W"], dtype=np.float64)
+        for dst_poc, dst in cameras.items():
+            M = np.asarray(dst["W2C"], dtype=np.float64) @ src_c2w
+            R = np.ascontiguousarray(M[:3, :3], dtype=np.float64)
+            t = np.ascontiguousarray(M[:3, 3], dtype=np.float64)
+            cache[(src_poc, dst_poc)] = RelativeCameraTransform(
+                src_poc=src_poc,
+                dst_poc=dst_poc,
+                R=R,
+                t=t,
+                r00=float(R[0, 0]),
+                r01=float(R[0, 1]),
+                r02=float(R[0, 2]),
+                r10=float(R[1, 0]),
+                r11=float(R[1, 1]),
+                r12=float(R[1, 2]),
+                r20=float(R[2, 0]),
+                r21=float(R[2, 1]),
+                r22=float(R[2, 2]),
+                tx=float(t[0]),
+                ty=float(t[1]),
+                tz=float(t[2]),
+                src_fx=float(src["fx"]),
+                src_fy=float(src["fy"]),
+                src_cx=float(src["cx"]),
+                src_cy=float(src["cy"]),
+                src_z_sign=float(src["z_sign"]),
+                dst_fx=float(dst["fx"]),
+                dst_fy=float(dst["fy"]),
+                dst_cx=float(dst["cx"]),
+                dst_cy=float(dst["cy"]),
+                dst_z_sign=float(dst["z_sign"]),
+            )
+    return cache
 
 
 # ============================================================
@@ -228,6 +316,17 @@ class MVObservation:
     y: int
     w: int
     h: int
+    list_id: str
+    ref_poc: int
+    mv_x: float
+    mv_y: float
+
+
+@dataclass
+class ProcessingMVSample:
+    poc: int
+    x: float
+    y: float
     list_id: str
     ref_poc: int
     mv_x: float
@@ -309,94 +408,65 @@ def parse_mv_csv(path: str, num_frames: int) -> List[List[MVObservation]]:
     return by_frame
 
 
-def pixel_ray(u: float, v: float, cam: Dict[str, Any]) -> np.ndarray:
-    K = cam["K"]
-    z_sign = float(cam["z_sign"])
-    return np.array(
-        [
-            (u - K[0, 2]) / K[0, 0],
-            (v - K[1, 2]) / K[1, 1],
-            z_sign,
-        ],
-        dtype=np.float64,
-    )
-
-
-def project_point(X: np.ndarray, cam: Dict[str, Any]) -> Optional[np.ndarray]:
-    K = cam["K"]
-    z_sign = float(cam["z_sign"])
-    depth = z_sign * float(X[2])
-    if not np.isfinite(depth) or depth <= 1e-10:
-        return None
-    return np.array(
-        [
-            K[0, 0] * float(X[0]) / depth + K[0, 2],
-            K[1, 1] * float(X[1]) / depth + K[1, 2],
-        ],
-        dtype=np.float64,
-    )
-
-
-def relative_transform(
-    cam_cur: Dict[str, Any],
-    cam_ref: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray]:
-    M = np.asarray(cam_ref["W2C"]) @ np.asarray(cam_cur["C2W"])
-    return M[:3, :3], M[:3, 3]
-
-
-def solve_depth_closed_form(
+def solve_depth_closed_form_scalar(
     u: float,
     v: float,
     mv_x: float,
     mv_y: float,
-    cam_cur: Dict[str, Any],
-    cam_ref: Dict[str, Any],
+    rel: RelativeCameraTransform,
     min_parallax: float,
     max_reproj_error: float,
 ) -> Optional[Tuple[float, float]]:
+    """Closed-form depth solve without per-MV NumPy allocations.
+
+    All camera-pair matrices and scalar intrinsic values are cached in
+    ``RelativeCameraTransform``. This function therefore performs only scalar
+    arithmetic for each sampled MV.
+    """
     ur = u + mv_x
     vr = v + mv_y
 
-    ray = pixel_ray(u, v, cam_cur)
-    R, t = relative_transform(cam_cur, cam_ref)
-    q = R @ ray
+    rx = (u - rel.src_cx) / rel.src_fx
+    ry = (v - rel.src_cy) / rel.src_fy
+    rz = rel.src_z_sign
 
-    K = cam_ref["K"]
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-    z_sign_ref = float(cam_ref["z_sign"])
+    qx = rel.r00 * rx + rel.r01 * ry + rel.r02 * rz
+    qy = rel.r10 * rx + rel.r11 * ry + rel.r12 * rz
+    qz = rel.r20 * rx + rel.r21 * ry + rel.r22 * rz
 
-    du = ur - cx
-    dv = vr - cy
+    du = ur - rel.dst_cx
+    dv = vr - rel.dst_cy
 
-    Au = du * z_sign_ref * q[2] - fx * q[0]
-    Bu = fx * t[0] - du * z_sign_ref * t[2]
+    au = du * rel.dst_z_sign * qz - rel.dst_fx * qx
+    bu = rel.dst_fx * rel.tx - du * rel.dst_z_sign * rel.tz
+    av = dv * rel.dst_z_sign * qz - rel.dst_fy * qy
+    bv = rel.dst_fy * rel.ty - dv * rel.dst_z_sign * rel.tz
 
-    Av = dv * z_sign_ref * q[2] - fy * q[1]
-    Bv = fy * t[1] - dv * z_sign_ref * t[2]
-
-    A = np.array([Au, Av], dtype=np.float64)
-    B = np.array([Bu, Bv], dtype=np.float64)
-
-    denom = float(np.dot(A, A))
-    if not np.isfinite(denom) or denom < min_parallax * min_parallax:
+    denom = au * au + av * av
+    min_denom = min_parallax * min_parallax
+    if not math.isfinite(denom) or denom < min_denom:
         return None
 
-    depth = float(np.dot(A, B) / denom)
-    if not np.isfinite(depth) or depth <= 0.0:
+    depth = (au * bu + av * bv) / denom
+    if not math.isfinite(depth) or depth <= 0.0:
         return None
 
-    X_ref = depth * q + t
-    pred = project_point(X_ref, cam_ref)
-    if pred is None:
+    x_ref = depth * qx + rel.tx
+    y_ref = depth * qy + rel.ty
+    z_ref = depth * qz + rel.tz
+    ref_depth = rel.dst_z_sign * z_ref
+    if not math.isfinite(ref_depth) or ref_depth <= 1e-10:
         return None
 
-    reproj_error = float(np.linalg.norm(pred - np.array([ur, vr], dtype=np.float64)))
-    if not np.isfinite(reproj_error) or reproj_error > max_reproj_error:
+    pred_u = rel.dst_fx * x_ref / ref_depth + rel.dst_cx
+    pred_v = rel.dst_fy * y_ref / ref_depth + rel.dst_cy
+    err_u = pred_u - ur
+    err_v = pred_v - vr
+    reproj_error = math.hypot(err_u, err_v)
+    if not math.isfinite(reproj_error) or reproj_error > max_reproj_error:
         return None
 
-    return depth, reproj_error
+    return float(depth), float(reproj_error)
 
 
 # ============================================================
@@ -545,33 +615,97 @@ def fit_inv_depth_planes_gpu(
 # Local current-frame predictor
 # ============================================================
 
-def make_depth_observations(
-    mv_rows: List[MVObservation],
-    cameras: Dict[int, Dict[str, Any]],
+def _select_spatially_diverse_mv_samples(
+    items: List[ProcessingMVSample],
+    budget: int,
+    block_center_x: float,
+    block_center_y: float,
+) -> List[ProcessingMVSample]:
+    """Select a small deterministic subset with spatial/ref-list diversity."""
+    if budget <= 0 or len(items) <= budget:
+        return items
+
+    selected: List[ProcessingMVSample] = []
+    remaining = list(items)
+
+    # Preserve at least one sample from as many list/reference groups as the
+    # budget permits. The representative nearest the fit-block center is less
+    # likely to sit exactly on a block boundary; larger MV magnitude breaks ties.
+    groups: Dict[Tuple[str, int], List[ProcessingMVSample]] = {}
+    for item in remaining:
+        groups.setdefault((item.list_id, item.ref_poc), []).append(item)
+
+    group_order = sorted(
+        groups.items(),
+        key=lambda kv: (-len(kv[1]), str(kv[0][0]), int(kv[0][1])),
+    )
+    for _, group_items in group_order:
+        if len(selected) >= budget:
+            break
+        chosen = min(
+            group_items,
+            key=lambda s: (
+                (s.x - block_center_x) ** 2 + (s.y - block_center_y) ** 2,
+                -(s.mv_x * s.mv_x + s.mv_y * s.mv_y),
+                s.x,
+                s.y,
+            ),
+        )
+        selected.append(chosen)
+        remaining.remove(chosen)
+
+    # Fill the rest by farthest-point sampling. This avoids taking four nearly
+    # identical 4x4 MVs from the same corner of the fit block.
+    while remaining and len(selected) < budget:
+        def candidate_score(sample: ProcessingMVSample) -> Tuple[float, float, float, float]:
+            min_dist = min(
+                (sample.x - chosen.x) ** 2 + (sample.y - chosen.y) ** 2
+                for chosen in selected
+            )
+            group_is_new = all(
+                (sample.list_id, sample.ref_poc)
+                != (chosen.list_id, chosen.ref_poc)
+                for chosen in selected
+            )
+            motion_mag = sample.mv_x * sample.mv_x + sample.mv_y * sample.mv_y
+            # Tuple max: favor spatial coverage, then unseen ref/list, then
+            # larger motion/parallax proxy, with deterministic coordinate ties.
+            return (
+                min_dist,
+                1.0 if group_is_new else 0.0,
+                motion_mag,
+                -(sample.x + sample.y * 1e-3),
+            )
+
+        chosen = max(remaining, key=candidate_score)
+        selected.append(chosen)
+        remaining.remove(chosen)
+
+    return selected
+
+
+def sample_mv_rows_for_processing(
+    mv_rows: Sequence[MVObservation],
     full_width: int,
     full_height: int,
     processing_width: int,
     processing_height: int,
     downsample_scale: int,
-    min_depth: float,
-    max_depth: float,
-    min_parallax: float,
-    max_reproj_error: float,
-) -> List[DepthObservation]:
-    """Convert full-resolution MV rows to reduced-resolution depth observations.
+    processing_fit_block: int,
+    max_samples_per_fit_block: int,
+) -> Tuple[List[ProcessingMVSample], Dict[str, int]]:
+    """Reduce 4x4-span MVs before any closed-form depth solve.
 
-    The CSV remains in the original image coordinate system. Block centers and
-    MVs are converted to the processing coordinate system before closed-form
-    depth recovery. The current target block is still excluded later by
-    build_block_fit_jobs(), which uses only left/top/top-left source blocks.
+    Sampling is done per reduced-resolution fit block, across all L0/L1 and
+    reference POCs. ``max_samples_per_fit_block=0`` disables reduction.
     """
-    out: List[DepthObservation] = []
     scale = float(downsample_scale)
+    grouped: Dict[Tuple[int, int], List[ProcessingMVSample]] = {}
+    eligible = 0
+    duplicate_count = 0
+    seen_keys: Dict[Tuple[int, int], set[Tuple[Any, ...]]] = {}
 
     for row in mv_rows:
-        if row.poc not in cameras or row.ref_poc not in cameras:
-            continue
-
         cx_full = row.x + (row.w - 1) * 0.5
         cy_full = row.y + (row.h - 1) * 0.5
         if not (0.0 <= cx_full < full_width and 0.0 <= cy_full < full_height):
@@ -585,13 +719,88 @@ def make_depth_observations(
         ):
             continue
 
-        solved = solve_depth_closed_form(
-            u=cx,
-            v=cy,
+        gx = int(math.floor(max(cx, 0.0) / processing_fit_block))
+        gy = int(math.floor(max(cy, 0.0) / processing_fit_block))
+        key = (gx, gy)
+        sample = ProcessingMVSample(
+            poc=row.poc,
+            x=cx,
+            y=cy,
+            list_id=row.list_id,
+            ref_poc=row.ref_poc,
             mv_x=row.mv_x / scale,
             mv_y=row.mv_y / scale,
-            cam_cur=cameras[row.poc],
-            cam_ref=cameras[row.ref_poc],
+        )
+        eligible += 1
+
+        # Remove exact duplicated span records without collapsing L0/L1 or
+        # different reference pictures.
+        dedup_key = (
+            round(cx, 6),
+            round(cy, 6),
+            str(row.list_id),
+            int(row.ref_poc),
+            round(sample.mv_x, 6),
+            round(sample.mv_y, 6),
+        )
+        block_seen = seen_keys.setdefault(key, set())
+        if dedup_key in block_seen:
+            duplicate_count += 1
+            continue
+        block_seen.add(dedup_key)
+        grouped.setdefault(key, []).append(sample)
+
+    selected: List[ProcessingMVSample] = []
+    max_before = 0
+    for (gx, gy), items in grouped.items():
+        max_before = max(max_before, len(items))
+        bx = gx * processing_fit_block
+        by = gy * processing_fit_block
+        block_center_x = bx + (processing_fit_block - 1) * 0.5
+        block_center_y = by + (processing_fit_block - 1) * 0.5
+        selected.extend(
+            _select_spatially_diverse_mv_samples(
+                items=items,
+                budget=max_samples_per_fit_block,
+                block_center_x=block_center_x,
+                block_center_y=block_center_y,
+            )
+        )
+
+    stats = {
+        "input_mv_rows": int(len(mv_rows)),
+        "eligible_mv_rows": int(eligible),
+        "duplicate_mv_rows_removed": int(duplicate_count),
+        "sampled_mv_rows": int(len(selected)),
+        "mv_fit_blocks": int(len(grouped)),
+        "max_mv_rows_in_one_fit_block_before_sampling": int(max_before),
+        "max_samples_per_fit_block": int(max_samples_per_fit_block),
+    }
+    return selected, stats
+
+
+def make_depth_observations(
+    mv_samples: Sequence[ProcessingMVSample],
+    relative_cache: Dict[Tuple[int, int], RelativeCameraTransform],
+    min_depth: float,
+    max_depth: float,
+    min_parallax: float,
+    max_reproj_error: float,
+) -> List[DepthObservation]:
+    """Convert only sampled reduced-resolution MVs into depth observations."""
+    out: List[DepthObservation] = []
+
+    for sample in mv_samples:
+        rel = relative_cache.get((sample.poc, sample.ref_poc))
+        if rel is None:
+            continue
+
+        solved = solve_depth_closed_form_scalar(
+            u=sample.x,
+            v=sample.y,
+            mv_x=sample.mv_x,
+            mv_y=sample.mv_y,
+            rel=rel,
             min_parallax=min_parallax,
             max_reproj_error=max_reproj_error,
         )
@@ -604,13 +813,13 @@ def make_depth_observations(
 
         out.append(
             DepthObservation(
-                poc=row.poc,
-                x=cx,
-                y=cy,
+                poc=sample.poc,
+                x=sample.x,
+                y=sample.y,
                 depth=depth,
                 reproj_error=err,
-                ref_poc=row.ref_poc,
-                list_id=row.list_id,
+                ref_poc=sample.ref_poc,
+                list_id=sample.list_id,
             )
         )
 
@@ -895,8 +1104,7 @@ def _update_zbuffer_chunk(
 
 def forward_warp_depth(
     source: DepthState,
-    cam_src: Dict[str, Any],
-    cam_dst: Dict[str, Any],
+    rel: RelativeCameraTransform,
     width: int,
     height: int,
     min_depth: float,
@@ -931,15 +1139,8 @@ def forward_warp_depth(
     dst_conf = np.zeros((height, width), dtype=np.float32)
     dst_src = np.full((height, width), -1, dtype=np.int32)
 
-    Ksrc = np.asarray(cam_src["K"], dtype=np.float64)
-    Kdst = np.asarray(cam_dst["K"], dtype=np.float64)
-    zsign_src = float(cam_src["z_sign"])
-    zsign_dst = float(cam_dst["z_sign"])
-    M = np.asarray(cam_dst["W2C"], dtype=np.float64) @ np.asarray(
-        cam_src["C2W"], dtype=np.float64
-    )
-    R = M[:3, :3]
-    t = M[:3, 3]
+    R = rel.R
+    t = rel.t
 
     offsets = [
         (dx, dy)
@@ -955,18 +1156,18 @@ def forward_warp_depth(
         c = cs[start:end]
 
         X = np.empty((3, end - start), dtype=np.float64)
-        X[0] = z * (u - Ksrc[0, 2]) / Ksrc[0, 0]
-        X[1] = z * (v - Ksrc[1, 2]) / Ksrc[1, 1]
-        X[2] = z * zsign_src
+        X[0] = z * (u - rel.src_cx) / rel.src_fx
+        X[1] = z * (v - rel.src_cy) / rel.src_fy
+        X[2] = z * rel.src_z_sign
 
         Xd = R @ X + t[:, None]
-        zd = zsign_dst * Xd[2]
+        zd = rel.dst_z_sign * Xd[2]
         front = np.isfinite(zd) & (zd >= min_depth) & (zd <= max_depth)
         if not np.any(front):
             continue
 
-        ud = Kdst[0, 0] * Xd[0, front] / zd[front] + Kdst[0, 2]
-        vd = Kdst[1, 1] * Xd[1, front] / zd[front] + Kdst[1, 2]
+        ud = rel.dst_fx * Xd[0, front] / zd[front] + rel.dst_cx
+        vd = rel.dst_fy * Xd[1, front] / zd[front] + rel.dst_cy
         zd = zd[front]
         c = c[front]
 
@@ -1066,11 +1267,68 @@ def _sample_reference_consistency(
     return best_error, best_conf
 
 
+def compute_geometry_check_mask(
+    candidates: Sequence[DepthCandidate],
+    min_depth: float,
+    max_depth: float,
+    agreement_log_threshold: float,
+    skip_agreed_pixels: bool,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Return pixels that still require expensive geometry reprojection.
+
+    Pixels with at least two valid candidates whose complete log-depth range is
+    inside ``agreement_log_threshold`` are already mutually consistent and may
+    bypass geometry checking. Single-candidate pixels remain checked.
+    """
+    shape = candidates[0].depth.shape
+    if not skip_agreed_pixels or len(candidates) < 2:
+        return np.ones(shape, dtype=bool), {
+            "geometry_skip_enabled": int(skip_agreed_pixels),
+            "geometry_skipped_agreed_pixels": 0,
+            "geometry_check_pixels": int(shape[0] * shape[1]),
+        }
+
+    count = np.zeros(shape, dtype=np.uint8)
+    min_log = np.full(shape, np.inf, dtype=np.float64)
+    max_log = np.full(shape, -np.inf, dtype=np.float64)
+
+    for candidate in candidates:
+        depth = np.asarray(candidate.depth, dtype=np.float64)
+        conf = np.asarray(candidate.confidence)
+        valid = (
+            np.isfinite(depth)
+            & (depth >= min_depth)
+            & (depth <= max_depth)
+            & np.isfinite(conf)
+            & (conf > 0.0)
+        )
+        if not np.any(valid):
+            continue
+        log_depth = np.log(depth[valid])
+        count[valid] = np.minimum(count[valid].astype(np.uint16) + 1, 255).astype(np.uint8)
+        min_log[valid] = np.minimum(min_log[valid], log_depth)
+        max_log[valid] = np.maximum(max_log[valid], log_depth)
+
+    mutually_agreed = (
+        (count >= 2)
+        & np.isfinite(min_log)
+        & np.isfinite(max_log)
+        & ((max_log - min_log) <= max(agreement_log_threshold, 1e-8))
+    )
+    check_mask = ~mutually_agreed
+    return check_mask, {
+        "geometry_skip_enabled": 1,
+        "geometry_skipped_agreed_pixels": int(np.count_nonzero(mutually_agreed)),
+        "geometry_check_pixels": int(np.count_nonzero(check_mask)),
+    }
+
+
 def geometry_gate_candidate(
     candidate: DepthCandidate,
     target_poc: int,
     reference_states: Sequence[DepthState],
-    cameras: Dict[int, Dict[str, Any]],
+    relative_cache: Dict[Tuple[int, int], RelativeCameraTransform],
+    geometry_check_mask: Optional[np.ndarray],
     min_depth: float,
     max_depth: float,
     soft_log_threshold: float,
@@ -1094,76 +1352,97 @@ def geometry_gate_candidate(
         & (base_conf > 0.0)
     )
 
-    if not np.any(valid):
+    if geometry_check_mask is None:
+        check_valid = valid
+    else:
+        if geometry_check_mask.shape != depth.shape:
+            raise ValueError("geometry_check_mask shape mismatch")
+        check_valid = valid & geometry_check_mask
+
+    input_valid_count = int(np.count_nonzero(valid))
+    checked_count = int(np.count_nonzero(check_valid))
+    skipped_count = input_valid_count - checked_count
+
+    if input_valid_count == 0:
         return candidate, {
             "candidate": candidate.name,
             "source_poc": candidate.source_poc,
             "input_valid_pixels": 0,
+            "geometry_checked_pixels": 0,
+            "geometry_skipped_agreement_pixels": 0,
             "geometry_supported_pixels": 0,
             "geometry_rejected_pixels": 0,
             "output_valid_pixels": 0,
             "mean_geometry_score": 0.0,
         }
 
+    if checked_count == 0:
+        return candidate, {
+            "candidate": candidate.name,
+            "source_poc": candidate.source_poc,
+            "reference_pocs": [],
+            "input_valid_pixels": input_valid_count,
+            "geometry_checked_pixels": 0,
+            "geometry_skipped_agreement_pixels": skipped_count,
+            "geometry_supported_pixels": 0,
+            "external_geometry_supported_pixels": 0,
+            "geometry_rejected_pixels": 0,
+            "output_valid_pixels": input_valid_count,
+            "mean_geometry_score": 1.0,
+            "median_best_depth_ratio": 1.0,
+        }
+
     refs = list(reference_states)
     if candidate.source_poc is not None:
-        refs.sort(key=lambda s: 0 if s.poc == candidate.source_poc else 1)
+        refs.sort(key=lambda state: 0 if state.poc == candidate.source_poc else 1)
     refs = refs[:max_references]
 
     h, w = depth.shape
-    flat_size = h * w
-    score_sum = np.zeros(flat_size, dtype=np.float64)
-    weight_sum = np.zeros(flat_size, dtype=np.float64)
-    best_error = np.full(flat_size, np.inf, dtype=np.float64)
-    support_count = np.zeros(flat_size, dtype=np.uint8)
-    external_weight_sum = np.zeros(flat_size, dtype=np.float64)
-    best_external_error = np.full(flat_size, np.inf, dtype=np.float64)
-    external_support_count = np.zeros(flat_size, dtype=np.uint8)
-
-    ys, xs = np.nonzero(valid)
-    flat_idx_all = ys.astype(np.int64) * w + xs.astype(np.int64)
+    ys, xs = np.nonzero(check_valid)
     zs_all = depth[ys, xs].astype(np.float64, copy=False)
+    checked_flat_idx = ys.astype(np.int64) * w + xs.astype(np.int64)
+    n = xs.size
 
-    cam_target = cameras[target_poc]
-    Kt = np.asarray(cam_target["K"], dtype=np.float64)
-    zsign_t = float(cam_target["z_sign"])
+    # Allocate only for conflicting/single-candidate pixels that actually need
+    # geometry evaluation, rather than for the full frame.
+    score_sum = np.zeros(n, dtype=np.float64)
+    weight_sum = np.zeros(n, dtype=np.float64)
+    best_error = np.full(n, np.inf, dtype=np.float64)
+    support_count = np.zeros(n, dtype=np.uint8)
+    external_weight_sum = np.zeros(n, dtype=np.float64)
+    best_external_error = np.full(n, np.inf, dtype=np.float64)
+    external_support_count = np.zeros(n, dtype=np.uint8)
 
     for ref in refs:
-        cam_ref = cameras[ref.poc]
-        Kr = np.asarray(cam_ref["K"], dtype=np.float64)
-        zsign_r = float(cam_ref["z_sign"])
-        M = np.asarray(cam_ref["W2C"], dtype=np.float64) @ np.asarray(
-            cam_target["C2W"], dtype=np.float64
-        )
-        R = M[:3, :3]
-        t = M[:3, 3]
+        rel = relative_cache.get((target_poc, ref.poc))
+        if rel is None:
+            continue
         ref_weight_scale = (
             self_reference_weight
             if candidate.source_poc is not None and ref.poc == candidate.source_poc
             else 1.0
         )
 
-        for start in range(0, xs.size, chunk_pixels):
-            end = min(start + chunk_pixels, xs.size)
+        for start in range(0, n, chunk_pixels):
+            end = min(start + chunk_pixels, n)
             u = xs[start:end].astype(np.float64)
             v = ys[start:end].astype(np.float64)
             z = zs_all[start:end]
-            flat_idx = flat_idx_all[start:end]
 
             X = np.empty((3, end - start), dtype=np.float64)
-            X[0] = z * (u - Kt[0, 2]) / Kt[0, 0]
-            X[1] = z * (v - Kt[1, 2]) / Kt[1, 1]
-            X[2] = z * zsign_t
+            X[0] = z * (u - rel.src_cx) / rel.src_fx
+            X[1] = z * (v - rel.src_cy) / rel.src_fy
+            X[2] = z * rel.src_z_sign
 
-            Xr = R @ X + t[:, None]
-            zr = zsign_r * Xr[2]
+            Xr = rel.R @ X + rel.t[:, None]
+            zr = rel.dst_z_sign * Xr[2]
             front = np.isfinite(zr) & (zr >= min_depth) & (zr <= max_depth)
             if not np.any(front):
                 continue
 
             pos = np.nonzero(front)[0]
-            ur = Kr[0, 0] * Xr[0, pos] / zr[pos] + Kr[0, 2]
-            vr = Kr[1, 1] * Xr[1, pos] / zr[pos] + Kr[1, 2]
+            ur = rel.dst_fx * Xr[0, pos] / zr[pos] + rel.dst_cx
+            vr = rel.dst_fy * Xr[1, pos] / zr[pos] + rel.dst_cy
             bx = np.rint(ur).astype(np.int64)
             by = np.rint(vr).astype(np.int64)
 
@@ -1182,16 +1461,16 @@ def geometry_gate_candidate(
             if not np.any(comparable):
                 continue
 
-            dst = flat_idx[pos[comparable]]
+            local_dst = start + pos[comparable]
             e = err[comparable]
             rw = ref_c[comparable] * ref_weight_scale
             soft_score = np.exp(-np.square(e / max(soft_log_threshold, 1e-8)))
 
-            score_sum[dst] += rw * soft_score
-            weight_sum[dst] += rw
-            best_error[dst] = np.minimum(best_error[dst], e)
-            support_count[dst] = np.minimum(
-                support_count[dst].astype(np.uint16) + 1,
+            score_sum[local_dst] += rw * soft_score
+            weight_sum[local_dst] += rw
+            best_error[local_dst] = np.minimum(best_error[local_dst], e)
+            support_count[local_dst] = np.minimum(
+                support_count[local_dst].astype(np.uint16) + 1,
                 255,
             ).astype(np.uint8)
 
@@ -1199,49 +1478,49 @@ def geometry_gate_candidate(
                 candidate.source_poc is not None and ref.poc == candidate.source_poc
             )
             if not is_self_reference:
-                external_weight_sum[dst] += rw
-                best_external_error[dst] = np.minimum(best_external_error[dst], e)
-                external_support_count[dst] = np.minimum(
-                    external_support_count[dst].astype(np.uint16) + 1,
+                external_weight_sum[local_dst] += rw
+                best_external_error[local_dst] = np.minimum(
+                    best_external_error[local_dst], e
+                )
+                external_support_count[local_dst] = np.minimum(
+                    external_support_count[local_dst].astype(np.uint16) + 1,
                     255,
                 ).astype(np.uint8)
 
-    geom_score = np.ones(flat_size, dtype=np.float64)
+    geom_score = np.ones(n, dtype=np.float64)
     supported = weight_sum > 0.0
-    geom_score[supported] = score_sum[supported] / np.maximum(weight_sum[supported], 1e-12)
+    geom_score[supported] = score_sum[supported] / np.maximum(
+        weight_sum[supported], 1e-12
+    )
 
-    valid_flat = valid.reshape(-1)
     required_support = max(min_support, 1)
     enough_external = external_support_count >= required_support
     enough_any = support_count >= required_support
-
-    # Cross-anchor evidence takes precedence. Self round-trip consistency is
-    # used only when no independently decoded anchor can evaluate the pixel.
     chosen_error = np.where(enough_external, best_external_error, best_error)
     chosen_supported = enough_external | (~enough_external & enough_any)
-    hard_bad = valid_flat & chosen_supported & (
+    hard_bad_local = chosen_supported & (
         (chosen_error > hard_log_threshold) | (geom_score <= 1e-6)
     )
 
-    adjusted_conf = base_conf.reshape(-1).copy()
+    adjusted_conf_flat = base_conf.reshape(-1).copy()
     mix = float(np.clip(confidence_mix, 0.0, 1.0))
-    adjusted_conf[supported] *= (1.0 - mix) + mix * np.clip(geom_score[supported], 0.0, 1.0)
-    adjusted_conf[valid_flat & ~supported] *= unsupported_penalty
-    adjusted_conf[hard_bad] = 0.0
+    supported_global = checked_flat_idx[supported]
+    adjusted_conf_flat[supported_global] *= (
+        (1.0 - mix) + mix * np.clip(geom_score[supported], 0.0, 1.0)
+    )
+    unsupported_global = checked_flat_idx[~supported]
+    adjusted_conf_flat[unsupported_global] *= unsupported_penalty
+    hard_bad_global = checked_flat_idx[hard_bad_local]
+    adjusted_conf_flat[hard_bad_global] = 0.0
 
-    out_depth = depth.reshape(-1).copy()
-    out_depth[adjusted_conf <= 0.0] = 0.0
-    out_conf = np.clip(adjusted_conf, 0.0, 1.0).reshape(h, w).astype(np.float32)
-    out_depth = out_depth.reshape(h, w)
+    out_depth_flat = depth.reshape(-1).copy()
+    out_depth_flat[adjusted_conf_flat <= 0.0] = 0.0
+    out_conf = np.clip(adjusted_conf_flat, 0.0, 1.0).reshape(h, w).astype(np.float32)
+    out_depth = out_depth_flat.reshape(h, w)
 
     output_valid = out_conf > 0.0
-    supported_valid = valid_flat & supported
-    mean_score = (
-        float(np.mean(geom_score[supported_valid]))
-        if np.any(supported_valid)
-        else 0.0
-    )
-    finite_best = best_error[supported_valid & np.isfinite(best_error)]
+    mean_score = float(np.mean(geom_score[supported])) if np.any(supported) else 0.0
+    finite_best = best_error[supported & np.isfinite(best_error)]
     median_best_ratio = float(np.exp(np.median(finite_best))) if finite_best.size else 0.0
 
     gated = DepthCandidate(
@@ -1254,13 +1533,15 @@ def geometry_gate_candidate(
     stats = {
         "candidate": candidate.name,
         "source_poc": candidate.source_poc,
-        "reference_pocs": [s.poc for s in refs],
-        "input_valid_pixels": int(np.count_nonzero(valid)),
-        "geometry_supported_pixels": int(np.count_nonzero(supported_valid)),
+        "reference_pocs": [state.poc for state in refs],
+        "input_valid_pixels": input_valid_count,
+        "geometry_checked_pixels": checked_count,
+        "geometry_skipped_agreement_pixels": skipped_count,
+        "geometry_supported_pixels": int(np.count_nonzero(supported)),
         "external_geometry_supported_pixels": int(
-            np.count_nonzero(valid_flat & (external_weight_sum > 0.0))
+            np.count_nonzero(external_weight_sum > 0.0)
         ),
-        "geometry_rejected_pixels": int(np.count_nonzero(hard_bad)),
+        "geometry_rejected_pixels": int(np.count_nonzero(hard_bad_local)),
         "output_valid_pixels": int(np.count_nonzero(output_valid)),
         "mean_geometry_score": mean_score,
         "median_best_depth_ratio": median_best_ratio,
@@ -1627,6 +1908,15 @@ def main() -> None:
     )
     ap.add_argument("--neighborhood", type=int, default=0)
     ap.add_argument("--min-points", type=int, default=4)
+    ap.add_argument(
+        "--max-mv-samples-per-fit-block",
+        type=int,
+        default=4,
+        help=(
+            "Maximum sampled MV rows per reduced-resolution fit block before "
+            "depth solving. 0 keeps all rows."
+        ),
+    )
 
     ap.add_argument("--min-depth", type=float, default=1e-4)
     ap.add_argument("--max-depth", type=float, default=1e6)
@@ -1716,6 +2006,27 @@ def main() -> None:
     ap.add_argument("--geometry-confidence-mix", type=float, default=0.75)
     ap.add_argument("--geometry-self-reference-weight", type=float, default=0.50)
     ap.add_argument("--geometry-chunk-pixels", type=int, default=262144)
+    ap.add_argument(
+        "--geometry-skip-agreed-pixels",
+        dest="geometry_skip_agreed_pixels",
+        action="store_true",
+        default=True,
+        help="Skip reprojection where at least two candidates already agree.",
+    )
+    ap.add_argument(
+        "--no-geometry-skip-agreed-pixels",
+        dest="geometry_skip_agreed_pixels",
+        action="store_false",
+    )
+    ap.add_argument(
+        "--geometry-skip-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Multiplicative full candidate range considered already agreed. "
+            "Default: --depth-consistency-ratio."
+        ),
+    )
 
     ap.add_argument(
         "--anchor-pocs",
@@ -1752,6 +2063,7 @@ def main() -> None:
 
     ap.add_argument("--device", default="auto")
     ap.add_argument("--gpu-batch-blocks", type=int, default=4096)
+    ap.add_argument("--profile", action="store_true", help="Print per-stage timings.")
 
     args = ap.parse_args()
 
@@ -1773,6 +2085,8 @@ def main() -> None:
         raise ValueError("--fit-block must be positive")
     if args.min_points < 3:
         raise ValueError("--min-points must be >= 3")
+    if args.max_mv_samples_per_fit_block < 0:
+        raise ValueError("--max-mv-samples-per-fit-block must be >= 0")
     if args.max_propagation_sources < 0:
         raise ValueError("--max-propagation-sources must be >= 0")
     if args.propagation_splat_radius < 0:
@@ -1789,6 +2103,8 @@ def main() -> None:
         raise ValueError("--geometry-hard-ratio must be >= --geometry-consistency-ratio")
     if args.geometry_occlusion_ratio < 1.0:
         raise ValueError("--geometry-occlusion-ratio must be >= 1")
+    if args.geometry_skip_ratio is not None and args.geometry_skip_ratio <= 1.0:
+        raise ValueError("--geometry-skip-ratio must be > 1")
 
     processing_width = (args.width + args.downsample_scale - 1) // args.downsample_scale
     processing_height = (args.height + args.downsample_scale - 1) // args.downsample_scale
@@ -1809,6 +2125,7 @@ def main() -> None:
     camera_json = load_camera_jsonl(args.camera_param)
     full_cameras = build_camera_lookup(camera_json)
     cameras = scale_camera_lookup(full_cameras, args.downsample_scale)
+    relative_cache = build_relative_transform_cache(cameras)
 
     header = camera_json["header"]
     if args.depth_scale_real is None:
@@ -1858,6 +2175,9 @@ def main() -> None:
     print("propagation causality     : decoded pictures only")
     print("candidate processing      : geometry gate -> selective blend")
     print(f"max propagation sources   : {args.max_propagation_sources}")
+    print(f"MV samples / fit block    : {args.max_mv_samples_per_fit_block or 'all'}")
+    print(f"geometry skip agreed      : {args.geometry_skip_agreed_pixels}")
+    print(f"relative transform cache  : {len(relative_cache)} pairs")
     print(f"depth scale real          : {depth_scale_real:.12g}")
 
     depth_frames: List[Optional[np.ndarray]] = [None] * args.num_frames
@@ -1868,25 +2188,50 @@ def main() -> None:
     blend_log_threshold = math.log(args.depth_consistency_ratio)
     geometry_soft_log = math.log(args.geometry_consistency_ratio)
     geometry_hard_log = math.log(args.geometry_hard_ratio)
+    geometry_skip_ratio = (
+        args.depth_consistency_ratio
+        if args.geometry_skip_ratio is None
+        else args.geometry_skip_ratio
+    )
+    geometry_skip_log = math.log(geometry_skip_ratio)
+    cumulative_timing: Dict[str, float] = {
+        "mv_sampling": 0.0,
+        "mv_depth": 0.0,
+        "local_fit_render": 0.0,
+        "warp": 0.0,
+        "geometry": 0.0,
+        "fusion": 0.0,
+        "total": 0.0,
+    }
 
     for decode_rank, poc in enumerate(decode_order):
-        # All current-picture MV observations may be preloaded for simulation,
-        # but each target fit-block only consumes left/top/top-left blocks in
-        # build_block_fit_jobs(). The current target block MV is never used.
-        observations = make_depth_observations(
+        frame_start = perf_counter()
+
+        stage_start = perf_counter()
+        sampled_mvs, mv_sampling_stats = sample_mv_rows_for_processing(
             mv_rows=mv_by_frame[poc],
-            cameras=cameras,
             full_width=args.width,
             full_height=args.height,
             processing_width=processing_width,
             processing_height=processing_height,
             downsample_scale=args.downsample_scale,
+            processing_fit_block=processing_fit_block,
+            max_samples_per_fit_block=args.max_mv_samples_per_fit_block,
+        )
+        t_mv_sampling = perf_counter() - stage_start
+
+        stage_start = perf_counter()
+        observations = make_depth_observations(
+            mv_samples=sampled_mvs,
+            relative_cache=relative_cache,
             min_depth=args.min_depth,
             max_depth=args.max_depth,
             min_parallax=processing_min_parallax,
             max_reproj_error=processing_max_reproj_error,
         )
+        t_mv_depth = perf_counter() - stage_start
 
+        stage_start = perf_counter()
         jobs = build_block_fit_jobs(
             observations=observations,
             width=processing_width,
@@ -1937,7 +2282,9 @@ def main() -> None:
             coordinate_scale=float(args.downsample_scale),
         )
         local_ratio = float(np.mean(local_valid))
+        t_local = perf_counter() - stage_start
 
+        stage_start = perf_counter()
         selected_sources = select_propagation_sources(
             states=state_bank,
             target_poc=poc,
@@ -1975,8 +2322,7 @@ def main() -> None:
 
             warp_depth, warp_conf, _ = forward_warp_depth(
                 source=source,
-                cam_src=cameras[source.poc],
-                cam_dst=cameras[poc],
+                rel=relative_cache[(source.poc, poc)],
                 width=processing_width,
                 height=processing_height,
                 min_depth=args.min_depth,
@@ -2013,16 +2359,51 @@ def main() -> None:
                 }
             )
 
+        t_warp = perf_counter() - stage_start
         preserve_local = args.anchor_hole_fill_only and poc in anchor_pocs
+
+        stage_start = perf_counter()
+        geometry_check_mask, geometry_skip_stats = compute_geometry_check_mask(
+            candidates=raw_candidates,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            agreement_log_threshold=geometry_skip_log,
+            skip_agreed_pixels=args.geometry_skip_agreed_pixels,
+        )
 
         gated_candidates: List[DepthCandidate] = []
         geometry_stats: List[Dict[str, Any]] = []
-        for candidate in raw_candidates:
+        for candidate_index, candidate in enumerate(raw_candidates):
+            if preserve_local and candidate_index == 0:
+                # The local anchor predictor is copied exactly, so avoid doing
+                # geometry work that would be overwritten immediately.
+                gated_candidates.append(candidate)
+                local_valid_count = int(np.count_nonzero(candidate.confidence > 0.0))
+                geometry_stats.append(
+                    {
+                        "candidate": candidate.name,
+                        "source_poc": candidate.source_poc,
+                        "reference_pocs": [],
+                        "input_valid_pixels": local_valid_count,
+                        "geometry_checked_pixels": 0,
+                        "geometry_skipped_agreement_pixels": local_valid_count,
+                        "geometry_supported_pixels": 0,
+                        "external_geometry_supported_pixels": 0,
+                        "geometry_rejected_pixels": 0,
+                        "output_valid_pixels": local_valid_count,
+                        "mean_geometry_score": 1.0,
+                        "median_best_depth_ratio": 1.0,
+                        "skip_reason": "anchor_local_preserved",
+                    }
+                )
+                continue
+
             gated, gstats = geometry_gate_candidate(
                 candidate=candidate,
                 target_poc=poc,
                 reference_states=selected_sources,
-                cameras=cameras,
+                relative_cache=relative_cache,
+                geometry_check_mask=geometry_check_mask,
                 min_depth=args.min_depth,
                 max_depth=args.max_depth,
                 soft_log_threshold=geometry_soft_log,
@@ -2039,12 +2420,8 @@ def main() -> None:
             gated_candidates.append(gated)
             geometry_stats.append(gstats)
 
-        if preserve_local:
-            # POC 8/16/24-type anchors already have reliable local structure.
-            # Geometry diagnostics are kept, but local valid pixels themselves
-            # are not removed or attenuated by temporal candidates.
-            gated_candidates[0] = raw_candidates[0]
-
+        t_geometry = perf_counter() - stage_start
+        stage_start = perf_counter()
         final_depth, final_conf, selected_label, fusion_stats = fuse_depth_candidates(
             candidates=gated_candidates,
             min_depth=args.min_depth,
@@ -2055,6 +2432,7 @@ def main() -> None:
             preserve_local_valid=preserve_local,
         )
 
+        t_fusion = perf_counter() - stage_start
         final_valid = final_depth > 0.0
         final_ratio = float(np.mean(final_valid))
         mean_conf = float(np.mean(final_conf[final_valid])) if np.any(final_valid) else 0.0
@@ -2083,6 +2461,7 @@ def main() -> None:
             "is_anchor": poc in anchor_pocs,
             "anchor_local_preserved": preserve_local,
             "mv_rows": len(mv_by_frame[poc]),
+            "mv_sampling": mv_sampling_stats,
             "valid_depth_observations": len(observations),
             "fit_jobs": len(jobs),
             "successful_planes": sum(c is not None for c in coeffs),
@@ -2092,9 +2471,24 @@ def main() -> None:
             "quality_score": quality_score,
             "selected_source_pocs": [s.poc for s in selected_sources],
             "propagation_sources": source_stats,
+            "geometry_skip": geometry_skip_stats,
             "geometry_candidates": geometry_stats,
             "fusion": fusion_stats,
         }
+
+        t_total = perf_counter() - frame_start
+        timing = {
+            "mv_sampling": t_mv_sampling,
+            "mv_depth": t_mv_depth,
+            "local_fit_render": t_local,
+            "warp": t_warp,
+            "geometry": t_geometry,
+            "fusion": t_fusion,
+            "total": t_total,
+        }
+        frame_stats_by_poc[poc]["timing_seconds"] = timing
+        for key, value in timing.items():
+            cumulative_timing[key] += value
 
         print_progress(
             decode_rank=decode_rank,
@@ -2105,8 +2499,19 @@ def main() -> None:
             final_ratio=final_ratio,
             num_sources=len(selected_sources),
         )
+        if args.profile:
+            print(
+                f"\n  time poc={poc:3d}: sample={t_mv_sampling:.3f}s "
+                f"mv={t_mv_depth:.3f}s local={t_local:.3f}s "
+                f"warp={t_warp:.3f}s geom={t_geometry:.3f}s "
+                f"fuse={t_fusion:.3f}s total={t_total:.3f}s"
+            )
 
     print()
+    if args.profile:
+        print("Cumulative stage time:")
+        for key, value in cumulative_timing.items():
+            print(f"  {key:18s}: {value:.3f}s")
 
     zero_depth = np.zeros(
         (processing_height, processing_width), dtype=np.float64
@@ -2155,6 +2560,8 @@ def main() -> None:
                 "num_frames": args.num_frames,
                 "fit_block_full_resolution": args.fit_block,
                 "fit_block_processing_resolution": processing_fit_block,
+                "max_mv_samples_per_fit_block": args.max_mv_samples_per_fit_block,
+                "relative_transform_cache_pairs": len(relative_cache),
                 "max_reproj_error_full_pixels": args.max_reproj_error,
                 "max_reproj_error_processing_pixels": processing_max_reproj_error,
                 "max_plane_slope_full_pixel": args.max_plane_slope,
@@ -2171,8 +2578,11 @@ def main() -> None:
                 "depth_consistency_ratio": args.depth_consistency_ratio,
                 "geometry_consistency_ratio": args.geometry_consistency_ratio,
                 "geometry_hard_ratio": args.geometry_hard_ratio,
+                "geometry_skip_agreed_pixels": args.geometry_skip_agreed_pixels,
+                "geometry_skip_ratio": geometry_skip_ratio,
                 "depth_scale_real": depth_scale_real,
                 "device": device,
+                "cumulative_timing_seconds": cumulative_timing,
                 "frames_decode_order": [frame_stats_by_poc[p] for p in decode_order],
                 "frames_poc_order": [frame_stats_by_poc[p] for p in range(args.num_frames)],
             },
