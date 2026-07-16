@@ -481,48 +481,106 @@ def huber_weights(residual: np.ndarray, delta: float) -> np.ndarray:
     return w
 
 
-def fit_inv_depth_plane_cpu(
+
+def _weighted_constant_inv_depth(
+    invz: np.ndarray,
+    weights: np.ndarray,
+) -> Optional[float]:
+    sw = float(np.sum(weights))
+    if not math.isfinite(sw) or sw <= 1e-12:
+        return None
+    c = float(np.sum(weights * invz) / sw)
+    return c if math.isfinite(c) and c > 0.0 else None
+
+
+def _solve_weighted_plane_normal_equation(
+    dx: np.ndarray,
+    dy: np.ndarray,
+    invz: np.ndarray,
+    weights: np.ndarray,
+    determinant_threshold: float,
+) -> Optional[np.ndarray]:
+    """Solve a 3-parameter weighted plane without eigendecomposition."""
+    sxx = float(np.sum(weights * dx * dx))
+    syy = float(np.sum(weights * dy * dy))
+    sxy = float(np.sum(weights * dx * dy))
+    sx = float(np.sum(weights * dx))
+    sy = float(np.sum(weights * dy))
+    sw = float(np.sum(weights))
+    sxz = float(np.sum(weights * dx * invz))
+    syz = float(np.sum(weights * dy * invz))
+    sz = float(np.sum(weights * invz))
+
+    # Determinant of the symmetric normal matrix.
+    det = (
+        sxx * (syy * sw - sy * sy)
+        - sxy * (sxy * sw - sy * sx)
+        + sx * (sxy * sy - syy * sx)
+    )
+    scale = max(abs(sxx), abs(syy), abs(sw), 1.0)
+    if not math.isfinite(det) or abs(det) <= determinant_threshold * scale * scale * scale:
+        return None
+
+    normal = np.array(
+        [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, sw]],
+        dtype=np.float64,
+    )
+    rhs = np.array([sxz, syz, sz], dtype=np.float64)
+    try:
+        coeff = np.linalg.solve(normal, rhs)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.isfinite(coeff).all() or coeff[2] <= 0.0:
+        return None
+    return coeff
+
+
+def fit_inv_depth_plane_fast_cpu(
     xs: np.ndarray,
     ys: np.ndarray,
     depths: np.ndarray,
     reproj_errors: np.ndarray,
     cx: float,
     cy: float,
-    irls_iters: int,
-    huber_delta: float,
-    min_condition: float,
+    constant_relative_threshold: float,
+    refit_relative_threshold: float,
+    determinant_threshold: float,
+    enable_refit: bool,
 ) -> Optional[np.ndarray]:
+    """Decoder-oriented local fit: c-only early exit, one WLS, optional refit."""
     if depths.size < 3:
         return None
 
     invz = 1.0 / depths
-    A = np.stack([xs - cx, ys - cy, np.ones_like(xs)], axis=1)
     weights = 1.0 / np.maximum(1.0 + reproj_errors * reproj_errors, 1e-6)
-
-    coeff = None
-    for _ in range(max(1, irls_iters)):
-        sw = np.sqrt(np.maximum(weights, 1e-10))
-        Aw = A * sw[:, None]
-        bw = invz * sw
-
-        normal = Aw.T @ Aw
-        eig = np.linalg.eigvalsh(normal)
-        if eig[-1] <= 1e-15 or eig[0] / eig[-1] < min_condition:
-            return None
-
-        try:
-            coeff = np.linalg.solve(normal, Aw.T @ bw)
-        except np.linalg.LinAlgError:
-            return None
-
-        residual = invz - A @ coeff
-        scale = 1.4826 * np.median(np.abs(residual - np.median(residual)))
-        scale = max(float(scale), 1e-8)
-        robust = huber_weights(residual / scale, huber_delta)
-        weights = robust / np.maximum(1.0 + reproj_errors * reproj_errors, 1e-6)
-
-    if coeff is None or not np.isfinite(coeff).all():
+    c_only = _weighted_constant_inv_depth(invz, weights)
+    if c_only is None:
         return None
+
+    c_residual = np.abs(invz - c_only) / np.maximum(invz, 1e-12)
+    weighted_c_error = float(np.sum(weights * c_residual) / max(np.sum(weights), 1e-12))
+    if weighted_c_error <= constant_relative_threshold:
+        return np.array([0.0, 0.0, c_only], dtype=np.float64)
+
+    dx = xs - cx
+    dy = ys - cy
+    coeff = _solve_weighted_plane_normal_equation(
+        dx, dy, invz, weights, determinant_threshold
+    )
+    if coeff is None:
+        return np.array([0.0, 0.0, c_only], dtype=np.float64)
+
+    if enable_refit and depths.size >= 4:
+        pred = coeff[0] * dx + coeff[1] * dy + coeff[2]
+        rel = np.abs(pred - invz) / np.maximum(invz, 1e-12)
+        inlier = rel <= refit_relative_threshold
+        if 3 <= int(np.count_nonzero(inlier)) < depths.size:
+            refit = _solve_weighted_plane_normal_equation(
+                dx[inlier], dy[inlier], invz[inlier], weights[inlier], determinant_threshold
+            )
+            if refit is not None:
+                coeff = refit
+
     return coeff.astype(np.float64)
 
 
@@ -893,6 +951,7 @@ def build_block_fit_jobs(
     return jobs
 
 
+
 def render_jobs(
     jobs: List[Dict[str, Any]],
     coeffs: List[Optional[np.ndarray]],
@@ -904,6 +963,7 @@ def render_jobs(
     min_points: int,
     coordinate_scale: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Render with row/pixel increments; no per-block meshgrid allocation."""
     depth = np.zeros((height, width), dtype=np.float64)
     valid = np.zeros((height, width), dtype=bool)
     confidence = np.zeros((height, width), dtype=np.float32)
@@ -920,45 +980,37 @@ def render_jobs(
         bw, bh = int(job["bw"]), int(job["bh"])
         cx, cy = float(job["cx"]), float(job["cy"])
 
-        gx = np.arange(bx, bx + bw, dtype=np.float64)
-        gy = np.arange(by, by + bh, dtype=np.float64)
-        xx, yy = np.meshgrid(gx, gy)
-
-        invz = a * (xx - cx) + b * (yy - cy) + c
-        block_valid = np.isfinite(invz) & (invz > 1.0 / max_depth)
-        z = np.zeros_like(invz)
-        z[block_valid] = 1.0 / invz[block_valid]
-        block_valid &= (z >= min_depth) & (z <= max_depth)
-
-        if not np.any(block_valid):
-            continue
-
-        obs_invz = 1.0 / np.asarray(job["depths"], dtype=np.float64)
-        obs_pred = (
-            a * (np.asarray(job["xs"]) - cx)
-            + b * (np.asarray(job["ys"]) - cy)
-            + c
-        )
+        obs_invz = 1.0 / job["depths"]
+        obs_pred = a * (job["xs"] - cx) + b * (job["ys"] - cy) + c
         rel_residual = np.abs(obs_pred - obs_invz) / np.maximum(obs_invz, 1e-12)
-        fit_error = float(np.median(rel_residual))
-        reproj = float(np.median(np.asarray(job["errors"], dtype=np.float64)))
+        fit_error = float(np.mean(rel_residual))
+        reproj = float(np.mean(job["errors"]))
         point_factor = min(1.0, len(job["depths"]) / max(2.0 * min_points, 1.0))
         fit_conf = math.exp(-4.0 * fit_error)
         reproj_conf = 1.0 / (1.0 + reproj * reproj)
-        # a and b are expressed per reduced-resolution pixel. Normalize
-        # them back to the original pixel scale for confidence calculation.
         slope_norm = (abs(a) + abs(b)) / max(float(coordinate_scale), 1e-12)
         slope_conf = 1.0 / (1.0 + slope_norm)
-        block_conf = float(np.clip(point_factor * fit_conf * reproj_conf * slope_conf, 0.02, 1.0))
+        block_conf = float(np.clip(
+            point_factor * fit_conf * reproj_conf * slope_conf, 0.02, 1.0
+        ))
 
-        dst = depth[by:by + bh, bx:bx + bw]
-        vm = valid[by:by + bh, bx:bx + bw]
-        cm = confidence[by:by + bh, bx:bx + bw]
-        dst[block_valid] = z[block_valid]
-        vm[block_valid] = True
-        cm[block_valid] = block_conf
+        inv_row = a * (bx - cx) + b * (by - cy) + c
+        for yy in range(bh):
+            inv_value = inv_row
+            dst_y = by + yy
+            for xx in range(bw):
+                dst_x = bx + xx
+                if math.isfinite(inv_value) and inv_value > 1.0 / max_depth:
+                    z = 1.0 / inv_value
+                    if min_depth <= z <= max_depth:
+                        depth[dst_y, dst_x] = z
+                        valid[dst_y, dst_x] = True
+                        confidence[dst_y, dst_x] = block_conf
+                inv_value += a
+            inv_row += b
 
     return depth, valid, confidence
+
 
 
 # ============================================================
@@ -1050,6 +1102,7 @@ def select_propagation_sources(
     return candidates[:max_sources]
 
 
+
 def _update_zbuffer_chunk(
     depth_buffer: np.ndarray,
     conf_buffer: np.ndarray,
@@ -1060,15 +1113,11 @@ def _update_zbuffer_chunk(
     conf: np.ndarray,
     source_id: int,
 ) -> None:
+    """Nearest-depth reduction without sorting destination indices."""
     h, w = depth_buffer.shape
     inside = (
-        np.isfinite(z)
-        & np.isfinite(conf)
-        & (conf > 0.0)
-        & (x >= 0)
-        & (x < w)
-        & (y >= 0)
-        & (y < h)
+        np.isfinite(z) & np.isfinite(conf) & (conf > 0.0)
+        & (x >= 0) & (x < w) & (y >= 0) & (y < h)
     )
     if not np.any(inside):
         return
@@ -1079,27 +1128,24 @@ def _update_zbuffer_chunk(
     conf = conf[inside]
     idx = y * w + x
 
-    # Sort by destination index, then nearest depth. Keep one sample per pixel.
-    order = np.lexsort((z, idx))
-    idx_s = idx[order]
-    first = np.empty(idx_s.size, dtype=bool)
-    first[0] = True
-    first[1:] = idx_s[1:] != idx_s[:-1]
-    chosen = order[first]
-
-    idx_c = idx[chosen]
-    z_c = z[chosen]
-    c_c = conf[chosen]
-
     flat_d = depth_buffer.reshape(-1)
+    local_min = np.full(flat_d.size, np.inf, dtype=np.float64)
+    np.minimum.at(local_min, idx, z)
+    touched = np.isfinite(local_min)
+    replace = touched & (local_min < flat_d)
+    if not np.any(replace):
+        return
+
+    # Recover confidence for the winning depth. Exact ties use max confidence.
+    winning_sample = np.isclose(z, local_min[idx], rtol=1e-10, atol=1e-12)
+    local_conf = np.zeros(flat_d.size, dtype=np.float64)
+    np.maximum.at(local_conf, idx[winning_sample], conf[winning_sample])
+
     flat_c = conf_buffer.reshape(-1)
     flat_s = src_buffer.reshape(-1)
-    replace = z_c < flat_d[idx_c]
-    if np.any(replace):
-        dst_idx = idx_c[replace]
-        flat_d[dst_idx] = z_c[replace]
-        flat_c[dst_idx] = c_c[replace]
-        flat_s[dst_idx] = source_id
+    flat_d[replace] = local_min[replace]
+    flat_c[replace] = local_conf[replace]
+    flat_s[replace] = source_id
 
 
 def forward_warp_depth(
@@ -1649,6 +1695,68 @@ def fuse_depth_candidates(
     return out_depth, out_conf.astype(np.float32), selected_label, stats
 
 
+
+def fill_fused_depth_holes(
+    depth: np.ndarray,
+    confidence: np.ndarray,
+    selected_label: np.ndarray,
+    radius: int,
+    confidence_decay: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
+    """Fill only invalid fused pixels once, choosing the highest-confidence neighbor."""
+    if radius <= 0:
+        return depth, confidence, selected_label, {"hole_pixels_filled": 0}
+
+    src_depth = np.asarray(depth, dtype=np.float64)
+    src_conf = np.asarray(confidence, dtype=np.float32)
+    invalid = (src_depth <= 0.0) | (src_conf <= 0.0)
+    if not np.any(invalid):
+        return depth, confidence, selected_label, {"hole_pixels_filled": 0}
+
+    h, w = src_depth.shape
+    best_depth = np.zeros_like(src_depth)
+    best_conf = np.zeros_like(src_conf)
+    best_label = np.full_like(selected_label, -1)
+
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                continue
+            y_dst0 = max(0, -dy)
+            y_dst1 = min(h, h - dy)
+            x_dst0 = max(0, -dx)
+            x_dst1 = min(w, w - dx)
+            if y_dst0 >= y_dst1 or x_dst0 >= x_dst1:
+                continue
+            y_src0, y_src1 = y_dst0 + dy, y_dst1 + dy
+            x_src0, x_src1 = x_dst0 + dx, x_dst1 + dx
+
+            candidate_conf = src_conf[y_src0:y_src1, x_src0:x_src1]
+            candidate_depth = src_depth[y_src0:y_src1, x_src0:x_src1]
+            dst_invalid = invalid[y_dst0:y_dst1, x_dst0:x_dst1]
+            current_best = best_conf[y_dst0:y_dst1, x_dst0:x_dst1]
+            choose = dst_invalid & (candidate_depth > 0.0) & (candidate_conf > current_best)
+            if not np.any(choose):
+                continue
+            bd = best_depth[y_dst0:y_dst1, x_dst0:x_dst1]
+            bc = best_conf[y_dst0:y_dst1, x_dst0:x_dst1]
+            bl = best_label[y_dst0:y_dst1, x_dst0:x_dst1]
+            bd[choose] = candidate_depth[choose]
+            bc[choose] = candidate_conf[choose]
+            bl[choose] = selected_label[y_src0:y_src1, x_src0:x_src1][choose]
+
+    fill = invalid & (best_depth > 0.0) & (best_conf > 0.0)
+    out_depth = src_depth.copy()
+    out_conf = src_conf.copy()
+    out_label = selected_label.copy()
+    out_depth[fill] = best_depth[fill]
+    out_conf[fill] = np.clip(best_conf[fill] * confidence_decay, 0.0, 1.0)
+    out_label[fill] = best_label[fill]
+    return out_depth, out_conf, out_label, {
+        "hole_pixels_filled": int(np.count_nonzero(fill))
+    }
+
+
 # ============================================================
 # Output / final upsampling
 # ============================================================
@@ -1939,6 +2047,24 @@ def main() -> None:
     )
 
     ap.add_argument(
+        "--constant-plane-relative-threshold", type=float, default=0.04,
+        help="Use c-only when weighted relative inverse-depth error is below this value.",
+    )
+    ap.add_argument(
+        "--plane-refit-relative-threshold", type=float, default=0.08,
+        help="Samples above this relative inverse-depth error are removed for one optional refit.",
+    )
+    ap.add_argument(
+        "--plane-determinant-threshold", type=float, default=1e-10,
+        help="Relative determinant threshold for rejecting an unstable 3x3 normal equation.",
+    )
+    ap.add_argument(
+        "--plane-refit", dest="plane_refit", action="store_true", default=True,
+        help="Perform at most one inlier-only plane refit.",
+    )
+    ap.add_argument("--no-plane-refit", dest="plane_refit", action="store_false")
+
+    ap.add_argument(
         "--decode-order",
         default="ra",
         help=(
@@ -1946,17 +2072,25 @@ def main() -> None:
             "explicit comma-separated POC list."
         ),
     )
-    ap.add_argument("--max-propagation-sources", type=int, default=4)
+    ap.add_argument("--max-propagation-sources", type=int, default=2)
     ap.add_argument("--min-source-quality", type=float, default=0.01)
     ap.add_argument("--source-poc-distance-scale", type=float, default=16.0)
     ap.add_argument("--source-decode-distance-scale", type=float, default=8.0)
     ap.add_argument(
         "--propagation-splat-radius",
         type=int,
-        default=1,
-        help="Splat radius in reduced-resolution processing pixels.",
+        default=0,
+        help="Splat radius in reduced-resolution processing pixels; decoder-oriented default is 0.",
     )
     ap.add_argument("--propagation-chunk-pixels", type=int, default=262144)
+    ap.add_argument(
+        "--post-fusion-hole-fill-radius", type=int, default=1,
+        help="Fill invalid fused pixels once using neighbors in this processing-pixel radius.",
+    )
+    ap.add_argument(
+        "--post-fusion-hole-fill-confidence-decay", type=float, default=0.75,
+        help="Confidence multiplier for post-fusion hole-filled pixels.",
+    )
     ap.add_argument(
         "--propagation-half-life",
         type=float,
@@ -2091,6 +2225,10 @@ def main() -> None:
         raise ValueError("--max-propagation-sources must be >= 0")
     if args.propagation_splat_radius < 0:
         raise ValueError("--propagation-splat-radius must be >= 0")
+    if args.post_fusion_hole_fill_radius < 0:
+        raise ValueError("--post-fusion-hole-fill-radius must be >= 0")
+    if not (0.0 <= args.post_fusion_hole_fill_confidence_decay <= 1.0):
+        raise ValueError("--post-fusion-hole-fill-confidence-decay must be in [0,1]")
     if args.geometry_sample_radius < 0:
         raise ValueError("--geometry-sample-radius must be >= 0")
     if args.geometry_max_references < 0:
@@ -2175,6 +2313,9 @@ def main() -> None:
     print("propagation causality     : decoded pictures only")
     print("candidate processing      : geometry gate -> selective blend")
     print(f"max propagation sources   : {args.max_propagation_sources}")
+    print(f"propagation splat radius  : {args.propagation_splat_radius}")
+    print(f"post-fusion hole fill     : radius {args.post_fusion_hole_fill_radius}")
+    print(f"local fit                 : c-only early exit + 1 WLS + optional refit")
     print(f"MV samples / fit block    : {args.max_mv_samples_per_fit_block or 'all'}")
     print(f"geometry skip agreed      : {args.geometry_skip_agreed_pixels}")
     print(f"relative transform cache  : {len(relative_cache)} pairs")
@@ -2242,33 +2383,23 @@ def main() -> None:
         )
 
         coeffs: List[Optional[np.ndarray]] = []
-        if use_cuda and jobs:
-            for start in range(0, len(jobs), args.gpu_batch_blocks):
-                batch = jobs[start:start + args.gpu_batch_blocks]
-                coeffs.extend(
-                    fit_inv_depth_planes_gpu(
-                        blocks=batch,
-                        irls_iters=args.irls_iters,
-                        huber_delta=args.huber_delta,
-                        min_condition=args.min_condition,
-                        device=device,
-                    )
+        # The decoder-oriented fitter is intentionally CPU scalar/small-array code.
+        # GPU batching of thousands of tiny 3x3 systems costs more transfer/setup.
+        for job in jobs:
+            coeffs.append(
+                fit_inv_depth_plane_fast_cpu(
+                    xs=job["xs"],
+                    ys=job["ys"],
+                    depths=job["depths"],
+                    reproj_errors=job["errors"],
+                    cx=job["cx"],
+                    cy=job["cy"],
+                    constant_relative_threshold=args.constant_plane_relative_threshold,
+                    refit_relative_threshold=args.plane_refit_relative_threshold,
+                    determinant_threshold=args.plane_determinant_threshold,
+                    enable_refit=args.plane_refit,
                 )
-        else:
-            for job in jobs:
-                coeffs.append(
-                    fit_inv_depth_plane_cpu(
-                        xs=job["xs"],
-                        ys=job["ys"],
-                        depths=job["depths"],
-                        reproj_errors=job["errors"],
-                        cx=job["cx"],
-                        cy=job["cy"],
-                        irls_iters=args.irls_iters,
-                        huber_delta=args.huber_delta,
-                        min_condition=args.min_condition,
-                    )
-                )
+            )
 
         local_depth, local_valid, local_conf = render_jobs(
             jobs=jobs,
@@ -2432,6 +2563,15 @@ def main() -> None:
             preserve_local_valid=preserve_local,
         )
 
+        final_depth, final_conf, selected_label, hole_fill_stats = fill_fused_depth_holes(
+            depth=final_depth,
+            confidence=final_conf,
+            selected_label=selected_label,
+            radius=args.post_fusion_hole_fill_radius,
+            confidence_decay=args.post_fusion_hole_fill_confidence_decay,
+        )
+        fusion_stats["post_fusion_hole_fill"] = hole_fill_stats
+
         t_fusion = perf_counter() - stage_start
         final_valid = final_depth > 0.0
         final_ratio = float(np.mean(final_valid))
@@ -2575,6 +2715,13 @@ def main() -> None:
                 "propagation_causality": "already-decoded-depth-only",
                 "candidate_policy": "geometry-gate-then-selective-inverse-depth-blend",
                 "max_propagation_sources": args.max_propagation_sources,
+                "propagation_splat_radius": args.propagation_splat_radius,
+                "post_fusion_hole_fill_radius": args.post_fusion_hole_fill_radius,
+                "post_fusion_hole_fill_confidence_decay": args.post_fusion_hole_fill_confidence_decay,
+                "constant_plane_relative_threshold": args.constant_plane_relative_threshold,
+                "plane_refit_relative_threshold": args.plane_refit_relative_threshold,
+                "plane_determinant_threshold": args.plane_determinant_threshold,
+                "plane_refit": args.plane_refit,
                 "depth_consistency_ratio": args.depth_consistency_ratio,
                 "geometry_consistency_ratio": args.geometry_consistency_ratio,
                 "geometry_hard_ratio": args.geometry_hard_ratio,
