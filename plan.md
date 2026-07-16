@@ -1,523 +1,734 @@
-Before writing any code, do not implement or modify anything.
+Analyze the entire codec source and prepare a detailed implementation plan for adding an MMVD-like 2D refinement mechanism to the existing camera/depth projection-based prediction tool.
 
-First inspect the codec repository and the attached Python simulation script, then produce a detailed implementation plan for integrating the Camera+Depth prediction tool.
+Do not implement the feature yet.
 
-You may search and read repository files, trace call paths, and inspect existing implementations. Do not edit files, generate patches, or write implementation code.
+Your task is to:
 
-1. Source-of-truth rules
+1. Analyze the current projection tool implementation and call flow.
+2. Analyze the existing MMVD implementation and call flow.
+3. Identify which MMVD design concepts can be reused.
+4. Design a completely independent refinement framework dedicated to the projection tool.
+5. Produce a file/function-level implementation plan.
 
-The attached Python script is an algorithmic reference, not the final codec specification.
+Do not assume any projection-related flag names, mode names, function names, or data structures before analyzing the actual source code. Use the real identifiers only after locating them.
 
-Use it to understand:
+⸻
 
-* Camera parameter representation and relative transforms
-* The inverse-depth plane model
-* MV-to-depth reconstruction
-* Forward projection of reconstructed reference depth
-* Plane fitting
-* Plane quantization
-* Camera projection
-* Projection-domain warped-Y SATD evaluation
+1. Goal
 
-Do not copy its architecture directly.
+The existing tool roughly performs the following process:
 
-The Python script contains experimental behavior that does not match the final codec design, including:
+Current pixel + depth
+→ 3D camera transformation
+→ Projection into the reference frame
+→ Reference sampling
+→ Prediction generation
 
-* Separate left, top, top_left, and spatial_all syntax candidates
-* Separate fw_ref_<POC> candidates
-* A manually maintained categorical probability model
-* Generic best-reference selection using original-Y SATD
-* Fixed block sizes
-* Implicit zero-bit DepthReuseBuffer
-* Zero-anchor simulation rules
-* A single generic predictor-residual mode instead of separate C-only and full residual modes
+One of the existing prediction paths roughly behaves as follows:
 
-Start your response with a table describing the differences between the Python simulator and the intended codec design.
+Use an existing merge candidate
+→ Generate projection-based prediction
+→ Skip residual coding
 
-2. Inspect the current codec first
+The goal is to extend this path by introducing a small image-space refinement.
 
-Before proposing an architecture, locate and analyze the existing code related to:
+Projected reference position
++ small horizontal/vertical displacement
+→ final sampling position
 
-* Camera projection or CamProj prediction
-* Camera parameter storage and parsing
-* CU-level CamProj flags and state
-* Encoder inter-mode RDO
-* Decoder inter reconstruction
-* MotionInfo and MotionBuf
-* spanMotionInfo
-* Spatial Merge candidate derivation
-* HMVP insertion and reuse
-* L0/L1 reference-list handling
-* CABAC writer, reader, estimator, and context definitions
-* Existing plane, depth, or geometry-related utilities
+The purpose is to compensate for small projection errors caused by camera parameter inaccuracies, depth inaccuracies, and quantization errors without transmitting residuals.
 
-The repository may already contain part of the Camera Projection tool. Reuse and extend the existing implementation rather than creating a parallel duplicate tool.
+Initially, consider the following refinement candidates:
 
-For every proposed change, identify exact existing:
+Directions
+- right
+- left
+- down
+- up
+Steps
+- 1/4 pel
+- 1/2 pel
+- 1 pel
+- 2 pel
 
-* Files
-* Classes
-* Functions
-* Call sites
-* Data structures
+This gives
 
-Do not give only generic architectural recommendations.
+4 directions × 4 steps = 16 refinement candidates
 
-3. Final predictor architecture
+If a better candidate structure exists after analyzing the actual implementation, explain why and propose it.
 
-The predictor families have a permanently fixed logical order:
+⸻
 
-1. Forward Average
-2. MV Sample Best
-3. Forward Single
-4. Neighbor Depth Plane
-5. History Plane
+2. Most Important Design Rules
 
-The predictor order must never change by frame, slice, camera motion, or sequence.
+2.1 Never modify the existing MMVD implementation
 
-Unavailable candidates are removed before candidate-index coding.
+The existing MMVD implementation must be used only as a reference.
 
-Example:
+Do not modify:
 
-Logical order:
+* MMVD data structures
+* MMVD index definition
+* MMVD candidate generation
+* MMVD delta generation
+* MMVD merge candidate setup
+* MMVD encoder RDO
+* MMVD CABAC writer
+* MMVD CABAC reader
+* MMVD context models
+* MMVD decoder
+* MMVD MotionInfo generation
+* MMVD syntax
+* MMVD candidate configuration
 
-* Forward Average: unavailable
-* MV Sample Best: available
-* Forward Single: available
-* Neighbor Depth Plane: available
-* History Plane: unavailable
+Do not insert projection-related conditions inside existing MMVD functions.
 
-The coded available list becomes:
+For example, the following approach is forbidden:
 
-* index 0: MV Sample Best
-* index 1: Forward Single
-* index 2: Neighbor Depth Plane
+void ExistingMmvdFunction(...)
+{
+#if GlobalMotion
+    if (projectionCondition)
+    {
+        ...
+    }
+#endif
+    ...
+}
 
-The encoder and decoder must independently generate exactly the same available list in exactly the same order.
+The existing MMVD bitstream, encoder behavior, decoder behavior, and coding performance must remain completely unchanged.
 
-Propose:
+⸻
+
+2.2 Use MMVD only as a design reference
+
+The following MMVD concepts may be reused conceptually:
+
+* refinement index structure
+* direction + step representation
+* internal MV precision handling
+* unary/truncated-unary syntax design
+* SATD-based candidate pruning
+* full-RD workflow
+* encoder/decoder symmetric refinement reconstruction
+* MotionInfo update strategy
 
-* Candidate data structures
-* Candidate availability rules
-* Candidate-list generation functions
-* Encoder/decoder shared utility placement
-* Assertions or debug checks that verify candidate-list equality
+However, all implementation must be newly created specifically for the projection tool.
 
-4. Decoder determinism requirement
+If necessary, create entirely new:
 
-No candidate may contain a hidden encoder-only decision.
+* refinement index
+* delta generation function
+* candidate generation function
+* CU state
+* syntax
+* CABAC writer
+* CABAC reader
+* context models
+* encoder RDO
+* decoder reconstruction
+* debug/statistics
+
+Do not directly reuse MMVD-specific classes or functions.
 
-In particular, do not select an internal left, top, top-left, or other subcandidate using original-picture SATD unless that choice is explicitly signaled.
+General codec utilities (for example MV precision constants or common helper functions) may be reused, but nothing should modify or depend on MMVD-specific states or probability models.
+
+⸻
+
+3. Every modification must be protected by #if GlobalMotion
+
+This is mandatory.
+
+Every new or modified code section must be enclosed by
+
+#if GlobalMotion
+...
+#endif
+
+This includes:
+
+* constants
+* enums
+* new data structures
+* CU members
+* prediction states
+* declarations
+* implementations
+* encoder candidate generation
+* encoder RDO
+* decoder code
+* CABAC writer
+* CABAC reader
+* context models
+* syntax
+* initialization
+* copy/reset functions
+* MotionInfo update
+* configuration
+* tracing
+* debug code
+* statistics
+* call-site modifications
+
+For example,
+
+#if GlobalMotion
+// new CU members
+#endif
+
+Initialization:
+
+#if GlobalMotion
+...
+#endif
+
+Function declarations:
+
+#if GlobalMotion
+void NewProjectionRefinementFunction(...);
+#endif
+
+Function definitions:
+
+#if GlobalMotion
+void NewProjectionRefinementFunction(...)
+{
+    ...
+}
+#endif
+
+When GlobalMotion == 0, the codec must:
+
+* compile successfully
+* expose no new symbols
+* preserve identical behavior
+* preserve identical bitstreams
+* introduce no unused variables
+* introduce no linker errors
+
+For every proposed modification, explicitly specify where #if GlobalMotion should be placed.
+
+⸻
+
+4. MMVD Analysis
+
+Analyze the complete MMVD pipeline.
+
+The overall flow is approximately:
+
+Merge candidate generation
+→ base candidate selection
+→ refinement index decoding
+→ delta MV generation
+→ motion refinement
+→ motion compensation
+→ SATD pruning
+→ full RD
+→ CABAC encoding
+→ decoder reconstruction
+→ MotionInfo generation
+
+At minimum, trace:
+
+* MMVD index definition
+* base candidate generation
+* delta MV generation
+* CU setup
+* encoder first-pass candidate generation
+* SATD/SAD pruning
+* full RD
+* residual and skip paths
+* bit estimation
+* CABAC writer
+* CABAC reader
+* context models
+* decoder reconstruction
+* MotionInfo generation
+
+For every stage, document:
+
+File
+Function
+Inputs
+Outputs
+State changes
+Next function
 
-Review the intended meaning of MV Sample Best.
+⸻
 
-The preferred direction is one decoder-reproducible candidate derived from available neighboring MotionInfo, for example:
+5. Projection Tool Analysis
 
-* Gather all valid neighboring MV observations
-* Convert the observations to depth samples
-* Reject unreliable samples using decoder-available checks
-* Fit one plane using a deterministic rule
+Do not assume any existing identifiers.
+
+Find the actual implementation and analyze:
+
+State & Syntax
+
+* tool enable conditions
+* merge-related path
+* residual-free path
+* candidate indices
+* reference list handling
+* CU state
+* initialization/reset/copy
+* SPS/PPS/picture-level enable
+* syntax order
 
-If a meaningful “best” selection cannot be reproduced by the decoder, identify the problem and propose either:
+Encoder
 
-* A deterministic combined derivation, or
-* Minimal additional syntax
+* candidate generation
+* merge integration
+* residual-free path
+* first-pass distortion
+* pruning
+* full RD
+* bit estimation
+* final mode decision
+* reconstruction
 
-Apply the same determinism requirement to:
+Prediction
 
-* Neighbor Depth Plane
-* History Plane
-* Forward Average
-* Forward Single
+* depth loading
+* camera loading
+* 3D transformation
+* projection
+* reference coordinate generation
+* interpolation
+* boundary handling
+* invalid handling
+* uni-pred
+* bi-pred
+* prediction buffer generation
 
-5. Forward Single
+MotionInfo
 
-Forward Single is one predictor family.
+* how motion is stored
+* block/subblock motion
+* MotionInfo generation
+* merge reuse
+* temporal reuse
+* HMVP
+* affine interaction
+* filtering dependencies
 
-It may internally have up to two alternatives:
+⸻
 
-* The nearest valid L0 reference
-* The nearest valid L1 reference
+6. Projection Refinement Concept
 
-For each list, select only the nearest reference using:
+Traditional MMVD performs
 
-1. Minimum absolute POC distance from the current picture
-2. Smaller refIdx as the deterministic tie-breaker
+Final MV
+= Base MV + Delta MV
 
-Do not signal the refIdx.
+The proposed refinement should instead perform
 
-When both L0 and L1 alternatives are valid:
+Final projection motion(x,y)
+=
+Original projection motion(x,y)
++
+Common refinement delta
 
-* The encoder evaluates both
-* One CABAC-coded list flag selects L0 or L1
+or equivalently,
 
-When only one list is valid:
+Final projected coordinate(x,y)
+=
+Original projected coordinate(x,y)
++
+Common refinement offset
 
-* Infer the list
-* Do not code the list flag
+Since projection motion varies spatially, simply modifying one block MV is insufficient.
 
-Propose:
+The refinement must affect the actual projected coordinates or all subblock motions used for prediction.
 
-* How the nearest reference is derived
-* How both alternatives are represented during encoder RDO
-* How they remain one predictor index
-* Where the selected list is stored in CU state
-* CABAC syntax and context for the list flag
-* Decoder reconstruction behavior
+⸻
 
-6. Forward Average
+7. Independent Projection Refinement Design
 
-Forward Average should use reconstructed reference depth, never GT depth.
+Dedicated refinement index
 
-Analyze the cleanest definition using the nearest valid L0 and L1 reconstructed-depth references.
+Create a new refinement index containing at least:
 
-Explicitly address:
+step
+direction
 
-* Whether Forward Average requires both L0 and L1
-* Whether it is allowed when only one side is valid
-* How duplication with Forward Single is avoided
-* How valid and invalid forward-projected samples are combined
-* How occlusion or multiple projected samples are resolved
-* How its availability is reproduced identically by encoder and decoder
+If the existing implementation already signals a merge candidate separately, do not duplicate the base candidate index inside the refinement index unless necessary.
 
-Recommend one exact normative rule.
+Initial refinement candidates:
 
-7. Predictor source versus inter-prediction reference
+Steps
+- 1/4 pel
+- 1/2 pel
+- 1 pel
+- 2 pel
+Directions
+- right
+- left
+- down
+- up
 
-Explicitly distinguish:
+Design the bit layout according to the codec coding style.
 
-1. The reference picture used to generate a depth-plane predictor
-2. The reference picture or pictures used for final Camera Projection inter prediction
+⸻
 
-The Python simulator currently evaluates candidate depth against several references and selects the lowest-SATD reference. Do not copy this behavior silently.
+Dedicated delta generation
 
-For each predictor family, define:
+Create a completely new delta-generation function.
 
-* Predictor source reference
-* Final interDir
-* Final L0/L1 refIdx
-* Whether the predictor source and final prediction reference must be the same
-* Which values are inferred and which values require syntax
+Do not reuse the MMVD delta-generation function directly.
 
-This must be fully defined before implementation.
+The new function should approximately perform
 
-8. Plane representation and reconstruction
+Refinement index
+→ Decode step
+→ Decode direction
+→ Return image-space delta using internal MV precision
 
-The depth plane is:
+Reuse only common codec utilities if appropriate.
 
-1 / z(x,y) = a * (x - cx) + b * (y - cy) + c
+⸻
+
+Dedicated candidate generation
+
+Create a completely independent candidate-generation path.
+
+The intended flow is
+
+Generate base projection prediction
+→ Evaluate non-refined candidate
+→ Evaluate all refinement candidates
+→ First-pass cost
+→ Candidate pruning
+→ Full RD
+
+The MMVD pruning strategy may be referenced conceptually, but candidate management should remain completely independent.
+
+⸻
+
+Dedicated syntax & CABAC
+
+Do not modify or reuse MMVD syntax.
+
+If required, introduce new syntax for:
+
+Refinement enable
+Refinement index
+
+Create new CABAC contexts instead of sharing MMVD contexts.
+
+The statistics of this tool must never affect MMVD probability adaptation.
+
+⸻
+
+8. Refinement Application Position
+
+The preferred order is
+
+Camera/depth projection
+→ Projected coordinates
+→ Add refinement
+→ Boundary/validity check
+→ Reference interpolation
+
+Avoid
+
+Projection
+→ Boundary clipping
+→ Refinement
+
+Determine the safest implementation according to the actual coordinate representation used by the codec.
+
+Prefer internal MV precision or fixed-point arithmetic whenever possible to guarantee encoder/decoder consistency.
+
+⸻
+
+9. MotionInfo Update
+
+Updating only prediction while leaving MotionInfo unchanged is not acceptable.
+
+The stored motion must satisfy
+
+Stored motion
+=
+Original projection motion
++
+Refinement delta
+
+If subblock motion exists, apply the same refinement to every valid subblock.
+
+Analyze the impact on:
+
+* spatial merge
+* temporal merge
+* HMVP
+* affine derivation
+* motion-based filters
+* deblocking
+* subsequent candidate generation
+
+Implement MotionInfo refinement independently.
+
+Do not reuse or modify MMVD MotionInfo code.
+
+⸻
+
+10. Encoder RDO
+
+The two-stage MMVD workflow may be used as a reference.
+
+The intended workflow is
+
+For each projection-based candidate
+Evaluate base candidate
+Evaluate all refinement candidates
+Generate prediction
+Compute distortion
+Estimate syntax bits
+Compute first-pass cost
+Prune
+Perform full RD
+
+Cost should include
+
+Prediction distortion
++
+Lambda × Total syntax bits
+
+Estimate every syntax bit actually transmitted by the projection tool.
+
+If necessary, create a dedicated bit-estimation function instead of modifying the MMVD estimator.
+
+⸻
+
+11. Computational Optimization
+
+Avoid recomputing the complete camera/depth projection for every refinement candidate.
+
+Prefer
+
+Generate projected coordinate map once
+For every refinement candidate
+Apply delta
+Recheck validity
+Perform reference interpolation
+Compute distortion
+
+Analyze whether:
+
+* projected coordinates can be reused
+* projection and sampling can be separated
+* interpolation alone can be repeated
+* invalid masks must be recomputed
+* prediction buffers can be reused
+* chroma can reuse the same refinement
+* SATD can initially evaluate luma only
+
+If appropriate, propose splitting the current implementation into
+
+Projection coordinate generation
+Reference sampling
+
+using new functions or wrappers without modifying existing behavior.
+
+All new functions must be protected by #if GlobalMotion.
+
+⸻
+
+12. Invalid Region Handling
 
 Analyze:
 
-* The existing codec coordinate system
-* CU-center definition
-* Plane recentering
-* Quantization of a, b, and c
-* Fixed-point representation
-* Rounding rules
-* Clipping ranges
-* Invalid inverse-depth handling
-* Encoder/decoder numerical matching
+* current invalid detection
+* boundary handling
+* interpolation margins
+* validity changes after refinement
+* invalid fill policy
+* distortion treatment
+* invalid penalties
+* clipping behavior
+* encoder/decoder consistency
 
-The Python implementation uses floating point. The actual codec implementation must avoid encoder/decoder mismatch.
+Determine whether validity should be recomputed after refinement.
 
-Propose one deterministic representation and identify where conversion from the Python formulas is required.
+Also investigate whether candidates producing excessive invalid regions should be early rejected or penalized.
 
-9. Plane coding modes
+⸻
 
-The final plane coding modes are:
+13. Bi-pred
 
-* Predictor Only
-* C-only Residual
-* Full Residual
-* Direct Plane
+Analyze the existing MMVD bi-pred strategy, but do not reuse it directly.
 
-Definitions:
+Compare:
 
-Predictor Only:
+1. Uni-pred only
+2. Same image-space delta for both references
+3. Newly implemented temporal scaling
+4. Camera-motion-based scaling
+5. Independent refinement for each reference
 
-* Reconstructed plane equals the selected predictor
-* No plane residual is coded
+Initially, prioritize the uni-pred solution for simplicity and robustness.
 
-C-only Residual:
+⸻
 
-* a = predictor.a
-* b = predictor.b
-* c = predictor.c + delta_c
+14. Recommended Development Stages
 
-Full Residual:
+Stage 1
 
-* a = predictor.a + delta_a
-* b = predictor.b + delta_b
-* c = predictor.c + delta_c
+* Analyze projection tool
+* Analyze MMVD
+* Identify projection generation
+* Identify MotionInfo
+* Identify syntax
 
-Direct Plane:
+Stage 2
 
-* The absolute quantized a, b, and c are coded
-* No predictor index is required
+* Encoder-only experiment
+* Apply fixed refinement
+* Measure distortion improvement
+* No syntax or decoder changes yet
 
-Propose the exact syntax tree.
+Stage 3
 
-In particular, determine whether plane mode should be coded before or after predictor index, while ensuring Direct Plane does not unnecessarily code a predictor index.
+* Independent refinement index
+* Candidate generation
+* SATD pruning
+* Full RD
 
-Propose:
+Stage 4
 
-* CABAC contexts
-* Residual coefficient syntax
-* Zero/nonzero coding
-* Sign coding
-* Magnitude coding
-* Context sharing between a and b
-* Separate treatment of c
-* Encoder RDO bit estimation
-* Decoder parsing order
+* Dedicated syntax
+* Dedicated CABAC
+* Encoder/decoder synchronization
 
-10. Candidate-index CABAC coding
+Stage 5
 
-Candidate index must use the codec’s normal CABAC context adaptation.
+* MotionInfo refinement
+* Merge/HMVP verification
 
-Do not implement or retain the Python SimpleAdaptiveProb candidate model.
+Stage 6
 
-The preferred method is truncated unary coding over the compressed available-candidate list.
+* Coordinate reuse
+* Interpolation reuse
+* Buffer reuse
+* Invalid rejection optimization
 
-With five available candidates:
+Stage 7
 
-* index 0: 0
-* index 1: 10
-* index 2: 110
-* index 3: 1110
-* index 4: 1111
+* More refinement steps
+* Diagonal directions
+* Bi-pred support
+* Syntax optimization
 
-Use one CABAC context per decision level unless repository constraints suggest a better design.
+Every stage must verify both:
 
-Analyze and propose:
+* GlobalMotion == 0
+* GlobalMotion == 1
 
-* Number of contexts
-* Context initialization
-* Writer implementation location
-* Reader implementation location
-* Estimator use during RDO
-* Behavior when one candidate is available
-* Behavior when only two or three candidates are available
-* Context update behavior when the semantic candidate occupying index 0 changes because an earlier candidate is unavailable
+⸻
 
-The intended design learns the probability of the compressed ordinal index, not a separate probability for each predictor family.
+15. Expected Deliverables
 
-Do not introduce availability-pattern-specific contexts in the first implementation.
+A. Projection Tool Flow
 
-11. Encoder processing flow
+Provide the actual file/function call flow.
 
-Describe the complete encoder flow and map every stage to exact repository functions.
+B. MMVD Flow
 
-Expected conceptual flow:
-
-Depth Tool availability
-→ Generate deterministic available predictor list
-→ Generate plane coding alternatives
-→ Reconstruct candidate plane
-→ Generate candidate depth
-→ Camera-project into reference picture
-→ Generate warped Y predictor
-→ Calculate projection-domain SATD
-→ Estimate real CABAC fractional bits
-→ Select promising Depth Tool candidates
-→ Run the required normal inter residual/full-RD process
-→ Select the final CU mode
-→ Store reconstructed plane state
-→ Generate final 4x4 MotionInfo
-→ Allow normal Merge and HMVP reuse
+Provide the actual MMVD implementation flow.
 
-Clarify the relationship between:
+C. Reusable MMVD Concepts
 
-* Projection-domain SATD used by the simulator
-* Fast encoder candidate pruning
-* Existing codec full inter RD
-* Transform and residual coding
-* Final CU cost
-
-Do not assume that the simulator’s simplified SATD + lambda * simulated_bits should directly replace the codec’s normal full RD.
-
-12. Decoder processing flow
-
-Describe the complete decoder call flow with exact insertion points:
-
-Parse Depth Tool syntax
-→ Generate the same available predictor list
-→ Resolve Forward Single L0/L1 when applicable
-→ Reconstruct the inverse-depth plane
-→ Generate 4x4 depth
-→ Camera projection
-→ Generate 4x4 MV field
-→ Populate MotionInfo
-→ Perform normal inter prediction
-→ Reconstruct residual
-→ Update Merge/HMVP-related state
-
-Identify which operations must be shared between encoder and decoder.
-
-13. Motion generation and propagation
-
-After the final plane is reconstructed:
-
-* Generate depth for each 4x4 motion subblock
-* Camera-project the subblock into the selected reference picture
-* Generate codec-precision MV
-* Set refIdx and interDir
-* Store the result through the existing MotionBuf or spanMotionInfo path
-
-Analyze whether the current Camera Projection implementation uses:
-
-* Subblock center projection
-* Four-corner projection and averaging
-* Per-pixel projection followed by averaging
-* Another existing method
-
-Recommend one method consistent with the repository’s current CamProj behavior.
-
-The final MotionInfo must automatically participate in:
-
-* Spatial Merge
-* HMVP
-* Existing inter-neighbor lookup
-
-Do not introduce a separate Depth Tool Merge candidate path unless the existing architecture makes it unavoidable.
-
-Explain:
-
-* How a nonuniform 4x4 MV field is stored
-* How a representative HMVP MotionInfo is chosen
-* When HMVP is updated
-* Whether the existing HMVP maximum size remains unchanged
-* How bi-pred MotionInfo is handled
-
-14. History Plane
-
-Define a decoder-reproducible History Plane mechanism.
-
-Analyze and propose:
-
-* History entry contents
-* Maximum number of entries
-* Insertion order
-* Duplicate removal
-* Reset points
-* Slice/tile/subpicture restrictions
-* Reference-list compatibility
-* Recenter operation
-* Candidate availability
-* Encoder/decoder update timing
-
-Do not select a history entry using original-picture distortion unless the selected history index is signaled.
-
-If only one History Plane predictor is exposed, define a deterministic rule for selecting that entry.
-
-15. Features from the Python simulator that are not automatically in scope
-
-Do not assume the following experimental simulator features belong in the first codec implementation:
-
-* Fixed block-size operation
-* DepthReuseBuffer
-* Implicit zero-bit depth reuse
-* Zero-anchor POC rules
-* Manual adaptive probability models
-* Generic best-reference SATD selection
-* Arbitrary numbers of forward references
-
-For each feature, state whether it should be:
-
-* Excluded
-* Replaced by existing codec behavior
-* Deferred to a later phase
-* Retained for a specific reason
-
-16. Required implementation roadmap
-
-Split implementation into small, testable stages.
-
-A suggested direction is:
-
-1. Repository mapping and shared data structures
-2. Deterministic fixed-point plane representation
-3. One minimal predictor with Predictor-Only mode
-4. Encoder/decoder candidate-list symmetry
-5. Candidate-index CABAC
-6. Forward Single and L0/L1 flag
-7. Forward Average
-8. MV Sample predictor
-9. C-only, Full, and Direct plane coding
-10. Projection-domain candidate RDO
-11. 4x4 MotionInfo and spanMotionInfo
-12. Spatial Merge reuse
-13. HMVP reuse
-14. Neighbor Depth Plane
-15. History Plane
-16. Complexity reduction and cleanup
-
-You may change this order if repository dependencies require it.
-
-For every stage provide:
-
-* Exact files to modify
-* Exact functions or classes to modify
-* New data structures or functions
-* Encoder behavior
-* Decoder behavior
-* CABAC changes
-* Dependencies
-* Expected debug output
-* Unit or integration tests
-* Completion criteria
-* Main mismatch risks
-
-17. Verification plan
-
-Include a verification matrix covering at least:
-
-* Encoder and decoder available-candidate lists are identical
-* Candidate compressed indices are identical
-* POC cases where Forward Average is unavailable
-* Only L0 Forward Single is valid
-* Only L1 Forward Single is valid
-* Both L0 and L1 Forward Single are valid
-* One available predictor, requiring zero candidate-index bits
-* Predictor-Only reconstruction
-* C-only residual reconstruction
-* Full residual reconstruction
-* Direct Plane reconstruction
-* Fixed-point plane equality
-* Per-4x4 depth equality
-* Per-4x4 MV equality
-* refIdx and interDir equality
-* First reconstructed pixel mismatch tracing
-* Bitstream encode/decode synchronization
-* Spatial Merge reuse of Depth Tool MotionInfo
-* HMVP insertion and later reuse
-* Tile, slice, and CTU-boundary behavior
-
-Recommend debug dumps that can compare encoder and decoder values block by block.
-
-18. Required output format
-
-Produce the plan in the following sections:
-
-1. Existing repository architecture map
-2. Python simulator versus final codec discrepancy table
-3. Proposed normative Depth Tool design
-4. Data structures
-5. Syntax and CABAC design
-6. Encoder call flow
-7. Decoder call flow
-8. Predictor derivation rules
-9. MotionInfo, Merge, and HMVP integration
-10. File-by-file modification plan
-11. Incremental implementation stages
-12. Verification and debugging plan
-13. Risks, ambiguities, and decisions required before coding
-
-Do not write implementation code.
-
-Do not modify repository files.
-
-Do not provide pseudocode longer than necessary to explain interfaces.
-
-Every recommendation must be grounded in the actual repository structure and reference exact symbols where possible.
+Clearly separate:
+
+* reusable algorithms
+* reusable coding concepts
+* reusable RDO ideas
+* reusable precision handling
+* reusable validation strategies
+
+D. MMVD Components That Must Never Be Modified
+
+List everything that should remain untouched.
+
+E. Dedicated Projection Refinement Design
+
+Describe:
+
+* new data structures
+* new state variables
+* new refinement index
+* new delta generation
+* new candidate generation
+* new syntax
+* new CABAC contexts
+* new encoder RDO
+* new decoder reconstruction
+* new MotionInfo update
+
+Use the project’s naming conventions after analyzing the source.
+
+F. File/Function-Level Modification Plan
+
+Provide a table containing:
+
+File
+Existing function or structure
+Current responsibility
+New addition
+MMVD impact
+Location of #if GlobalMotion
+Notes
+
+The MMVD impact should ideally be None for every item.
+
+G. New Call Flow
+
+Provide pseudocode such as
+
+Base projection
+Generate refinement candidates
+Decode refinement delta
+Apply delta
+Validity check
+Reference sampling
+Cost evaluation
+Store final motion
+
+H. Validation Plan
+
+Include at least:
+
+* GlobalMotion=0 build
+* GlobalMotion=1 build
+* Existing MMVD bit-exact regression
+* Verify unchanged MMVD behavior
+* Encoder/decoder mismatch test
+* Prediction shift verification
+* Selected block ratio
+* Direction distribution
+* Step distribution
+* Invalid-region statistics
+* Distortion improvement over the original projection path
+* BD-rate improvement
+* Encoding time
+* Decoding time
+* MotionInfo verification
+* HMVP/merge verification
+
+⸻
+
+16. Final Notes
+
+* Never assume projection-related identifiers before analyzing the source.
+* Do not modify existing MMVD code.
+* Do not insert projection-specific logic into MMVD functions.
+* Do not reuse MMVD contexts.
+* Do not extend MMVD syntax.
+* Do not attach the new functionality to MMVD candidate types.
+* Use MMVD only as a conceptual design reference.
+* Implement the projection refinement as a completely independent feature.
+* Ensure that prediction and MotionInfo are updated consistently.
+* Protect every new or modified code section with #if GlobalMotion.
+* When GlobalMotion == 0, the codec must compile and behave exactly as before.
+* Do not generate patches yet.
+* Produce only the analysis, implementation plan, and high-level pseudocode.
+* If any information is uncertain, explicitly identify it as something that must be verified in the source code.
