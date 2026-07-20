@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Merge rap0...rapK geometry NPZ files.
+Merge gop0...gopK geometry NPZ files.
 
 Output:
 - one camera JSONL:
-    overlapping boundary POC is written once per RAP (two camera lines)
+    overlapping boundary POC is written once per GOP (two camera lines)
 - one depth YUV420p10le:
     each absolute POC is written once
-    for overlap, the earlier RAP/GOP depth is used
+    for overlap, the earlier GOP depth is used
 
 Supported NPZ:
 1) VGGT: depth_original, extrinsic, intrinsic_original
@@ -119,7 +119,7 @@ def repeat_K(K, n):
     raise ValueError(f"bad K shape: {K.shape}")
 
 
-def infer_seq_rap(path: Path, rap_name=None, rap_idx=None):
+def infer_seq_gop(path: Path, source_group_name=None, source_group_idx=None):
     stem = path.stem
     for suffix in [
         "_fixedK_gop_nn_frame_scale_geometry",
@@ -133,16 +133,18 @@ def infer_seq_rap(path: Path, rap_name=None, rap_idx=None):
         while stem.endswith(suffix):
             stem = stem[:-len(suffix)]
 
-    m = re.match(r"^(.*)_rap(\d+)$", stem)
+    m = re.match(r"^(.*)_(?:rap|gop)(\d+)$", stem, flags=re.IGNORECASE)
     if m:
-        return m.group(1), f"rap{m.group(2)}", int(m.group(2))
+        idx = int(m.group(2))
+        return m.group(1), f"gop{idx}", idx
 
-    if rap_name and re.fullmatch(r"rap\d+", rap_name):
-        ri = int(rap_name[3:])
-        return stem, rap_name, ri
-    if rap_idx is not None:
-        return stem, f"rap{int(rap_idx)}", int(rap_idx)
-    return stem, "rap0", 0
+    if source_group_name and re.fullmatch(r"(?:rap|gop)\d+", source_group_name, flags=re.IGNORECASE):
+        idx = int(re.search(r"\d+$", source_group_name).group())
+        return stem, f"gop{idx}", idx
+    if source_group_idx is not None:
+        idx = int(source_group_idx)
+        return stem, f"gop{idx}", idx
+    return stem, "gop0", 0
 
 
 def load_npz(path: Path, input_mode: str):
@@ -203,8 +205,8 @@ def load_npz(path: Path, input_mode: str):
         rn = scalar_str(z["rap_name"]) if "rap_name" in z else None
         ri = int(np.asarray(z["rap_index"]).item()) if "rap_index" in z else None
 
-    seq, rap_name, rap_idx = infer_seq_rap(path, rn, ri)
-    return dict(path=path, sequence=seq, rap_name=rap_name, rap_idx=rap_idx,
+    seq, gop_name, gop_idx = infer_seq_gop(path, rn, ri)
+    return dict(path=path, sequence=seq, gop_name=gop_name, gop_idx=gop_idx,
                 depth=depth.astype(np.float32), E=E.astype(np.float32),
                 K=K.astype(np.float32), fixed_K=fixed_K,
                 source_type=source_type,
@@ -241,32 +243,60 @@ def choose_scale(depth, percentile, precision):
                 depth_percentile=percentile, max_code=1023)
 
 
-def write_depth(path, depth, meta):
+def write_depth(path, depth, frame_metas, frame_owner_gops):
+    """
+    Write one merged depth frame per absolute POC.
+
+    Each frame is quantized with the depth scale of the GOP that owns
+    that depth frame. For an overlapping POC, the earlier GOP owns the depth,
+    so the earlier GOP scale is used.
+    """
     n, h, w = depth.shape
+    if len(frame_metas) != n or len(frame_owner_gops) != n:
+        raise ValueError("depth/frame scale metadata length mismatch")
     if h % 2 or w % 2:
         raise ValueError("YUV420 requires even width/height")
+
     ensure_parent(path)
     uv = np.full((h // 2, w // 2), 512, "<u2")
-    sr = float(meta["depth_scale_real"])
-    maes, rmses, clips = [], [], []
+    per_gop = {}
+
     with open(path, "wb") as f:
-        for d in depth:
-            y = np.nan_to_num(d, nan=0., posinf=1023*sr, neginf=0.)
+        for i, d in enumerate(depth):
+            meta = frame_metas[i]
+            owner_gop = int(frame_owner_gops[i])
+            sr = float(meta["depth_scale_real"])
+            if sr <= 0:
+                raise ValueError(f"invalid depth scale for GOP {owner_gop}: {sr}")
+
+            y = np.nan_to_num(d, nan=0., posinf=1023 * sr, neginf=0.)
             y = np.clip(np.round(y / sr), 0, 1023).astype("<u2")
-            f.write(y.tobytes()); f.write(uv.tobytes()); f.write(uv.tobytes())
+            f.write(y.tobytes())
+            f.write(uv.tobytes())
+            f.write(uv.tobytes())
+
+            stat = per_gop.setdefault(owner_gop, {"maes": [], "rmses": [], "clips": [], "frame_count": 0})
+            stat["frame_count"] += 1
             valid = np.isfinite(d) & (d > 0)
             if np.any(valid):
                 e = y.astype(np.float32)[valid] * sr - d[valid]
-                maes.append(float(np.mean(np.abs(e))))
-                rmses.append(float(np.sqrt(np.mean(e*e))))
-                clips.append(float(np.mean(y[valid] >= 1023)))
-    return dict(mean_mae=float(np.mean(maes)) if maes else None,
-                mean_rmse=float(np.mean(rmses)) if rmses else None,
-                max_clip_ratio=max(clips) if clips else 0.)
+                stat["maes"].append(float(np.mean(np.abs(e))))
+                stat["rmses"].append(float(np.sqrt(np.mean(e * e))))
+                stat["clips"].append(float(np.mean(y[valid] >= 1023)))
+
+    summary = {}
+    for gop_idx, stat in sorted(per_gop.items()):
+        summary[str(gop_idx)] = {
+            "frame_count": int(stat["frame_count"]),
+            "mean_mae": float(np.mean(stat["maes"])) if stat["maes"] else None,
+            "mean_rmse": float(np.mean(stat["rmses"])) if stat["rmses"] else None,
+            "max_clip_ratio": max(stat["clips"]) if stat["clips"] else 0.0,
+        }
+    return summary
 
 
 def process_sequence(seq, items, args):
-    items = sorted(items, key=lambda x: x["rap_idx"])
+    items = sorted(items, key=lambda x: x["gop_idx"])
     h, w = items[0]["depth"].shape[1:]
 
     for it in items:
@@ -274,7 +304,7 @@ def process_sequence(seq, items, args):
             raise ValueError(f"resolution mismatch: {it['path']}")
         it["rvec"], it["tvec"] = convert_pose(it["E"], args.pose_mode)
 
-    # Earlier RAP wins for depth at duplicate POC.
+    # Earlier GOP wins for depth at duplicate POC.
     depth_by_poc, depth_owner = {}, {}
     camera_count_by_poc = {}
     for it in items:
@@ -282,7 +312,7 @@ def process_sequence(seq, items, args):
             camera_count_by_poc[poc] = camera_count_by_poc.get(poc, 0) + 1
             if poc not in depth_by_poc:
                 depth_by_poc[poc] = it["depth"][li]
-                depth_owner[poc] = it["rap_idx"]
+                depth_owner[poc] = it["gop_idx"]
 
     pocs = sorted(depth_by_poc)
     if pocs != list(range(pocs[0], pocs[-1] + 1)):
@@ -300,42 +330,61 @@ def process_sequence(seq, items, args):
         print(f"[SKIP] exists: {seq}")
         return False
 
-    meta = choose_scale(merged_depth, args.depth_percentile,
-                        args.depth_scale_precision)
-    qstats = write_depth(out_yuv, merged_depth, meta)
+    # Compute one independent depth scale per GOP from its own depth set.
+    # The overlapping first frame of a later GOP is included in that GOP scale
+    # estimation, even though its depth sample is not written again to YUV.
+    gop_depth_meta = {}
+    for it in items:
+        gop_depth_meta[it["gop_idx"]] = choose_scale(
+            it["depth"], args.depth_percentile,
+            args.depth_scale_precision)
+        it["depth_meta"] = gop_depth_meta[it["gop_idx"]]
+
+    # Each unique depth frame uses the scale of its depth owner.
+    frame_owner_gops = [depth_owner[p] for p in pocs]
+    frame_metas = [gop_depth_meta[depth_owner[p]] for p in pocs]
+    qstats_by_gop = write_depth(
+        out_yuv, merged_depth, frame_metas, frame_owner_gops)
 
     overlaps = sorted(p for p, c in camera_count_by_poc.items() if c > 1)
     header = {
         "type": "header",
-        "format": "camparam_v3_multi_rap_merged",
+        "format": "camparam_v4_multi_gop_merged",
         "sequence_name": seq,
-        "rap_count": len(items),
+        "gop_count": len(items),
         "camera_record_count": sum(len(x["frame_indices"]) for x in items),
         "unique_depth_frame_count": len(pocs),
         "depth_frame_pocs": pocs,
         "overlap_pocs": overlaps,
         "overlap_policy": {
-            "camera": "all RAP-local records kept; overlap POC has two lines",
-            "depth": "one frame only; earlier RAP/GOP wins"
+            "camera": "all GOP-local records kept; overlap POC has two lines",
+            "depth": "one frame only; earlier GOP wins"
         },
         "width": w, "height": h, "bit_depth": 10,
         "depth_yuv": out_yuv.name,
-        **meta,
-        "depth_quant_summary": qstats,
+        "depth_scale_mode": "per_gop",
+        "depth_scale_signal": "written in every frame record using that GOP scale",
+        "depth_scale_precision": int(args.depth_scale_precision),
+        "depth_quant_summary_by_gop": qstats_by_gop,
         "pose_mode": args.pose_mode,
         "pose_convention": {
             "current_to_previous":
-                "X_prev=R*X_cur+t; each RAP local_poc 0 is identity",
+                "X_prev=R*X_cur+t; each GOP local_poc 0 is identity",
             "gop_local":
-                "X_i=R*X_0+t; each RAP local_poc 0 is identity",
+                "X_i=R*X_0+t; each GOP local_poc 0 is identity",
             "absolute": "camera_from_world in each NPZ coordinate system"
         }[args.pose_mode],
-        "raps": [{
-            "rap_idx": x["rap_idx"], "rap_name": x["rap_name"],
+        "gops": [{
+            "gop_idx": x["gop_idx"], "gop_name": x["gop_name"],
             "source_npz": str(x["path"].resolve()),
             "frame_indices": x["frame_indices"],
             "fixed_intrinsic": x["fixed_K"],
-            "initial_intrinsic": Kdict(x["K"][0], args.z_sign)
+            "initial_intrinsic": Kdict(x["K"][0], args.z_sign),
+            "depth_scale": int(x["depth_meta"]["depth_scale"]),
+            "depth_scale_precision": int(x["depth_meta"]["depth_scale_precision"]),
+            "depth_scale_real": float(x["depth_meta"]["depth_scale_real"]),
+            "depth_ref": float(x["depth_meta"]["depth_ref"]),
+            "depth_percentile": float(x["depth_meta"]["depth_percentile"])
         } for x in items]
     }
 
@@ -349,28 +398,38 @@ def process_sequence(seq, items, args):
                 rec = {
                     "type": "frame",
                     "camera_record_idx": record_idx,
-                    "rap_idx": it["rap_idx"],
-                    "rap_name": it["rap_name"],
+                    "gop_idx": it["gop_idx"],
+                    "gop_name": it["gop_name"],
                     "local_poc": li,
                     "poc": poc,
                     "frame_idx": poc,
                     "depth_frame_idx": poc_to_depth_idx[poc],
-                    "depth_source_rap_idx": depth_owner[poc],
+                    "depth_source_gop_idx": depth_owner[poc],
                     "is_overlap": camera_count_by_poc[poc] > 1,
-                    "is_depth_owner": depth_owner[poc] == it["rap_idx"],
+                    "is_depth_owner": depth_owner[poc] == it["gop_idx"],
                     "rvec": [float(x) for x in it["rvec"][li]],
                     "tvec": [float(x) for x in it["tvec"][li]],
                     "intrinsic": Kdict(it["K"][li], args.z_sign),
                     "intrinsic_delta": [float(x) for x in kd[li]]
                 }
+                # Repeat the current GOP depth scale in every JSON frame line.
+                rec["depth_scale"] = int(it["depth_meta"]["depth_scale"])
+                rec["depth_scale_precision"] = int(it["depth_meta"]["depth_scale_precision"])
+                rec["depth_scale_real"] = float(it["depth_meta"]["depth_scale_real"])
+                rec["depth_ref"] = float(it["depth_meta"]["depth_ref"])
+                rec["depth_percentile"] = float(it["depth_meta"]["depth_percentile"])
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 record_idx += 1
 
     print(f"[OK] {seq}")
-    print(f"     RAPs           : {[x['rap_name'] for x in items]}")
+    print(f"     GOPs           : {[x['gop_name'] for x in items]}")
     print(f"     overlap POCs   : {overlaps}")
     print(f"     camera records : {record_idx}")
     print(f"     depth frames   : {len(pocs)}")
+    print("     depth scales   :")
+    for it in items:
+        dm = it["depth_meta"]
+        print(f"       {it['gop_name']}: int={dm['depth_scale']}, real={dm['depth_scale_real']:.9g}")
     print(f"     camera JSONL   : {out_json}")
     print(f"     depth YUV      : {out_yuv}")
     return True
