@@ -1,69 +1,92 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-estimate_ra_pose_bits_and_warp_psnr.py
+simulate_relative_pose_dpcm_ra_warp.py
 
-Estimate:
-1) pose signaling bits using closed-loop predictive quantization and
-   signed Exp-Golomb order-0 coding;
-2) camera-projection warping quality on an original YUV420p10le sequence
-   using the merged depth YUV and each quantized pose reconstruction.
+Evaluate the previous adjacent-relative-pose coding method using:
 
-Input camera JSONL is expected to be produced by:
-    merge_gop_geometry_gop0_relative.py
+  1) merged camera JSONL produced with:
+         --pose-mode current_to_previous
+  2) original sequence YUV420p10le
+  3) merged depth YUV420p10le
 
-Input pose convention, independently for every GOP:
-    local_poc 0:
-        R_0 = I
-        t_0 = 0
+Input relative-pose convention:
+    For GOP-local frame i > 0:
 
-    local_poc i:
-        X_i = R_i X_0 + t_i
+        X_{i-1} = R_step_i X_i + t_step_i
 
-Closed-loop pose coding:
-    Rotation:
-        R_res_i = R_i @ R_rec_prev.T
-        r_res_i = Rodrigues^{-1}(R_res_i)
-        q_r_i   = round(r_res_i / rot_qstep)
-        R_rec_i = Rodrigues(q_r_i * rot_qstep) @ R_rec_prev
+    JSONL stores:
+        rvec[i] = Rodrigues(R_step_i)
+        tvec[i] = t_step_i
 
-    Translation:
-        t_res_i = t_i - t_rec_prev
-        q_t_i   = round(t_res_i / trans_qstep)
-        t_rec_i = t_rec_prev + q_t_i * trans_qstep
+    GOP local_poc 0 stores:
+        rvec = [0,0,0]
+        tvec = [0,0,0]
 
-    GOP local_poc 0 is implicit and costs zero residual bits by default.
+Closed-loop DPCM:
+    The six relative-pose components are predicted from previously
+    reconstructed relative-pose components.
+
+    Predictor modes:
+      previous:
+          pred_i = reconstructed_signal_{i-1}
+
+      linear:
+          pred_i = 2*reconstructed_signal_{i-1}
+                   - reconstructed_signal_{i-2}
+
+      zero:
+          pred_i = 0
+
+    For the first coded relative pose, predictor is always zero.
+
+    Residual:
+        e_i = signal_i - pred_i
+
+    Quantization:
+        q_i = round(e_i / qstep)
+        e_hat_i = q_i * qstep
+        signal_hat_i = pred_i + e_hat_i
+
+    Six signed q_i components are estimated with signed Exp-Golomb order-0.
+
+Absolute GOP-local reconstruction:
+    Let T_step_i map current camera i to previous camera i-1:
+
+        T_step_i = T_{i-1} @ inverse(T_i)
+
+    Therefore:
+
+        T_i = inverse(T_step_i) @ T_{i-1}
+
+    Starting from:
+        T_0 = identity
+
+    Expanded:
+        R_i = R_step_i.T @ R_{i-1}
+        t_i = R_step_i.T @ (t_{i-1} - t_step_i)
 
 Warping:
     For target t and reference r:
+
         R_rel = R_r @ R_t.T
         t_rel = t_r - R_rel @ t_t
 
-        X_t   = depth_t * K_t^{-1} [x, y, 1]^T
-        X_r   = R_rel X_t + t_rel
-        q_r   = K_r X_r / X_r.z
+        X_ref = R_rel X_target + t_rel
 
-    The reference Y frame is backward-remapped into the target domain.
+    The reference Y image is backward-remapped into the target domain
+    using the target depth frame.
 
-RA pair generation:
-    Default --pair-source dyadic recursively builds hierarchical random-access
-    relations over each GOP:
-        midpoint -> left endpoint
-        midpoint -> right endpoint
-    and, unless --no-bidirectional-pairs is used:
-        left endpoint -> midpoint
-        right endpoint -> midpoint
+RA pairs:
+    Default pair source is dyadic. Explicit GOP-local pairs can be supplied.
 
-    You can instead use adjacent pairs or provide explicit local-poc pairs.
+PSNR:
+    Baseline uses absolute poses reconstructed from the original unquantized
+    current-to-previous JSONL signals.
+    Quantized uses absolute poses reconstructed from closed-loop DPCM signals.
 
-PSNR comparison:
-    For every pair and qstep:
-      - baseline pose warp is computed from the unquantized JSONL pose;
-      - quantized pose warp is computed from the closed-loop reconstruction;
-      - both PSNRs are evaluated on the SAME common valid mask:
-            valid_common = valid_baseline & valid_quantized
-      - PSNR drop:
-            baseline_common_psnr - quantized_common_psnr
+    Both are evaluated over:
+        valid_common = valid_baseline & valid_quantized
 
 Outputs:
     <prefix>_summary.json
@@ -73,22 +96,16 @@ Outputs:
     <prefix>_per_frame_bits.csv
 
 Example:
-    python estimate_ra_pose_bits_and_warp_psnr.py \
+    python simulate_relative_pose_dpcm_ra_warp.py \
         --input-jsonl sequence_camParam_merged.jsonl \
-        --sequence-yuv sequence_1920x1080_10bit.yuv \
+        --sequence-yuv sequence_1920x1080_yuv420p10le.yuv \
         --depth-yuv sequence_depth_merged.yuv \
-        --width 1920 --height 1080 \
+        --width 1920 \
+        --height 1080 \
+        --predictor previous \
         --rot-qsteps 1e-6,2e-6,5e-6,1e-5 \
         --trans-qsteps 1e-6,2e-6,5e-6,1e-5 \
         --paired-qsteps
-
-Important:
-    - This estimates only signed Exp-Golomb residual bits plus optional fixed
-      overhead configured on the CLI.
-    - It does not model CABAC contexts, qstep signaling, byte alignment,
-      syntax flags, or container overhead.
-    - Depth YUV is interpreted using the depth scale of the GOP that OWNS each
-      merged depth frame, not necessarily the current camera-record GOP.
 """
 
 from __future__ import annotations
@@ -99,14 +116,14 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
 
 
 # ============================================================
-# Geometry helpers
+# Geometry
 # ============================================================
 
 def R_from_rvec(rvec: Iterable[float]) -> np.ndarray:
@@ -128,15 +145,10 @@ def K_from_record(rec: dict[str, Any]) -> np.ndarray:
     if not isinstance(intr, dict):
         raise KeyError("frame record has no intrinsic dictionary")
 
-    fx = float(intr["fx"])
-    fy = float(intr["fy"])
-    cx = float(intr["cx"])
-    cy = float(intr["cy"])
-
     return np.array(
         [
-            [fx, 0.0, cx],
-            [0.0, fy, cy],
+            [float(intr["fx"]), 0.0, float(intr["cx"])],
+            [0.0, float(intr["fy"]), float(intr["cy"])],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,
@@ -180,10 +192,8 @@ def vector_se_bits(values: np.ndarray) -> tuple[int, list[int]]:
 def frame_size_yuv420p10le(width: int, height: int) -> int:
     if width % 2 or height % 2:
         raise ValueError("YUV420 requires even width and height")
-    return (
-        width * height
-        + 2 * (width // 2) * (height // 2)
-    ) * 2
+    samples = width * height + 2 * (width // 2) * (height // 2)
+    return samples * 2
 
 
 def count_yuv420p10le_frames(
@@ -191,7 +201,15 @@ def count_yuv420p10le_frames(
     width: int,
     height: int,
 ) -> int:
-    return path.stat().st_size // frame_size_yuv420p10le(width, height)
+    frame_size = frame_size_yuv420p10le(width, height)
+    size = path.stat().st_size
+    trailing = size % frame_size
+    if trailing:
+        print(
+            f"[WARN] trailing bytes ignored: {path}, trailing={trailing}",
+            flush=True,
+        )
+    return size // frame_size
 
 
 def read_yuv420p10le_y(
@@ -213,15 +231,75 @@ def read_yuv420p10le_y(
 
     if y.size != y_count:
         raise EOFError(
-            f"cannot read frame {frame_idx} from {path}; "
-            f"got {y.size}/{y_count} Y samples"
+            f"cannot read frame {frame_idx} from {path}: "
+            f"{y.size}/{y_count} Y samples"
         )
 
     return y.reshape(height, width)
 
 
+class LumaReader:
+    def __init__(self, path: Path, width: int, height: int) -> None:
+        self.path = path
+        self.width = int(width)
+        self.height = int(height)
+        self.cache: dict[int, np.ndarray] = {}
+
+    def read(self, frame_idx: int) -> np.ndarray:
+        frame_idx = int(frame_idx)
+        if frame_idx not in self.cache:
+            self.cache[frame_idx] = read_yuv420p10le_y(
+                self.path,
+                self.width,
+                self.height,
+                frame_idx,
+            ).astype(np.float32)
+        return self.cache[frame_idx]
+
+
+class DepthReader:
+    def __init__(
+        self,
+        path: Path,
+        width: int,
+        height: int,
+        scale_by_gop: dict[int, float],
+    ) -> None:
+        self.path = path
+        self.width = int(width)
+        self.height = int(height)
+        self.scale_by_gop = scale_by_gop
+        self.cache: dict[tuple[int, int], np.ndarray] = {}
+
+    def read(
+        self,
+        depth_frame_idx: int,
+        owner_gop_idx: int,
+    ) -> np.ndarray:
+        key = (int(depth_frame_idx), int(owner_gop_idx))
+
+        if key in self.cache:
+            return self.cache[key]
+
+        if owner_gop_idx not in self.scale_by_gop:
+            raise KeyError(
+                f"no depth_scale_real for depth owner GOP {owner_gop_idx}"
+            )
+
+        code = read_yuv420p10le_y(
+            self.path,
+            self.width,
+            self.height,
+            depth_frame_idx,
+        ).astype(np.float32)
+
+        depth = code * float(self.scale_by_gop[owner_gop_idx])
+        self.cache[key] = depth
+        return depth
+
+
 # ============================================================
-# JSONL
+# JSONL loading
 # ============================================================
 
 def load_camera_jsonl(
@@ -238,10 +316,10 @@ def load_camera_jsonl(
 
             try:
                 obj = json.loads(line)
-            except json.JSONDecodeError as e:
+            except json.JSONDecodeError as exc:
                 raise ValueError(
-                    f"{path}:{line_no}: invalid JSON: {e}"
-                ) from e
+                    f"{path}:{line_no}: invalid JSON: {exc}"
+                ) from exc
 
             if not isinstance(obj, dict):
                 continue
@@ -254,25 +332,25 @@ def load_camera_jsonl(
             if obj.get("type") != "frame":
                 continue
 
-            for key in ["gop_idx", "rvec", "tvec", "intrinsic"]:
-                if key not in obj:
-                    raise KeyError(
-                        f"{path}:{line_no}: missing frame key '{key}'"
-                    )
+            required = ["gop_idx", "rvec", "tvec", "intrinsic"]
+            missing = [key for key in required if key not in obj]
+            if missing:
+                raise KeyError(
+                    f"{path}:{line_no}: missing keys {missing}"
+                )
 
             rvec = np.asarray(obj["rvec"], dtype=np.float64).reshape(-1)
             tvec = np.asarray(obj["tvec"], dtype=np.float64).reshape(-1)
 
             if rvec.size != 3 or tvec.size != 3:
                 raise ValueError(
-                    f"{path}:{line_no}: rvec/tvec must each contain 3 values"
+                    f"{path}:{line_no}: rvec/tvec must contain 3 values"
                 )
 
             rec = dict(obj)
             rec["_line_no"] = int(line_no)
             rec["_rvec_np"] = rvec
             rec["_tvec_np"] = tvec
-            rec["_R_np"] = R_from_rvec(rvec)
             rec["_K_np"] = K_from_record(rec)
 
             rec["gop_idx"] = int(rec["gop_idx"])
@@ -282,9 +360,7 @@ def load_camera_jsonl(
             rec["local_poc"] = int(
                 rec.get("local_poc", rec.get("poc", 0))
             )
-            rec["poc"] = int(
-                rec.get("poc", rec["local_poc"])
-            )
+            rec["poc"] = int(rec.get("poc", rec["local_poc"]))
             rec["frame_idx"] = int(
                 rec.get("frame_idx", rec["poc"])
             )
@@ -294,10 +370,18 @@ def load_camera_jsonl(
             rec["depth_source_gop_idx"] = int(
                 rec.get("depth_source_gop_idx", rec["gop_idx"])
             )
+
             frames.append(rec)
 
     if not frames:
         raise RuntimeError(f"No frame records found in {path}")
+
+    pose_mode = header.get("pose_mode")
+    if pose_mode is not None and pose_mode != "current_to_previous":
+        raise ValueError(
+            f"JSONL pose_mode is '{pose_mode}', but this simulator requires "
+            "'current_to_previous'"
+        )
 
     return header, frames
 
@@ -326,9 +410,25 @@ def group_frames_by_gop(
                 f"GOP {gop_idx}: duplicate local_poc values"
             )
 
-        if local_pocs[0] != 0:
+        if not local_pocs or local_pocs[0] != 0:
             raise ValueError(
-                f"GOP {gop_idx}: first local_poc is {local_pocs[0]}, not 0"
+                f"GOP {gop_idx}: first local_poc must be 0"
+            )
+
+        if local_pocs != list(range(len(local_pocs))):
+            raise ValueError(
+                f"GOP {gop_idx}: local_poc must be contiguous 0..N-1, "
+                f"got {local_pocs}"
+            )
+
+        if not np.allclose(recs[0]["_rvec_np"], 0.0, atol=1e-7):
+            raise ValueError(
+                f"GOP {gop_idx}: local_poc 0 rvec is not zero"
+            )
+
+        if not np.allclose(recs[0]["_tvec_np"], 0.0, atol=1e-7):
+            raise ValueError(
+                f"GOP {gop_idx}: local_poc 0 tvec is not zero"
             )
 
     return groups
@@ -338,33 +438,358 @@ def build_depth_scale_by_gop(
     header: dict[str, Any],
     frames: list[dict[str, Any]],
 ) -> dict[int, float]:
-    out: dict[int, float] = {}
+    scales: dict[int, float] = {}
 
     gops = header.get("gops")
     if isinstance(gops, list):
-        for g in gops:
-            if not isinstance(g, dict):
-                continue
-            if "gop_idx" in g and "depth_scale_real" in g:
-                out[int(g["gop_idx"])] = float(g["depth_scale_real"])
+        for item in gops:
+            if (
+                isinstance(item, dict)
+                and "gop_idx" in item
+                and "depth_scale_real" in item
+            ):
+                scales[int(item["gop_idx"])] = float(
+                    item["depth_scale_real"]
+                )
 
     for rec in frames:
-        gi = int(rec["gop_idx"])
-        if gi not in out and "depth_scale_real" in rec:
-            out[gi] = float(rec["depth_scale_real"])
+        gop_idx = int(rec["gop_idx"])
+        if gop_idx not in scales and "depth_scale_real" in rec:
+            scales[gop_idx] = float(rec["depth_scale_real"])
 
-    if not out:
+    if not scales:
         raise RuntimeError(
             "No depth_scale_real found in JSONL header or frame records"
         )
 
-    for gi, value in out.items():
-        if not np.isfinite(value) or value <= 0:
+    for gop_idx, scale in scales.items():
+        if not np.isfinite(scale) or scale <= 0:
             raise ValueError(
-                f"invalid depth scale for GOP {gi}: {value}"
+                f"invalid depth scale for GOP {gop_idx}: {scale}"
             )
 
-    return out
+    return scales
+
+
+# ============================================================
+# Relative signal reconstruction
+# ============================================================
+
+def reconstruct_absolute_from_relative(
+    relative_rvecs: np.ndarray,
+    relative_tvecs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reconstruct GOP-local absolute W2C poses.
+
+    Input at index i:
+        X_{i-1} = R_step_i X_i + t_step_i
+
+    Output:
+        X_i = R_abs_i X_0 + t_abs_i
+    """
+    relative_rvecs = np.asarray(relative_rvecs, dtype=np.float64)
+    relative_tvecs = np.asarray(relative_tvecs, dtype=np.float64)
+
+    if relative_rvecs.shape != relative_tvecs.shape:
+        raise ValueError("relative rvec/tvec shape mismatch")
+    if relative_rvecs.ndim != 2 or relative_rvecs.shape[1] != 3:
+        raise ValueError("relative poses must have shape [N,3]")
+
+    n = relative_rvecs.shape[0]
+
+    R_abs = np.zeros((n, 3, 3), dtype=np.float64)
+    t_abs = np.zeros((n, 3), dtype=np.float64)
+
+    R_abs[0] = np.eye(3, dtype=np.float64)
+    t_abs[0] = 0.0
+
+    for i in range(1, n):
+        R_step = R_from_rvec(relative_rvecs[i])
+        t_step = relative_tvecs[i]
+
+        R_abs[i] = R_step.T @ R_abs[i - 1]
+        t_abs[i] = R_step.T @ (
+            t_abs[i - 1] - t_step
+        )
+
+    return R_abs, t_abs
+
+
+@dataclass
+class CodingOptions:
+    rot_qstep: float
+    trans_qstep: float
+    predictor: str
+    first_frame_bits: int
+    per_gop_overhead_bits: int
+    per_frame_overhead_bits: int
+
+
+def quantize_to_index(
+    value: np.ndarray,
+    qstep: float,
+) -> np.ndarray:
+    if qstep <= 0:
+        raise ValueError("qstep must be positive")
+
+    return np.rint(
+        np.asarray(value, dtype=np.float64) / float(qstep)
+    ).astype(np.int64)
+
+
+def simulate_relative_dpcm(
+    gop_idx: int,
+    records: list[dict[str, Any]],
+    options: CodingOptions,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    Quantize and reconstruct JSONL current-to-previous relative signals.
+
+    Returns:
+        GOP bit summary
+        per-frame rows
+        reconstructed absolute R [N,3,3]
+        reconstructed absolute t [N,3]
+    """
+    n = len(records)
+
+    source_r = np.stack(
+        [np.asarray(r["_rvec_np"], dtype=np.float64) for r in records],
+        axis=0,
+    )
+    source_t = np.stack(
+        [np.asarray(r["_tvec_np"], dtype=np.float64) for r in records],
+        axis=0,
+    )
+
+    reconstructed_r = np.zeros_like(source_r)
+    reconstructed_t = np.zeros_like(source_t)
+
+    previous_r = np.zeros(3, dtype=np.float64)
+    previous_t = np.zeros(3, dtype=np.float64)
+    previous2_r = np.zeros(3, dtype=np.float64)
+    previous2_t = np.zeros(3, dtype=np.float64)
+
+    total_rotation_bits = 0
+    total_translation_bits = 0
+    total_overhead_bits = int(options.per_gop_overhead_bits)
+
+    total_rot_abs_qindex = 0
+    total_trans_abs_qindex = 0
+    total_rot_zero = 0
+    total_trans_zero = 0
+    total_components = 0
+
+    frame_rows: list[dict[str, Any]] = []
+
+    for i, rec in enumerate(records):
+        if i == 0:
+            r_pred = np.zeros(3, dtype=np.float64)
+            t_pred = np.zeros(3, dtype=np.float64)
+            r_res = np.zeros(3, dtype=np.float64)
+            t_res = np.zeros(3, dtype=np.float64)
+            q_r = np.zeros(3, dtype=np.int64)
+            q_t = np.zeros(3, dtype=np.int64)
+            r_component_bits = [0, 0, 0]
+            t_component_bits = [0, 0, 0]
+            rotation_bits = 0
+            translation_bits = 0
+            overhead_bits = int(options.first_frame_bits)
+            r_hat = np.zeros(3, dtype=np.float64)
+            t_hat = np.zeros(3, dtype=np.float64)
+
+        else:
+            if i == 1 or options.predictor == "zero":
+                r_pred = np.zeros(3, dtype=np.float64)
+                t_pred = np.zeros(3, dtype=np.float64)
+
+            elif options.predictor == "previous":
+                r_pred = previous_r.copy()
+                t_pred = previous_t.copy()
+
+            elif options.predictor == "linear":
+                if i == 2:
+                    r_pred = previous_r.copy()
+                    t_pred = previous_t.copy()
+                else:
+                    r_pred = 2.0 * previous_r - previous2_r
+                    t_pred = 2.0 * previous_t - previous2_t
+
+            else:
+                raise ValueError(options.predictor)
+
+            r_res = source_r[i] - r_pred
+            t_res = source_t[i] - t_pred
+
+            q_r = quantize_to_index(
+                r_res,
+                options.rot_qstep,
+            )
+            q_t = quantize_to_index(
+                t_res,
+                options.trans_qstep,
+            )
+
+            r_hat = (
+                r_pred
+                + q_r.astype(np.float64) * float(options.rot_qstep)
+            )
+            t_hat = (
+                t_pred
+                + q_t.astype(np.float64) * float(options.trans_qstep)
+            )
+
+            rotation_bits, r_component_bits = vector_se_bits(q_r)
+            translation_bits, t_component_bits = vector_se_bits(q_t)
+            overhead_bits = int(options.per_frame_overhead_bits)
+
+        reconstructed_r[i] = r_hat
+        reconstructed_t[i] = t_hat
+
+        total_rotation_bits += int(rotation_bits)
+        total_translation_bits += int(translation_bits)
+        total_overhead_bits += int(overhead_bits)
+
+        if i > 0:
+            total_rot_abs_qindex += int(np.sum(np.abs(q_r)))
+            total_trans_abs_qindex += int(np.sum(np.abs(q_t)))
+            total_rot_zero += int(np.count_nonzero(q_r == 0))
+            total_trans_zero += int(np.count_nonzero(q_t == 0))
+            total_components += 3
+
+        R_source = R_from_rvec(source_r[i])
+        R_hat = R_from_rvec(r_hat)
+        R_error = R_source @ R_hat.T
+        relative_rot_error = float(
+            np.linalg.norm(rvec_from_R(R_error))
+        )
+        relative_trans_error = float(
+            np.linalg.norm(source_t[i] - t_hat)
+        )
+
+        frame_rows.append(
+            {
+                "rot_qstep": float(options.rot_qstep),
+                "trans_qstep": float(options.trans_qstep),
+                "predictor": str(options.predictor),
+                "gop_idx": int(gop_idx),
+                "gop_name": str(rec["gop_name"]),
+                "local_poc": int(rec["local_poc"]),
+                "poc": int(rec["poc"]),
+                "is_anchor": i == 0,
+                "source_r_x": float(source_r[i, 0]),
+                "source_r_y": float(source_r[i, 1]),
+                "source_r_z": float(source_r[i, 2]),
+                "source_t_x": float(source_t[i, 0]),
+                "source_t_y": float(source_t[i, 1]),
+                "source_t_z": float(source_t[i, 2]),
+                "pred_r_x": float(r_pred[0]),
+                "pred_r_y": float(r_pred[1]),
+                "pred_r_z": float(r_pred[2]),
+                "pred_t_x": float(t_pred[0]),
+                "pred_t_y": float(t_pred[1]),
+                "pred_t_z": float(t_pred[2]),
+                "res_r_x": float(r_res[0]),
+                "res_r_y": float(r_res[1]),
+                "res_r_z": float(r_res[2]),
+                "res_t_x": float(t_res[0]),
+                "res_t_y": float(t_res[1]),
+                "res_t_z": float(t_res[2]),
+                "q_r_x": int(q_r[0]),
+                "q_r_y": int(q_r[1]),
+                "q_r_z": int(q_r[2]),
+                "q_t_x": int(q_t[0]),
+                "q_t_y": int(q_t[1]),
+                "q_t_z": int(q_t[2]),
+                "bits_r_x": int(r_component_bits[0]),
+                "bits_r_y": int(r_component_bits[1]),
+                "bits_r_z": int(r_component_bits[2]),
+                "bits_t_x": int(t_component_bits[0]),
+                "bits_t_y": int(t_component_bits[1]),
+                "bits_t_z": int(t_component_bits[2]),
+                "rotation_bits": int(rotation_bits),
+                "translation_bits": int(translation_bits),
+                "overhead_bits": int(overhead_bits),
+                "total_bits": int(
+                    rotation_bits + translation_bits + overhead_bits
+                ),
+                "reconstructed_r_x": float(r_hat[0]),
+                "reconstructed_r_y": float(r_hat[1]),
+                "reconstructed_r_z": float(r_hat[2]),
+                "reconstructed_t_x": float(t_hat[0]),
+                "reconstructed_t_y": float(t_hat[1]),
+                "reconstructed_t_z": float(t_hat[2]),
+                "relative_rot_error_rad": relative_rot_error,
+                "relative_rot_error_deg": float(
+                    np.degrees(relative_rot_error)
+                ),
+                "relative_trans_error": relative_trans_error,
+            }
+        )
+
+        previous2_r = previous_r.copy()
+        previous2_t = previous_t.copy()
+        previous_r = r_hat.copy()
+        previous_t = t_hat.copy()
+
+    R_abs_recon, t_abs_recon = reconstruct_absolute_from_relative(
+        reconstructed_r,
+        reconstructed_t,
+    )
+
+    total_bits = (
+        total_rotation_bits
+        + total_translation_bits
+        + total_overhead_bits
+    )
+
+    summary = {
+        "rot_qstep": float(options.rot_qstep),
+        "trans_qstep": float(options.trans_qstep),
+        "predictor": str(options.predictor),
+        "gop_idx": int(gop_idx),
+        "gop_name": str(records[0]["gop_name"]),
+        "frame_count": int(n),
+        "coded_frame_count": int(max(0, n - 1)),
+        "rotation_bits": int(total_rotation_bits),
+        "translation_bits": int(total_translation_bits),
+        "overhead_bits": int(total_overhead_bits),
+        "total_bits": int(total_bits),
+        "bits_per_camera_record": float(total_bits / n),
+        "bits_per_coded_frame": (
+            float(total_bits / (n - 1))
+            if n > 1
+            else 0.0
+        ),
+        "rot_mean_abs_qindex": (
+            float(total_rot_abs_qindex / total_components)
+            if total_components
+            else 0.0
+        ),
+        "trans_mean_abs_qindex": (
+            float(total_trans_abs_qindex / total_components)
+            if total_components
+            else 0.0
+        ),
+        "rot_zero_ratio": (
+            float(total_rot_zero / total_components)
+            if total_components
+            else 1.0
+        ),
+        "trans_zero_ratio": (
+            float(total_trans_zero / total_components)
+            if total_components
+            else 1.0
+        ),
+    }
+
+    return summary, frame_rows, R_abs_recon, t_abs_recon
 
 
 # ============================================================
@@ -374,10 +799,10 @@ def build_depth_scale_by_gop(
 def parse_explicit_pairs(
     text: str,
 ) -> list[tuple[int, int, str]]:
-    out: list[tuple[int, int, str]] = []
+    pairs: list[tuple[int, int, str]] = []
 
     if not text.strip():
-        return out
+        return pairs
 
     for token in text.replace(";", ",").split(","):
         token = token.strip()
@@ -392,7 +817,7 @@ def parse_explicit_pairs(
                 f"bad pair '{token}', use target:ref"
             )
 
-        out.append(
+        pairs.append(
             (
                 int(parts[0]),
                 int(parts[1]),
@@ -400,37 +825,36 @@ def parse_explicit_pairs(
             )
         )
 
-    return out
+    return pairs
 
 
 def generate_adjacent_pairs(
     local_pocs: list[int],
     bidirectional: bool,
 ) -> list[tuple[int, int, str]]:
-    out: list[tuple[int, int, str]] = []
+    pairs: list[tuple[int, int, str]] = []
 
     for i in range(1, len(local_pocs)):
-        cur = local_pocs[i]
-        prev = local_pocs[i - 1]
-        out.append((cur, prev, "adjacent"))
+        current = local_pocs[i]
+        previous = local_pocs[i - 1]
+
+        pairs.append(
+            (current, previous, "adjacent")
+        )
 
         if bidirectional:
-            out.append((prev, cur, "adjacent_reverse"))
+            pairs.append(
+                (previous, current, "adjacent_reverse")
+            )
 
-    return out
+    return pairs
 
 
 def generate_dyadic_pairs(
     local_pocs: list[int],
     bidirectional: bool,
 ) -> list[tuple[int, int, str]]:
-    """
-    Generate hierarchical RA pairs over the sorted local POC positions.
-
-    This works for arbitrary monotonically increasing local_poc values.
-    The recursion is based on list positions, not numeric midpoint equality.
-    """
-    out: list[tuple[int, int, str]] = []
+    pairs: list[tuple[int, int, str]] = []
     seen: set[tuple[int, int]] = set()
 
     def add(target: int, ref: int, kind: str) -> None:
@@ -438,31 +862,45 @@ def generate_dyadic_pairs(
         if target == ref or key in seen:
             return
         seen.add(key)
-        out.append((int(target), int(ref), kind))
+        pairs.append((int(target), int(ref), kind))
 
-    def rec(left_idx: int, right_idx: int, level: int) -> None:
-        if right_idx <= left_idx + 1:
+    def recurse(left: int, right: int, level: int) -> None:
+        if right <= left + 1:
             return
 
-        mid_idx = (left_idx + right_idx) // 2
+        middle = (left + right) // 2
 
-        left_poc = local_pocs[left_idx]
-        mid_poc = local_pocs[mid_idx]
-        right_poc = local_pocs[right_idx]
+        left_poc = local_pocs[left]
+        middle_poc = local_pocs[middle]
+        right_poc = local_pocs[right]
 
-        add(mid_poc, left_poc, f"dyadic_L{level}_left")
-        add(mid_poc, right_poc, f"dyadic_L{level}_right")
+        add(
+            middle_poc,
+            left_poc,
+            f"dyadic_L{level}_left",
+        )
+        add(
+            middle_poc,
+            right_poc,
+            f"dyadic_L{level}_right",
+        )
 
         if bidirectional:
-            add(left_poc, mid_poc, f"dyadic_L{level}_left_reverse")
-            add(right_poc, mid_poc, f"dyadic_L{level}_right_reverse")
+            add(
+                left_poc,
+                middle_poc,
+                f"dyadic_L{level}_left_reverse",
+            )
+            add(
+                right_poc,
+                middle_poc,
+                f"dyadic_L{level}_right_reverse",
+            )
 
-        rec(left_idx, mid_idx, level + 1)
-        rec(mid_idx, right_idx, level + 1)
+        recurse(left, middle, level + 1)
+        recurse(middle, right, level + 1)
 
     if len(local_pocs) >= 2:
-        # Include the two GOP endpoints because long-term endpoint references
-        # are part of the RA hierarchy even when no midpoint exists.
         add(
             local_pocs[-1],
             local_pocs[0],
@@ -475,8 +913,9 @@ def generate_dyadic_pairs(
                 "dyadic_endpoint_reverse",
             )
 
-    rec(0, len(local_pocs) - 1, 0)
-    return out
+    recurse(0, len(local_pocs) - 1, 0)
+
+    return pairs
 
 
 def build_pairs_for_gop(
@@ -509,272 +948,20 @@ def build_pairs_for_gop(
                 continue
             raise ValueError(
                 f"GOP {records[0]['gop_idx']}: pair {target}->{ref} "
-                f"not found in local_poc set {sorted(available)}"
+                f"is outside local_poc set {sorted(available)}"
             )
         checked.append((target, ref, kind))
 
     if not checked:
         raise RuntimeError(
-            f"GOP {records[0]['gop_idx']}: no valid pairs"
+            f"GOP {records[0]['gop_idx']}: no valid evaluation pairs"
         )
 
     return checked
 
 
 # ============================================================
-# Pose reconstruction and bit simulation
-# ============================================================
-
-@dataclass
-class CodingOptions:
-    rot_qstep: float
-    trans_qstep: float
-    first_frame_bits: int
-    per_gop_overhead_bits: int
-    per_frame_overhead_bits: int
-
-
-def quantize_to_index(
-    value: np.ndarray,
-    qstep: float,
-) -> np.ndarray:
-    if qstep <= 0:
-        raise ValueError("qstep must be positive")
-
-    return np.rint(
-        np.asarray(value, dtype=np.float64) / float(qstep)
-    ).astype(np.int64)
-
-
-def simulate_pose_coding(
-    gop_idx: int,
-    records: list[dict[str, Any]],
-    options: CodingOptions,
-) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, tuple[np.ndarray, np.ndarray]]]:
-    R_rec_prev = np.eye(3, dtype=np.float64)
-    t_rec_prev = np.zeros(3, dtype=np.float64)
-
-    recon_pose: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    per_frame: list[dict[str, Any]] = []
-
-    total_rot_bits = 0
-    total_trans_bits = 0
-    total_overhead_bits = int(options.per_gop_overhead_bits)
-
-    for coding_idx, rec in enumerate(records):
-        local_poc = int(rec["local_poc"])
-        R_true = np.asarray(rec["_R_np"], dtype=np.float64)
-        t_true = np.asarray(rec["_tvec_np"], dtype=np.float64)
-
-        if local_poc == 0:
-            rot_res = np.zeros(3, dtype=np.float64)
-            trans_res = np.zeros(3, dtype=np.float64)
-            q_rot = np.zeros(3, dtype=np.int64)
-            q_trans = np.zeros(3, dtype=np.int64)
-            rot_component_bits = [0, 0, 0]
-            trans_component_bits = [0, 0, 0]
-            rot_bits = 0
-            trans_bits = 0
-            overhead_bits = int(options.first_frame_bits)
-
-            R_rec = np.eye(3, dtype=np.float64)
-            t_rec = np.zeros(3, dtype=np.float64)
-        else:
-            R_res = R_true @ R_rec_prev.T
-            rot_res = rvec_from_R(R_res)
-            q_rot = quantize_to_index(
-                rot_res,
-                options.rot_qstep,
-            )
-            rot_res_hat = (
-                q_rot.astype(np.float64)
-                * float(options.rot_qstep)
-            )
-            R_rec = R_from_rvec(rot_res_hat) @ R_rec_prev
-
-            trans_res = t_true - t_rec_prev
-            q_trans = quantize_to_index(
-                trans_res,
-                options.trans_qstep,
-            )
-            trans_res_hat = (
-                q_trans.astype(np.float64)
-                * float(options.trans_qstep)
-            )
-            t_rec = t_rec_prev + trans_res_hat
-
-            rot_bits, rot_component_bits = vector_se_bits(q_rot)
-            trans_bits, trans_component_bits = vector_se_bits(q_trans)
-            overhead_bits = int(options.per_frame_overhead_bits)
-
-        total_rot_bits += int(rot_bits)
-        total_trans_bits += int(trans_bits)
-        total_overhead_bits += int(overhead_bits)
-
-        R_err = R_true @ R_rec.T
-        rot_error_rad = float(
-            np.linalg.norm(rvec_from_R(R_err))
-        )
-        trans_error = float(
-            np.linalg.norm(t_true - t_rec)
-        )
-
-        recon_pose[local_poc] = (
-            R_rec.copy(),
-            t_rec.copy(),
-        )
-
-        per_frame.append(
-            {
-                "rot_qstep": float(options.rot_qstep),
-                "trans_qstep": float(options.trans_qstep),
-                "gop_idx": int(gop_idx),
-                "gop_name": str(rec["gop_name"]),
-                "coding_order_idx": int(coding_idx),
-                "local_poc": local_poc,
-                "poc": int(rec["poc"]),
-                "is_anchor": local_poc == 0,
-                "rot_res_x": float(rot_res[0]),
-                "rot_res_y": float(rot_res[1]),
-                "rot_res_z": float(rot_res[2]),
-                "trans_res_x": float(trans_res[0]),
-                "trans_res_y": float(trans_res[1]),
-                "trans_res_z": float(trans_res[2]),
-                "rot_q_x": int(q_rot[0]),
-                "rot_q_y": int(q_rot[1]),
-                "rot_q_z": int(q_rot[2]),
-                "trans_q_x": int(q_trans[0]),
-                "trans_q_y": int(q_trans[1]),
-                "trans_q_z": int(q_trans[2]),
-                "rot_bits_x": int(rot_component_bits[0]),
-                "rot_bits_y": int(rot_component_bits[1]),
-                "rot_bits_z": int(rot_component_bits[2]),
-                "trans_bits_x": int(trans_component_bits[0]),
-                "trans_bits_y": int(trans_component_bits[1]),
-                "trans_bits_z": int(trans_component_bits[2]),
-                "rotation_bits": int(rot_bits),
-                "translation_bits": int(trans_bits),
-                "overhead_bits": int(overhead_bits),
-                "total_bits": int(
-                    rot_bits + trans_bits + overhead_bits
-                ),
-                "rot_recon_error_rad": rot_error_rad,
-                "rot_recon_error_deg": float(
-                    np.degrees(rot_error_rad)
-                ),
-                "trans_recon_l2_error": trans_error,
-            }
-        )
-
-        R_rec_prev = R_rec
-        t_rec_prev = t_rec
-
-    total_bits = (
-        total_rot_bits
-        + total_trans_bits
-        + total_overhead_bits
-    )
-
-    summary = {
-        "rot_qstep": float(options.rot_qstep),
-        "trans_qstep": float(options.trans_qstep),
-        "gop_idx": int(gop_idx),
-        "gop_name": str(records[0]["gop_name"]),
-        "frame_count": int(len(records)),
-        "coded_frame_count": int(max(0, len(records) - 1)),
-        "rotation_bits": int(total_rot_bits),
-        "translation_bits": int(total_trans_bits),
-        "overhead_bits": int(total_overhead_bits),
-        "total_bits": int(total_bits),
-        "bits_per_camera_record": float(
-            total_bits / len(records)
-        ),
-        "bits_per_coded_frame": (
-            float(total_bits / (len(records) - 1))
-            if len(records) > 1
-            else 0.0
-        ),
-    }
-
-    return summary, per_frame, recon_pose
-
-
-# ============================================================
-# Depth cache
-# ============================================================
-
-class DepthReader:
-    def __init__(
-        self,
-        path: Path,
-        width: int,
-        height: int,
-        scale_by_gop: dict[int, float],
-    ) -> None:
-        self.path = path
-        self.width = int(width)
-        self.height = int(height)
-        self.scale_by_gop = scale_by_gop
-        self.cache: dict[tuple[int, int], np.ndarray] = {}
-
-    def read(
-        self,
-        depth_frame_idx: int,
-        owner_gop_idx: int,
-    ) -> np.ndarray:
-        key = (int(depth_frame_idx), int(owner_gop_idx))
-
-        if key in self.cache:
-            return self.cache[key]
-
-        if owner_gop_idx not in self.scale_by_gop:
-            raise KeyError(
-                f"no depth scale for owner GOP {owner_gop_idx}"
-            )
-
-        code = read_yuv420p10le_y(
-            self.path,
-            self.width,
-            self.height,
-            depth_frame_idx,
-        ).astype(np.float32)
-
-        depth = code * float(
-            self.scale_by_gop[owner_gop_idx]
-        )
-
-        self.cache[key] = depth
-        return depth
-
-
-class LumaReader:
-    def __init__(
-        self,
-        path: Path,
-        width: int,
-        height: int,
-    ) -> None:
-        self.path = path
-        self.width = int(width)
-        self.height = int(height)
-        self.cache: dict[int, np.ndarray] = {}
-
-    def read(self, frame_idx: int) -> np.ndarray:
-        frame_idx = int(frame_idx)
-
-        if frame_idx not in self.cache:
-            self.cache[frame_idx] = read_yuv420p10le_y(
-                self.path,
-                self.width,
-                self.height,
-                frame_idx,
-            ).astype(np.float32)
-
-        return self.cache[frame_idx]
-
-
-# ============================================================
-# Warping and PSNR
+# Warping
 # ============================================================
 
 def camera_map(
@@ -804,35 +991,16 @@ def camera_map(
     cx_r = float(K_ref[0, 2])
     cy_r = float(K_ref[1, 2])
 
-    map_x = np.full(
-        (height, width),
-        -1.0,
-        dtype=np.float32,
-    )
-    map_y = np.full(
-        (height, width),
-        -1.0,
-        dtype=np.float32,
-    )
-    valid_all = np.zeros(
-        (height, width),
-        dtype=bool,
-    )
+    map_x = np.full((height, width), -1.0, dtype=np.float32)
+    map_y = np.full((height, width), -1.0, dtype=np.float32)
+    valid_all = np.zeros((height, width), dtype=bool)
 
-    xs_full = np.arange(
-        width,
-        dtype=np.float64,
-    )
+    xs_full = np.arange(width, dtype=np.float64)
 
     for y0 in range(0, height, row_batch):
         y1 = min(height, y0 + row_batch)
 
-        ys = np.arange(
-            y0,
-            y1,
-            dtype=np.float64,
-        )
-
+        ys = np.arange(y0, y1, dtype=np.float64)
         xs, yy = np.meshgrid(xs_full, ys)
 
         ray_x = (xs - cx_t) / fx_t
@@ -861,35 +1029,33 @@ def camera_map(
         X_ref = X_target @ R_rel.T + t_rel[None, :]
 
         z = X_ref[:, 2]
-
-        eps = 1e-12
         z_safe = np.where(
-            np.abs(z) > eps,
+            np.abs(z) > 1e-12,
             z,
-            np.where(z >= 0, eps, -eps),
+            np.where(z >= 0, 1e-12, -1e-12),
         )
 
-        mx = fx_r * (X_ref[:, 0] / z_safe) + cx_r
-        my = fy_r * (X_ref[:, 1] / z_safe) + cy_r
+        map_x_values = fx_r * (X_ref[:, 0] / z_safe) + cx_r
+        map_y_values = fy_r * (X_ref[:, 1] / z_safe) + cy_r
 
         valid = (
-            np.isfinite(mx)
-            & np.isfinite(my)
+            np.isfinite(map_x_values)
+            & np.isfinite(map_y_values)
             & np.isfinite(dep)
             & (dep > 0)
             & (z * float(z_sign) > float(z_min))
-            & (mx >= 0)
-            & (mx <= width - 1)
-            & (my >= 0)
-            & (my <= height - 1)
+            & (map_x_values >= 0)
+            & (map_x_values <= width - 1)
+            & (map_y_values >= 0)
+            & (map_y_values <= height - 1)
         )
 
-        map_x[y0:y1] = mx.reshape(
+        map_x[y0:y1] = map_x_values.reshape(
             y1 - y0,
             width,
         ).astype(np.float32)
 
-        map_y[y0:y1] = my.reshape(
+        map_y[y0:y1] = map_y_values.reshape(
             y1 - y0,
             width,
         ).astype(np.float32)
@@ -922,15 +1088,14 @@ def warp_reference_to_target(
 
 def masked_error_stats(
     target: np.ndarray,
-    pred: np.ndarray,
+    prediction: np.ndarray,
     mask: np.ndarray,
     max_value: float,
 ) -> dict[str, Any]:
     mask = np.asarray(mask, dtype=bool)
-
     count = int(np.count_nonzero(mask))
 
-    if count <= 0:
+    if count == 0:
         return {
             "count": 0,
             "sse": 0.0,
@@ -939,14 +1104,14 @@ def masked_error_stats(
             "psnr": None,
         }
 
-    diff = (
+    difference = (
         target.astype(np.float64)[mask]
-        - pred.astype(np.float64)[mask]
+        - prediction.astype(np.float64)[mask]
     )
 
-    sse = float(np.sum(diff * diff))
+    sse = float(np.sum(difference * difference))
     mse = float(sse / count)
-    mae = float(np.mean(np.abs(diff)))
+    mae = float(np.mean(np.abs(difference)))
 
     psnr = (
         999.0
@@ -954,7 +1119,7 @@ def masked_error_stats(
         else float(
             10.0
             * math.log10(
-                (float(max_value) ** 2) / mse
+                float(max_value) ** 2 / mse
             )
         )
     )
@@ -969,83 +1134,82 @@ def masked_error_stats(
 
 
 def evaluate_pair(
-    target_rec: dict[str, Any],
-    ref_rec: dict[str, Any],
+    target_record: dict[str, Any],
+    reference_record: dict[str, Any],
     baseline_target_pose: tuple[np.ndarray, np.ndarray],
-    baseline_ref_pose: tuple[np.ndarray, np.ndarray],
-    quant_target_pose: tuple[np.ndarray, np.ndarray],
-    quant_ref_pose: tuple[np.ndarray, np.ndarray],
+    baseline_reference_pose: tuple[np.ndarray, np.ndarray],
+    quantized_target_pose: tuple[np.ndarray, np.ndarray],
+    quantized_reference_pose: tuple[np.ndarray, np.ndarray],
     luma_reader: LumaReader,
     depth_reader: DepthReader,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     target_y = luma_reader.read(
-        int(target_rec["frame_idx"])
+        int(target_record["frame_idx"])
     )
-    ref_y = luma_reader.read(
-        int(ref_rec["frame_idx"])
+    reference_y = luma_reader.read(
+        int(reference_record["frame_idx"])
     )
 
-    depth_target = depth_reader.read(
-        int(target_rec["depth_frame_idx"]),
-        int(target_rec["depth_source_gop_idx"]),
+    target_depth = depth_reader.read(
+        int(target_record["depth_frame_idx"]),
+        int(target_record["depth_source_gop_idx"]),
     )
 
     K_target = np.asarray(
-        target_rec["_K_np"],
+        target_record["_K_np"],
         dtype=np.float64,
     )
-    K_ref = np.asarray(
-        ref_rec["_K_np"],
+    K_reference = np.asarray(
+        reference_record["_K_np"],
         dtype=np.float64,
     )
 
-    R_t_base, t_t_base = baseline_target_pose
-    R_r_base, t_r_base = baseline_ref_pose
+    R_target_base, t_target_base = baseline_target_pose
+    R_reference_base, t_reference_base = baseline_reference_pose
 
-    R_t_quant, t_t_quant = quant_target_pose
-    R_r_quant, t_r_quant = quant_ref_pose
+    R_target_quant, t_target_quant = quantized_target_pose
+    R_reference_quant, t_reference_quant = quantized_reference_pose
 
-    mx_base, my_base, valid_base = camera_map(
+    map_x_base, map_y_base, valid_base = camera_map(
         width=args.width,
         height=args.height,
         K_target=K_target,
-        K_ref=K_ref,
-        R_target=R_t_base,
-        t_target=t_t_base,
-        R_ref=R_r_base,
-        t_ref=t_r_base,
-        depth_target=depth_target,
+        K_ref=K_reference,
+        R_target=R_target_base,
+        t_target=t_target_base,
+        R_ref=R_reference_base,
+        t_ref=t_reference_base,
+        depth_target=target_depth,
         z_sign=args.z_sign,
         z_min=args.z_min,
         row_batch=args.row_batch,
     )
 
-    mx_quant, my_quant, valid_quant = camera_map(
+    map_x_quant, map_y_quant, valid_quant = camera_map(
         width=args.width,
         height=args.height,
         K_target=K_target,
-        K_ref=K_ref,
-        R_target=R_t_quant,
-        t_target=t_t_quant,
-        R_ref=R_r_quant,
-        t_ref=t_r_quant,
-        depth_target=depth_target,
+        K_ref=K_reference,
+        R_target=R_target_quant,
+        t_target=t_target_quant,
+        R_ref=R_reference_quant,
+        t_ref=t_reference_quant,
+        depth_target=target_depth,
         z_sign=args.z_sign,
         z_min=args.z_min,
         row_batch=args.row_batch,
     )
 
-    pred_base = warp_reference_to_target(
-        ref_y,
-        mx_base,
-        my_base,
+    prediction_base = warp_reference_to_target(
+        reference_y,
+        map_x_base,
+        map_y_base,
     )
-
-    pred_quant = warp_reference_to_target(
-        ref_y,
-        mx_quant,
-        my_quant,
+    prediction_quant = warp_reference_to_target(
+        reference_y,
+        map_x_quant,
+        map_y_quant,
     )
 
     valid_common = valid_base & valid_quant
@@ -1056,7 +1220,6 @@ def evaluate_pair(
             (kernel_size, kernel_size),
             dtype=np.uint8,
         )
-
         valid_common = (
             cv2.erode(
                 valid_common.astype(np.uint8),
@@ -1068,74 +1231,68 @@ def evaluate_pair(
 
     max_value = float((1 << args.bitdepth) - 1)
 
-    base_common = masked_error_stats(
+    baseline_common = masked_error_stats(
         target_y,
-        pred_base,
+        prediction_base,
+        valid_common,
+        max_value,
+    )
+    quantized_common = masked_error_stats(
+        target_y,
+        prediction_quant,
         valid_common,
         max_value,
     )
 
-    quant_common = masked_error_stats(
+    baseline_native = masked_error_stats(
         target_y,
-        pred_quant,
-        valid_common,
-        max_value,
-    )
-
-    base_native = masked_error_stats(
-        target_y,
-        pred_base,
+        prediction_base,
         valid_base,
         max_value,
     )
-
-    quant_native = masked_error_stats(
+    quantized_native = masked_error_stats(
         target_y,
-        pred_quant,
+        prediction_quant,
         valid_quant,
         max_value,
     )
 
     psnr_drop = None
     if (
-        base_common["psnr"] is not None
-        and quant_common["psnr"] is not None
+        baseline_common["psnr"] is not None
+        and quantized_common["psnr"] is not None
     ):
         psnr_drop = float(
-            base_common["psnr"]
-            - quant_common["psnr"]
+            baseline_common["psnr"]
+            - quantized_common["psnr"]
         )
 
     return {
-        "common_valid_count": int(base_common["count"]),
+        "common_valid_count": int(baseline_common["count"]),
         "common_valid_ratio": float(
-            base_common["count"]
+            baseline_common["count"]
             / (args.width * args.height)
         ),
-        "baseline_common_sse": float(base_common["sse"]),
-        "baseline_common_mse": base_common["mse"],
-        "baseline_common_psnr": base_common["psnr"],
-        "quantized_common_sse": float(quant_common["sse"]),
-        "quantized_common_mse": quant_common["mse"],
-        "quantized_common_psnr": quant_common["psnr"],
+        "baseline_common_sse": float(baseline_common["sse"]),
+        "baseline_common_mse": baseline_common["mse"],
+        "baseline_common_psnr": baseline_common["psnr"],
+        "quantized_common_sse": float(quantized_common["sse"]),
+        "quantized_common_mse": quantized_common["mse"],
+        "quantized_common_psnr": quantized_common["psnr"],
         "psnr_drop_common": psnr_drop,
-        "baseline_native_valid_ratio": float(
-            np.mean(valid_base)
-        ),
-        "baseline_native_psnr": base_native["psnr"],
-        "quantized_native_valid_ratio": float(
-            np.mean(valid_quant)
-        ),
-        "quantized_native_psnr": quant_native["psnr"],
+        "baseline_native_valid_ratio": float(np.mean(valid_base)),
+        "baseline_native_psnr": baseline_native["psnr"],
+        "quantized_native_valid_ratio": float(np.mean(valid_quant)),
+        "quantized_native_psnr": quantized_native["psnr"],
     }
 
 
 # ============================================================
-# Qstep and CSV
+# Qsteps / output
 # ============================================================
 
 def parse_float_list(text: str) -> list[float]:
-    vals: list[float] = []
+    values: list[float] = []
 
     for token in text.replace(";", ",").split(","):
         token = token.strip()
@@ -1149,40 +1306,43 @@ def parse_float_list(text: str) -> list[float]:
                 f"qstep must be positive: {value}"
             )
 
-        vals.append(value)
+        values.append(value)
 
-    if not vals:
+    if not values:
         raise ValueError("empty qstep list")
 
-    return vals
+    return values
 
 
 def make_qstep_pairs(
     args: argparse.Namespace,
 ) -> list[tuple[float, float]]:
-    rot_steps = (
+    rotation_qsteps = (
         parse_float_list(args.rot_qsteps)
         if args.rot_qsteps
         else [float(args.rot_qstep)]
     )
 
-    trans_steps = (
+    translation_qsteps = (
         parse_float_list(args.trans_qsteps)
         if args.trans_qsteps
         else [float(args.trans_qstep)]
     )
 
     if args.paired_qsteps:
-        if len(rot_steps) != len(trans_steps):
+        if len(rotation_qsteps) != len(translation_qsteps):
             raise ValueError(
-                "--paired-qsteps requires equal list lengths"
+                "--paired-qsteps requires equal numbers of qsteps"
             )
-        return list(zip(rot_steps, trans_steps))
+
+        return list(
+            zip(rotation_qsteps, translation_qsteps)
+        )
 
     return [
-        (r, t)
-        for r in rot_steps
-        for t in trans_steps
+        (rotation_qstep, translation_qstep)
+        for rotation_qstep in rotation_qsteps
+        for translation_qstep in translation_qsteps
     ]
 
 
@@ -1190,10 +1350,7 @@ def write_csv(
     path: Path,
     rows: list[dict[str, Any]],
 ) -> None:
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -1228,62 +1385,37 @@ def write_csv(
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Estimate predictive pose Exp-Golomb bits and RA camera-warp "
-            "PSNR degradation for pose qstep sweeps."
+            "Simulate closed-loop DPCM of adjacent current-to-previous "
+            "camera poses and evaluate RA warp PSNR."
         )
     )
 
-    ap.add_argument(
-        "--input-jsonl",
-        required=True,
-    )
+    ap.add_argument("--input-jsonl", required=True)
     ap.add_argument(
         "--sequence-yuv",
         required=True,
-        help="Original sequence in YUV420p10le",
+        help="Original YUV420p10le sequence",
     )
     ap.add_argument(
         "--depth-yuv",
         required=True,
-        help="Merged depth YUV420p10le produced by the GOP merge script",
+        help="Merged depth YUV420p10le",
     )
-    ap.add_argument(
-        "--width",
-        type=int,
-        required=True,
-    )
-    ap.add_argument(
-        "--height",
-        type=int,
-        required=True,
-    )
-    ap.add_argument(
-        "--output-prefix",
-        default="",
-    )
+    ap.add_argument("--width", type=int, required=True)
+    ap.add_argument("--height", type=int, required=True)
+    ap.add_argument("--output-prefix", default="")
 
     ap.add_argument(
-        "--rot-qstep",
-        type=float,
-        default=1e-5,
+        "--predictor",
+        choices=["previous", "linear", "zero"],
+        default="previous",
     )
-    ap.add_argument(
-        "--trans-qstep",
-        type=float,
-        default=1e-5,
-    )
-    ap.add_argument(
-        "--rot-qsteps",
-        default="",
-    )
-    ap.add_argument(
-        "--trans-qsteps",
-        default="",
-    )
-    ap.add_argument(
-        "--paired-qsteps",
-        action="store_true",
-    )
+
+    ap.add_argument("--rot-qstep", type=float, default=1e-5)
+    ap.add_argument("--trans-qstep", type=float, default=1e-5)
+    ap.add_argument("--rot-qsteps", default="")
+    ap.add_argument("--trans-qsteps", default="")
+    ap.add_argument("--paired-qsteps", action="store_true")
 
     ap.add_argument(
         "--pair-source",
@@ -1293,10 +1425,7 @@ def main() -> None:
     ap.add_argument(
         "--pairs",
         default="",
-        help=(
-            "Explicit GOP-local target:ref pairs; when set, overrides "
-            "--pair-source. Example: 16:0,16:32"
-        ),
+        help="Explicit GOP-local target:ref pairs, e.g. 16:0,16:32",
     )
     ap.add_argument(
         "--no-bidirectional-pairs",
@@ -1313,42 +1442,14 @@ def main() -> None:
         choices=[10],
         default=10,
     )
-    ap.add_argument(
-        "--z-sign",
-        type=float,
-        default=1.0,
-    )
-    ap.add_argument(
-        "--z-min",
-        type=float,
-        default=1e-4,
-    )
-    ap.add_argument(
-        "--row-batch",
-        type=int,
-        default=64,
-    )
-    ap.add_argument(
-        "--valid-erode",
-        type=int,
-        default=1,
-    )
+    ap.add_argument("--z-sign", type=float, default=1.0)
+    ap.add_argument("--z-min", type=float, default=1e-4)
+    ap.add_argument("--row-batch", type=int, default=64)
+    ap.add_argument("--valid-erode", type=int, default=1)
 
-    ap.add_argument(
-        "--first-frame-bits",
-        type=int,
-        default=0,
-    )
-    ap.add_argument(
-        "--per-gop-overhead-bits",
-        type=int,
-        default=0,
-    )
-    ap.add_argument(
-        "--per-frame-overhead-bits",
-        type=int,
-        default=0,
-    )
+    ap.add_argument("--first-frame-bits", type=int, default=0)
+    ap.add_argument("--per-gop-overhead-bits", type=int, default=0)
+    ap.add_argument("--per-frame-overhead-bits", type=int, default=0)
 
     args = ap.parse_args()
 
@@ -1360,22 +1461,24 @@ def main() -> None:
         raise ValueError("--row-batch must be positive")
     if args.valid_erode < 0:
         raise ValueError("--valid-erode must be non-negative")
+    if args.rot_qstep <= 0 or args.trans_qstep <= 0:
+        raise ValueError("qsteps must be positive")
 
-    input_jsonl = Path(
-        args.input_jsonl
-    ).expanduser().resolve()
-    sequence_yuv = Path(
-        args.sequence_yuv
-    ).expanduser().resolve()
-    depth_yuv = Path(
-        args.depth_yuv
-    ).expanduser().resolve()
-
-    for path in [
-        input_jsonl,
-        sequence_yuv,
-        depth_yuv,
+    for name in [
+        "first_frame_bits",
+        "per_gop_overhead_bits",
+        "per_frame_overhead_bits",
     ]:
+        if int(getattr(args, name)) < 0:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be non-negative"
+            )
+
+    input_jsonl = Path(args.input_jsonl).expanduser().resolve()
+    sequence_yuv = Path(args.sequence_yuv).expanduser().resolve()
+    depth_yuv = Path(args.depth_yuv).expanduser().resolve()
+
+    for path in [input_jsonl, sequence_yuv, depth_yuv]:
         if not path.is_file():
             raise FileNotFoundError(path)
 
@@ -1386,17 +1489,18 @@ def main() -> None:
     else:
         stem = input_jsonl.with_suffix("")
         output_prefix = stem.parent / (
-            stem.name + "_ra_pose_bits_warp"
+            stem.name
+            + f"_relative_dpcm_{args.predictor}_ra_warp"
         )
 
     header, frames = load_camera_jsonl(input_jsonl)
     groups = group_frames_by_gop(frames)
-    scale_by_gop = build_depth_scale_by_gop(
+    depth_scale_by_gop = build_depth_scale_by_gop(
         header,
         frames,
     )
 
-    seq_frame_count = count_yuv420p10le_frames(
+    sequence_frame_count = count_yuv420p10le_frames(
         sequence_yuv,
         args.width,
         args.height,
@@ -1407,19 +1511,25 @@ def main() -> None:
         args.height,
     )
 
-    max_seq_idx = max(int(r["frame_idx"]) for r in frames)
-    max_depth_idx = max(int(r["depth_frame_idx"]) for r in frames)
+    maximum_sequence_index = max(
+        int(rec["frame_idx"])
+        for rec in frames
+    )
+    maximum_depth_index = max(
+        int(rec["depth_frame_idx"])
+        for rec in frames
+    )
 
-    if max_seq_idx >= seq_frame_count:
+    if maximum_sequence_index >= sequence_frame_count:
         raise ValueError(
-            f"sequence YUV has {seq_frame_count} frames but JSONL "
-            f"requires frame_idx {max_seq_idx}"
+            f"sequence YUV contains {sequence_frame_count} frames, "
+            f"but JSONL requires frame_idx={maximum_sequence_index}"
         )
 
-    if max_depth_idx >= depth_frame_count:
+    if maximum_depth_index >= depth_frame_count:
         raise ValueError(
-            f"depth YUV has {depth_frame_count} frames but JSONL "
-            f"requires depth_frame_idx {max_depth_idx}"
+            f"depth YUV contains {depth_frame_count} frames, "
+            f"but JSONL requires depth_frame_idx={maximum_depth_index}"
         )
 
     luma_reader = LumaReader(
@@ -1427,31 +1537,23 @@ def main() -> None:
         args.width,
         args.height,
     )
-
     depth_reader = DepthReader(
         depth_yuv,
         args.width,
         args.height,
-        scale_by_gop,
+        depth_scale_by_gop,
     )
 
     qstep_pairs = make_qstep_pairs(args)
 
-    per_setting_rows: list[dict[str, Any]] = []
-    per_gop_rows: list[dict[str, Any]] = []
-    per_pair_rows: list[dict[str, Any]] = []
-    per_frame_bit_rows: list[dict[str, Any]] = []
-    settings_json: list[dict[str, Any]] = []
-
-    # Baseline original poses indexed by GOP and local_poc.
-    baseline_pose_by_gop: dict[
-        int,
-        dict[int, tuple[np.ndarray, np.ndarray]]
-    ] = {}
-
-    rec_by_gop_local: dict[
+    records_by_gop_local: dict[
         int,
         dict[int, dict[str, Any]]
+    ] = {}
+
+    baseline_pose_by_gop: dict[
+        int,
+        tuple[np.ndarray, np.ndarray]
     ] = {}
 
     pairs_by_gop: dict[
@@ -1460,30 +1562,46 @@ def main() -> None:
     ] = {}
 
     for gop_idx, records in groups.items():
-        baseline_pose_by_gop[gop_idx] = {
-            int(r["local_poc"]): (
-                np.asarray(r["_R_np"], dtype=np.float64),
-                np.asarray(r["_tvec_np"], dtype=np.float64),
-            )
-            for r in records
+        records_by_gop_local[gop_idx] = {
+            int(record["local_poc"]): record
+            for record in records
         }
 
-        rec_by_gop_local[gop_idx] = {
-            int(r["local_poc"]): r
-            for r in records
-        }
+        source_relative_r = np.stack(
+            [record["_rvec_np"] for record in records],
+            axis=0,
+        )
+        source_relative_t = np.stack(
+            [record["_tvec_np"] for record in records],
+            axis=0,
+        )
+
+        baseline_pose_by_gop[gop_idx] = (
+            reconstruct_absolute_from_relative(
+                source_relative_r,
+                source_relative_t,
+            )
+        )
 
         pairs_by_gop[gop_idx] = build_pairs_for_gop(
             records,
             args,
         )
 
-    for setting_idx, (rot_qstep, trans_qstep) in enumerate(
-        qstep_pairs
-    ):
+    per_setting_rows: list[dict[str, Any]] = []
+    per_gop_rows: list[dict[str, Any]] = []
+    per_pair_rows: list[dict[str, Any]] = []
+    per_frame_rows: list[dict[str, Any]] = []
+    settings_json: list[dict[str, Any]] = []
+
+    for setting_idx, (
+        rotation_qstep,
+        translation_qstep,
+    ) in enumerate(qstep_pairs):
         options = CodingOptions(
-            rot_qstep=float(rot_qstep),
-            trans_qstep=float(trans_qstep),
+            rot_qstep=float(rotation_qstep),
+            trans_qstep=float(translation_qstep),
+            predictor=str(args.predictor),
             first_frame_bits=int(args.first_frame_bits),
             per_gop_overhead_bits=int(args.per_gop_overhead_bits),
             per_frame_overhead_bits=int(args.per_frame_overhead_bits),
@@ -1494,342 +1612,341 @@ def main() -> None:
         setting_frame_rows: list[dict[str, Any]] = []
 
         for gop_idx in sorted(groups):
-            gop_summary, frame_bits, recon_pose = simulate_pose_coding(
+            (
+                gop_summary,
+                frame_rows,
+                R_absolute_quantized,
+                t_absolute_quantized,
+            ) = simulate_relative_dpcm(
                 gop_idx,
                 groups[gop_idx],
                 options,
             )
 
-            pair_rows_this_gop: list[dict[str, Any]] = []
+            R_absolute_baseline, t_absolute_baseline = (
+                baseline_pose_by_gop[gop_idx]
+            )
+
+            pair_rows_for_gop: list[dict[str, Any]] = []
 
             for pair_idx, (
-                target_local,
-                ref_local,
+                target_local_poc,
+                reference_local_poc,
                 pair_kind,
             ) in enumerate(pairs_by_gop[gop_idx]):
-                target_rec = rec_by_gop_local[gop_idx][target_local]
-                ref_rec = rec_by_gop_local[gop_idx][ref_local]
+                target_record = records_by_gop_local[gop_idx][
+                    target_local_poc
+                ]
+                reference_record = records_by_gop_local[gop_idx][
+                    reference_local_poc
+                ]
 
                 metrics = evaluate_pair(
-                    target_rec=target_rec,
-                    ref_rec=ref_rec,
-                    baseline_target_pose=baseline_pose_by_gop[
-                        gop_idx
-                    ][target_local],
-                    baseline_ref_pose=baseline_pose_by_gop[
-                        gop_idx
-                    ][ref_local],
-                    quant_target_pose=recon_pose[target_local],
-                    quant_ref_pose=recon_pose[ref_local],
+                    target_record=target_record,
+                    reference_record=reference_record,
+                    baseline_target_pose=(
+                        R_absolute_baseline[target_local_poc],
+                        t_absolute_baseline[target_local_poc],
+                    ),
+                    baseline_reference_pose=(
+                        R_absolute_baseline[reference_local_poc],
+                        t_absolute_baseline[reference_local_poc],
+                    ),
+                    quantized_target_pose=(
+                        R_absolute_quantized[target_local_poc],
+                        t_absolute_quantized[target_local_poc],
+                    ),
+                    quantized_reference_pose=(
+                        R_absolute_quantized[reference_local_poc],
+                        t_absolute_quantized[reference_local_poc],
+                    ),
                     luma_reader=luma_reader,
                     depth_reader=depth_reader,
                     args=args,
                 )
 
-                row = {
+                pair_row = {
                     "setting_idx": int(setting_idx),
-                    "rot_qstep": float(rot_qstep),
-                    "trans_qstep": float(trans_qstep),
+                    "rot_qstep": float(rotation_qstep),
+                    "trans_qstep": float(translation_qstep),
+                    "predictor": str(args.predictor),
                     "gop_idx": int(gop_idx),
                     "gop_name": str(
                         groups[gop_idx][0]["gop_name"]
                     ),
                     "pair_idx": int(pair_idx),
-                    "pair_kind": pair_kind,
-                    "target_local_poc": int(target_local),
-                    "ref_local_poc": int(ref_local),
-                    "target_poc": int(target_rec["poc"]),
-                    "ref_poc": int(ref_rec["poc"]),
+                    "pair_kind": str(pair_kind),
+                    "target_local_poc": int(target_local_poc),
+                    "reference_local_poc": int(reference_local_poc),
+                    "target_poc": int(target_record["poc"]),
+                    "reference_poc": int(reference_record["poc"]),
                     "target_frame_idx": int(
-                        target_rec["frame_idx"]
+                        target_record["frame_idx"]
                     ),
-                    "ref_frame_idx": int(
-                        ref_rec["frame_idx"]
+                    "reference_frame_idx": int(
+                        reference_record["frame_idx"]
                     ),
                     **metrics,
                 }
 
-                pair_rows_this_gop.append(row)
-                setting_pair_rows.append(row)
+                pair_rows_for_gop.append(pair_row)
+                setting_pair_rows.append(pair_row)
 
-            valid_pair_rows = [
-                r
-                for r in pair_rows_this_gop
-                if r["baseline_common_psnr"] is not None
-                and r["quantized_common_psnr"] is not None
-                and r["common_valid_count"] > 0
+            valid_gop_pairs = [
+                row
+                for row in pair_rows_for_gop
+                if row["baseline_common_psnr"] is not None
+                and row["quantized_common_psnr"] is not None
+                and row["common_valid_count"] > 0
             ]
 
-            if valid_pair_rows:
-                mean_base_psnr = float(
+            if valid_gop_pairs:
+                mean_baseline_psnr = float(
                     np.mean(
                         [
-                            r["baseline_common_psnr"]
-                            for r in valid_pair_rows
+                            row["baseline_common_psnr"]
+                            for row in valid_gop_pairs
                         ]
                     )
                 )
-
-                mean_quant_psnr = float(
+                mean_quantized_psnr = float(
                     np.mean(
                         [
-                            r["quantized_common_psnr"]
-                            for r in valid_pair_rows
+                            row["quantized_common_psnr"]
+                            for row in valid_gop_pairs
                         ]
                     )
                 )
-
-                mean_drop = float(
+                mean_psnr_drop = float(
                     np.mean(
                         [
-                            r["psnr_drop_common"]
-                            for r in valid_pair_rows
+                            row["psnr_drop_common"]
+                            for row in valid_gop_pairs
                         ]
                     )
                 )
 
                 pooled_count = int(
                     sum(
-                        r["common_valid_count"]
-                        for r in valid_pair_rows
+                        row["common_valid_count"]
+                        for row in valid_gop_pairs
                     )
                 )
-
-                pooled_base_sse = float(
+                pooled_baseline_sse = float(
                     sum(
-                        r["baseline_common_sse"]
-                        for r in valid_pair_rows
+                        row["baseline_common_sse"]
+                        for row in valid_gop_pairs
                     )
                 )
-
-                pooled_quant_sse = float(
+                pooled_quantized_sse = float(
                     sum(
-                        r["quantized_common_sse"]
-                        for r in valid_pair_rows
+                        row["quantized_common_sse"]
+                        for row in valid_gop_pairs
                     )
                 )
 
-                maxv2 = float(
+                maximum_value_squared = float(
                     ((1 << args.bitdepth) - 1) ** 2
                 )
 
-                pooled_base_mse = (
-                    pooled_base_sse / pooled_count
+                pooled_baseline_mse = (
+                    pooled_baseline_sse / pooled_count
                 )
-                pooled_quant_mse = (
-                    pooled_quant_sse / pooled_count
+                pooled_quantized_mse = (
+                    pooled_quantized_sse / pooled_count
                 )
 
-                pooled_base_psnr = float(
+                pooled_baseline_psnr = float(
                     10.0
                     * math.log10(
-                        maxv2 / max(pooled_base_mse, 1e-30)
+                        maximum_value_squared
+                        / max(pooled_baseline_mse, 1e-30)
                     )
                 )
-
-                pooled_quant_psnr = float(
+                pooled_quantized_psnr = float(
                     10.0
                     * math.log10(
-                        maxv2 / max(pooled_quant_mse, 1e-30)
+                        maximum_value_squared
+                        / max(pooled_quantized_mse, 1e-30)
                     )
                 )
-
-                pooled_drop = float(
-                    pooled_base_psnr - pooled_quant_psnr
+                pooled_psnr_drop = float(
+                    pooled_baseline_psnr
+                    - pooled_quantized_psnr
                 )
             else:
-                mean_base_psnr = None
-                mean_quant_psnr = None
-                mean_drop = None
+                mean_baseline_psnr = None
+                mean_quantized_psnr = None
+                mean_psnr_drop = None
                 pooled_count = 0
-                pooled_base_psnr = None
-                pooled_quant_psnr = None
-                pooled_drop = None
+                pooled_baseline_psnr = None
+                pooled_quantized_psnr = None
+                pooled_psnr_drop = None
 
             gop_summary.update(
                 {
                     "setting_idx": int(setting_idx),
-                    "pair_count": int(len(pair_rows_this_gop)),
-                    "valid_pair_count": int(
-                        len(valid_pair_rows)
-                    ),
-                    "mean_baseline_common_psnr": mean_base_psnr,
-                    "mean_quantized_common_psnr": mean_quant_psnr,
-                    "mean_psnr_drop_common": mean_drop,
-                    "pooled_common_valid_count": int(
-                        pooled_count
-                    ),
-                    "pooled_baseline_psnr": pooled_base_psnr,
-                    "pooled_quantized_psnr": pooled_quant_psnr,
-                    "pooled_psnr_drop": pooled_drop,
+                    "pair_count": int(len(pair_rows_for_gop)),
+                    "valid_pair_count": int(len(valid_gop_pairs)),
+                    "mean_baseline_common_psnr": mean_baseline_psnr,
+                    "mean_quantized_common_psnr": mean_quantized_psnr,
+                    "mean_psnr_drop_common": mean_psnr_drop,
+                    "pooled_common_valid_count": int(pooled_count),
+                    "pooled_baseline_psnr": pooled_baseline_psnr,
+                    "pooled_quantized_psnr": pooled_quantized_psnr,
+                    "pooled_psnr_drop": pooled_psnr_drop,
                 }
             )
 
             setting_gop_rows.append(gop_summary)
-            setting_frame_rows.extend(frame_bits)
+            setting_frame_rows.extend(frame_rows)
 
         valid_setting_pairs = [
-            r
-            for r in setting_pair_rows
-            if r["baseline_common_psnr"] is not None
-            and r["quantized_common_psnr"] is not None
-            and r["common_valid_count"] > 0
+            row
+            for row in setting_pair_rows
+            if row["baseline_common_psnr"] is not None
+            and row["quantized_common_psnr"] is not None
+            and row["common_valid_count"] > 0
         ]
 
-        total_bits = int(
-            sum(r["total_bits"] for r in setting_gop_rows)
-        )
         total_rotation_bits = int(
-            sum(r["rotation_bits"] for r in setting_gop_rows)
+            sum(row["rotation_bits"] for row in setting_gop_rows)
         )
         total_translation_bits = int(
-            sum(r["translation_bits"] for r in setting_gop_rows)
+            sum(row["translation_bits"] for row in setting_gop_rows)
         )
         total_overhead_bits = int(
-            sum(r["overhead_bits"] for r in setting_gop_rows)
+            sum(row["overhead_bits"] for row in setting_gop_rows)
+        )
+        total_bits = (
+            total_rotation_bits
+            + total_translation_bits
+            + total_overhead_bits
         )
 
         total_camera_records = int(
-            sum(r["frame_count"] for r in setting_gop_rows)
+            sum(row["frame_count"] for row in setting_gop_rows)
         )
         total_coded_frames = int(
-            sum(r["coded_frame_count"] for r in setting_gop_rows)
+            sum(row["coded_frame_count"] for row in setting_gop_rows)
         )
 
         if valid_setting_pairs:
-            mean_base_psnr = float(
+            mean_baseline_psnr = float(
                 np.mean(
                     [
-                        r["baseline_common_psnr"]
-                        for r in valid_setting_pairs
+                        row["baseline_common_psnr"]
+                        for row in valid_setting_pairs
                     ]
                 )
             )
-
-            mean_quant_psnr = float(
+            mean_quantized_psnr = float(
                 np.mean(
                     [
-                        r["quantized_common_psnr"]
-                        for r in valid_setting_pairs
+                        row["quantized_common_psnr"]
+                        for row in valid_setting_pairs
                     ]
                 )
             )
-
-            mean_drop = float(
+            mean_psnr_drop = float(
                 np.mean(
                     [
-                        r["psnr_drop_common"]
-                        for r in valid_setting_pairs
+                        row["psnr_drop_common"]
+                        for row in valid_setting_pairs
                     ]
                 )
             )
-
-            median_drop = float(
+            median_psnr_drop = float(
                 np.median(
                     [
-                        r["psnr_drop_common"]
-                        for r in valid_setting_pairs
+                        row["psnr_drop_common"]
+                        for row in valid_setting_pairs
                     ]
                 )
             )
-
-            max_drop = float(
+            max_psnr_drop = float(
                 np.max(
                     [
-                        r["psnr_drop_common"]
-                        for r in valid_setting_pairs
+                        row["psnr_drop_common"]
+                        for row in valid_setting_pairs
                     ]
                 )
             )
 
             pooled_count = int(
                 sum(
-                    r["common_valid_count"]
-                    for r in valid_setting_pairs
+                    row["common_valid_count"]
+                    for row in valid_setting_pairs
                 )
             )
-
-            pooled_base_sse = float(
+            pooled_baseline_sse = float(
                 sum(
-                    r["baseline_common_sse"]
-                    for r in valid_setting_pairs
+                    row["baseline_common_sse"]
+                    for row in valid_setting_pairs
                 )
             )
-
-            pooled_quant_sse = float(
+            pooled_quantized_sse = float(
                 sum(
-                    r["quantized_common_sse"]
-                    for r in valid_setting_pairs
+                    row["quantized_common_sse"]
+                    for row in valid_setting_pairs
                 )
             )
 
-            maxv2 = float(
+            maximum_value_squared = float(
                 ((1 << args.bitdepth) - 1) ** 2
             )
 
-            pooled_base_mse = (
-                pooled_base_sse / pooled_count
+            pooled_baseline_mse = (
+                pooled_baseline_sse / pooled_count
             )
-            pooled_quant_mse = (
-                pooled_quant_sse / pooled_count
+            pooled_quantized_mse = (
+                pooled_quantized_sse / pooled_count
             )
 
-            pooled_base_psnr = float(
+            pooled_baseline_psnr = float(
                 10.0
                 * math.log10(
-                    maxv2 / max(pooled_base_mse, 1e-30)
+                    maximum_value_squared
+                    / max(pooled_baseline_mse, 1e-30)
                 )
             )
-
-            pooled_quant_psnr = float(
+            pooled_quantized_psnr = float(
                 10.0
                 * math.log10(
-                    maxv2 / max(pooled_quant_mse, 1e-30)
+                    maximum_value_squared
+                    / max(pooled_quantized_mse, 1e-30)
                 )
             )
-
-            pooled_drop = float(
-                pooled_base_psnr - pooled_quant_psnr
+            pooled_psnr_drop = float(
+                pooled_baseline_psnr
+                - pooled_quantized_psnr
             )
         else:
-            mean_base_psnr = None
-            mean_quant_psnr = None
-            mean_drop = None
-            median_drop = None
-            max_drop = None
+            mean_baseline_psnr = None
+            mean_quantized_psnr = None
+            mean_psnr_drop = None
+            median_psnr_drop = None
+            max_psnr_drop = None
             pooled_count = 0
-            pooled_base_psnr = None
-            pooled_quant_psnr = None
-            pooled_drop = None
+            pooled_baseline_psnr = None
+            pooled_quantized_psnr = None
+            pooled_psnr_drop = None
 
         setting_summary = {
             "setting_idx": int(setting_idx),
-            "rot_qstep": float(rot_qstep),
-            "trans_qstep": float(trans_qstep),
+            "rot_qstep": float(rotation_qstep),
+            "trans_qstep": float(translation_qstep),
+            "predictor": str(args.predictor),
             "gop_count": int(len(setting_gop_rows)),
             "pair_count": int(len(setting_pair_rows)),
-            "valid_pair_count": int(
-                len(valid_setting_pairs)
-            ),
-            "camera_record_count": int(
-                total_camera_records
-            ),
-            "coded_frame_count": int(
-                total_coded_frames
-            ),
-            "rotation_bits": int(
-                total_rotation_bits
-            ),
-            "translation_bits": int(
-                total_translation_bits
-            ),
-            "overhead_bits": int(
-                total_overhead_bits
-            ),
+            "valid_pair_count": int(len(valid_setting_pairs)),
+            "camera_record_count": int(total_camera_records),
+            "coded_frame_count": int(total_coded_frames),
+            "rotation_bits": int(total_rotation_bits),
+            "translation_bits": int(total_translation_bits),
+            "overhead_bits": int(total_overhead_bits),
             "total_bits": int(total_bits),
-            "total_bytes_ceil": int(
-                (total_bits + 7) // 8
-            ),
+            "total_bytes_ceil": int((total_bits + 7) // 8),
             "bits_per_camera_record": (
                 float(total_bits / total_camera_records)
                 if total_camera_records
@@ -1840,31 +1957,21 @@ def main() -> None:
                 if total_coded_frames
                 else 0.0
             ),
-            "mean_baseline_common_psnr": (
-                mean_base_psnr
-            ),
-            "mean_quantized_common_psnr": (
-                mean_quant_psnr
-            ),
-            "mean_psnr_drop_common": mean_drop,
-            "median_psnr_drop_common": median_drop,
-            "max_psnr_drop_common": max_drop,
-            "pooled_common_valid_count": int(
-                pooled_count
-            ),
-            "pooled_baseline_psnr": (
-                pooled_base_psnr
-            ),
-            "pooled_quantized_psnr": (
-                pooled_quant_psnr
-            ),
-            "pooled_psnr_drop": pooled_drop,
+            "mean_baseline_common_psnr": mean_baseline_psnr,
+            "mean_quantized_common_psnr": mean_quantized_psnr,
+            "mean_psnr_drop_common": mean_psnr_drop,
+            "median_psnr_drop_common": median_psnr_drop,
+            "max_psnr_drop_common": max_psnr_drop,
+            "pooled_common_valid_count": int(pooled_count),
+            "pooled_baseline_psnr": pooled_baseline_psnr,
+            "pooled_quantized_psnr": pooled_quantized_psnr,
+            "pooled_psnr_drop": pooled_psnr_drop,
         }
 
         per_setting_rows.append(setting_summary)
         per_gop_rows.extend(setting_gop_rows)
         per_pair_rows.extend(setting_pair_rows)
-        per_frame_bit_rows.extend(setting_frame_rows)
+        per_frame_rows.extend(setting_frame_rows)
 
         settings_json.append(
             {
@@ -1875,41 +1982,35 @@ def main() -> None:
 
         print("=" * 80)
         print(
-            f"setting {setting_idx}: "
-            f"rot_qstep={rot_qstep:.9g}, "
-            f"trans_qstep={trans_qstep:.9g}"
+            f"setting {setting_idx}: predictor={args.predictor}, "
+            f"rot_qstep={rotation_qstep:.9g}, "
+            f"trans_qstep={translation_qstep:.9g}"
         )
         print(
-            f"  pose bits              : {total_bits} "
+            f"  pose bits             : {total_bits} "
             f"({(total_bits + 7) // 8} bytes ceil)"
         )
         print(
-            f"  bits/coded frame       : "
+            f"  bits / coded frame    : "
             f"{setting_summary['bits_per_coded_frame']:.4f}"
         )
         print(
-            f"  mean baseline PSNR     : "
-            f"{mean_base_psnr}"
+            f"  mean baseline PSNR    : {mean_baseline_psnr}"
         )
         print(
-            f"  mean quantized PSNR    : "
-            f"{mean_quant_psnr}"
+            f"  mean quantized PSNR   : {mean_quantized_psnr}"
         )
         print(
-            f"  mean PSNR drop         : "
-            f"{mean_drop}"
+            f"  mean PSNR drop        : {mean_psnr_drop}"
         )
         print(
-            f"  pooled baseline PSNR   : "
-            f"{pooled_base_psnr}"
+            f"  pooled baseline PSNR  : {pooled_baseline_psnr}"
         )
         print(
-            f"  pooled quantized PSNR  : "
-            f"{pooled_quant_psnr}"
+            f"  pooled quantized PSNR : {pooled_quantized_psnr}"
         )
         print(
-            f"  pooled PSNR drop       : "
-            f"{pooled_drop}"
+            f"  pooled PSNR drop      : {pooled_psnr_drop}"
         )
 
     result = {
@@ -1918,35 +2019,31 @@ def main() -> None:
         "depth_yuv": str(depth_yuv),
         "width": int(args.width),
         "height": int(args.height),
-        "sequence_frame_count": int(
-            seq_frame_count
-        ),
-        "depth_frame_count": int(
-            depth_frame_count
-        ),
+        "sequence_frame_count": int(sequence_frame_count),
+        "depth_frame_count": int(depth_frame_count),
         "input_header": header,
         "depth_scale_by_gop": {
-            str(k): float(v)
-            for k, v in sorted(scale_by_gop.items())
+            str(key): float(value)
+            for key, value in sorted(depth_scale_by_gop.items())
         },
         "coding_model": {
-            "anchor": (
-                "Each GOP local_poc 0 is implicit R=I,t=0"
+            "input_pose_mode": "current_to_previous",
+            "input_relative_transform": (
+                "X_{i-1}=R_step_i X_i+t_step_i"
             ),
-            "rotation_predictor": (
-                "previous quantized reconstructed rotation"
+            "predictor": str(args.predictor),
+            "first_relative_predictor": "zero",
+            "residual": (
+                "source adjacent-relative rvec/tvec minus predicted "
+                "reconstructed adjacent-relative rvec/tvec"
             ),
-            "rotation_residual": (
-                "Rodrigues(R_true @ R_rec_prev.T)"
+            "quantization": "independent uniform scalar quantization",
+            "bit_estimation": (
+                "signed Exp-Golomb order-0 over six quantized residual integers"
             ),
-            "translation_predictor": (
-                "previous quantized reconstructed local absolute tvec"
-            ),
-            "translation_residual": (
-                "t_true - t_rec_prev"
-            ),
-            "integer_code": (
-                "signed Exp-Golomb order-0 independently for 6 components"
+            "absolute_reconstruction": (
+                "R_i=R_step_i.T@R_{i-1}; "
+                "t_i=R_step_i.T@(t_{i-1}-t_step_i)"
             ),
         },
         "warp_model": {
@@ -1956,16 +2053,13 @@ def main() -> None:
             "bidirectional": bool(
                 not args.no_bidirectional_pairs
             ),
-            "relative_pose": (
+            "relative_target_to_reference": (
                 "R_rel=R_ref@R_target.T; "
                 "t_rel=t_ref-R_rel@t_target"
             ),
-            "depth": (
-                "target merged-depth frame decoded with its owner GOP scale"
-            ),
             "metric": (
-                "baseline and quantized warps compared on their common "
-                "valid mask; PSNR drop=baseline_common-quantized_common"
+                "baseline and quantized pose warps are evaluated on their "
+                "common valid mask"
             ),
         },
         "options": vars(args),
@@ -2005,29 +2099,17 @@ def main() -> None:
         )
         f.write("\n")
 
-    write_csv(
-        setting_csv_path,
-        per_setting_rows,
-    )
-    write_csv(
-        gop_csv_path,
-        per_gop_rows,
-    )
-    write_csv(
-        pair_csv_path,
-        per_pair_rows,
-    )
-    write_csv(
-        frame_csv_path,
-        per_frame_bit_rows,
-    )
+    write_csv(setting_csv_path, per_setting_rows)
+    write_csv(gop_csv_path, per_gop_rows)
+    write_csv(pair_csv_path, per_pair_rows)
+    write_csv(frame_csv_path, per_frame_rows)
 
     print("=" * 80)
-    print(f"summary JSON      : {summary_path}")
-    print(f"per-setting CSV   : {setting_csv_path}")
-    print(f"per-GOP CSV       : {gop_csv_path}")
-    print(f"per-pair CSV      : {pair_csv_path}")
-    print(f"per-frame bits CSV: {frame_csv_path}")
+    print(f"summary JSON       : {summary_path}")
+    print(f"per-setting CSV    : {setting_csv_path}")
+    print(f"per-GOP CSV        : {gop_csv_path}")
+    print(f"per-pair CSV       : {pair_csv_path}")
+    print(f"per-frame bits CSV : {frame_csv_path}")
 
 
 if __name__ == "__main__":
