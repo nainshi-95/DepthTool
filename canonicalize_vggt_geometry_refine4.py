@@ -3,23 +3,19 @@
 """
 batch_affine_cp_rf_refine_canonical_outputs_pose_coding.py
 
-Batch second-stage refinement for canonicalized fixedK GOP NN-depth outputs.
+Batch second-stage refinement with adjacent-relative-pose DPCM coding loss.
 
-This version adds a codec-aware predictive-pose regularizer that reproduces
-how the refined camera poses are intended to be stored later:
+This version uses the previous relative-pose coding structure:
 
-  * The GOP first frame is implicit and re-anchored to R=I, t=0.
-  * For frame i > 0, absolute local rotation R_i is predicted from the
-    previous quantized/reconstructed rotation.
-  * The stored rotation residual is a 3-component Rodrigues vector of
-        R_res_i = R_i @ R_rec_{i-1}.T
-  * Absolute local W2C t_i is predicted from the previous quantized/
-    reconstructed t vector, and the stored translation residual is
-        t_res_i = t_i - t_rec_{i-1}
-  * Both residuals are quantized in a closed loop using the configured qsteps.
-  * The optimization loss includes differentiable rate proxies for the six
-    stored integer residual components and optional quantization-reconstruction
-    penalties.
+  * Frame 0 has no pose signal.
+  * Absolute W2C poses are converted to adjacent current-to-previous poses:
+        R_step_i = R_{i-1} @ R_i.T
+        t_step_i = t_{i-1} - R_step_i @ t_i
+  * The stored relative signal is six values:
+        Rodrigues(R_step_i), t_step_i
+  * The default predictor is the previously reconstructed relative pose.
+  * Only the component-wise DPCM residual is quantized and rate-regularized.
+  * Optional zero and linear predictors are available for comparison.
 
 Input per sequence, recursively found under --src-root:
   <base>_fixedK_gop_nn_geometry.npz
@@ -1455,14 +1451,57 @@ def fit_rf_tiny_t_w2c(
         r_cur: torch.Tensor,
         t_cur: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """
+        Codec model matching the previous relative-pose coding method.
+
+        First convert absolute W2C poses into adjacent current-to-previous poses:
+
+            X_{i-1} = R_step_i X_i + t_step_i
+
+            R_step_i = R_{i-1} R_i^T
+            t_step_i = t_{i-1} - R_step_i t_i
+
+        The stored six-dimensional signal is:
+
+            s_i = [ Rodrigues(R_step_i), t_step_i ]
+
+        The signal is then predicted from previously reconstructed adjacent
+        relative-pose signals.  The default predictor is simply the previous
+        reconstructed relative pose:
+
+            pred_i = s_hat_{i-1}
+            residual_i = s_i - pred_i
+
+        This is closed-loop DPCM.  Frame 0 has no pose signal.  For frame 1,
+        no prior adjacent relative pose exists, so the predictor is zero.
+
+        Optional predictors:
+          zero:
+              pred_i = 0
+          previous:
+              pred_i = s_hat_{i-1}
+          linear:
+              pred_i = 2*s_hat_{i-1} - s_hat_{i-2}
+
+        Rotation prediction and residual coding are deliberately performed on
+        the three Rodrigues components, because that matches the previous
+        storage method being optimized here.
+        """
         zero = torch.zeros((), dtype=dtype, device=device)
+
         if n_frames <= 1:
             empty = torch.empty((0, 3), dtype=dtype, device=device)
             return {
+                "relative_rot_signal": empty,
+                "relative_trans_signal": empty,
+                "rot_predictor": empty,
+                "trans_predictor": empty,
                 "rot_residual": empty,
                 "trans_residual": empty,
                 "rot_recon_error": empty,
                 "trans_recon_error": empty,
+                "absolute_rot_recon_error": empty,
+                "absolute_trans_recon_error": empty,
                 "rot_rate_proxy": zero,
                 "trans_rate_proxy": zero,
                 "rot_quant_mse": zero,
@@ -1471,23 +1510,42 @@ def fit_rf_tiny_t_w2c(
 
         R_abs = torch_rodrigues(r_cur)
 
-        # Re-anchor the GOP to frame 0. This leaves every pair-wise relative pose
-        # unchanged while making the first stored pose exactly I/0.
+        # Re-anchor only for decoder-side absolute reconstruction/error
+        # measurement.  The adjacent relative poses themselves are invariant
+        # to this common coordinate-system change.
         R_anchor = R_abs[anchor]
         t_anchor = t_cur[anchor]
         R_local = torch.matmul(R_abs, R_anchor.transpose(0, 1))
-        t_local = t_cur - torch.matmul(R_local, t_anchor.reshape(3, 1)).squeeze(-1)
+        t_local = t_cur - torch.matmul(
+            R_local,
+            t_anchor.reshape(3, 1),
+        ).squeeze(-1)
 
-        if args.pose_code_trans_domain == "tvec":
-            trans_signal = t_local
-        elif args.pose_code_trans_domain == "center":
-            trans_signal = -torch.bmm(R_local.transpose(1, 2), t_local.unsqueeze(-1)).squeeze(-1)
-        else:
-            raise ValueError(args.pose_code_trans_domain)
+        # Adjacent current-to-previous relative transforms.
+        #
+        #   X_{i-1} = R_step_i X_i + t_step_i
+        #
+        R_step = torch.bmm(
+            R_local[:-1],
+            R_local[1:].transpose(1, 2),
+        )
+        t_step = t_local[:-1] - torch.bmm(
+            R_step,
+            t_local[1:].unsqueeze(-1),
+        ).squeeze(-1)
+        r_step = torch_matrix_to_rotvec(R_step)
 
-        R_rec_prev = torch.eye(3, dtype=dtype, device=device)
-        trans_rec_prev = torch.zeros(3, dtype=dtype, device=device)
+        predictor_mode = str(args.pose_code_predictor)
 
+        prev_r_hat = torch.zeros(3, dtype=dtype, device=device)
+        prev_t_hat = torch.zeros(3, dtype=dtype, device=device)
+        prev2_r_hat = torch.zeros(3, dtype=dtype, device=device)
+        prev2_t_hat = torch.zeros(3, dtype=dtype, device=device)
+
+        relative_rot_signals: list[torch.Tensor] = []
+        relative_trans_signals: list[torch.Tensor] = []
+        rot_predictors: list[torch.Tensor] = []
+        trans_predictors: list[torch.Tensor] = []
         rot_residuals: list[torch.Tensor] = []
         trans_residuals: list[torch.Tensor] = []
         rot_recon_errors: list[torch.Tensor] = []
@@ -1495,43 +1553,140 @@ def fit_rf_tiny_t_w2c(
         rot_symbol_quant_errors: list[torch.Tensor] = []
         trans_symbol_quant_errors: list[torch.Tensor] = []
 
-        for i in range(1, n_frames):
-            R_res = R_local[i] @ R_rec_prev.transpose(0, 1)
-            r_res = torch_matrix_to_rotvec(R_res)
-            r_res_hard = hard_uniform_quantize(r_res, args.pose_code_rot_qstep)
+        reconstructed_step_R: list[torch.Tensor] = []
+        reconstructed_step_t: list[torch.Tensor] = []
+
+        for j in range(n_frames - 1):
+            # j=0 corresponds to frame 1.  It has no previous relative signal,
+            # therefore all predictors use zero for the first coded pose.
+            if j == 0 or predictor_mode == "zero":
+                r_pred = torch.zeros(3, dtype=dtype, device=device)
+                t_pred = torch.zeros(3, dtype=dtype, device=device)
+            elif predictor_mode == "previous":
+                r_pred = prev_r_hat
+                t_pred = prev_t_hat
+            elif predictor_mode == "linear":
+                if j == 1:
+                    r_pred = prev_r_hat
+                    t_pred = prev_t_hat
+                else:
+                    r_pred = 2.0 * prev_r_hat - prev2_r_hat
+                    t_pred = 2.0 * prev_t_hat - prev2_t_hat
+            else:
+                raise ValueError(predictor_mode)
+
+            r_res = r_step[j] - r_pred
+            t_res = t_step[j] - t_pred
+
+            r_res_hard = hard_uniform_quantize(
+                r_res,
+                args.pose_code_rot_qstep,
+            )
+            t_res_hard = hard_uniform_quantize(
+                t_res,
+                args.pose_code_trans_qstep,
+            )
+
+            # Hard quantization in forward, identity gradient in backward.
             r_res_hat = r_res + (r_res_hard - r_res).detach()
-            R_res_hat = torch_rodrigues(r_res_hat.unsqueeze(0))[0]
-            R_rec = R_res_hat @ R_rec_prev
+            t_res_hat = t_res + (t_res_hard - t_res).detach()
 
-            trans_res = trans_signal[i] - trans_rec_prev
-            trans_res_hard = hard_uniform_quantize(trans_res, args.pose_code_trans_qstep)
-            trans_res_hat = trans_res + (trans_res_hard - trans_res).detach()
-            trans_rec = trans_rec_prev + trans_res_hat
+            r_hat = r_pred + r_res_hat
+            t_hat = t_pred + t_res_hat
+            R_hat = torch_rodrigues(r_hat.unsqueeze(0))[0]
 
-            R_error = R_local[i] @ R_rec.transpose(0, 1)
-            r_recon_error = torch_matrix_to_rotvec(R_error)
-            trans_recon_error = trans_signal[i] - trans_rec
-
+            relative_rot_signals.append(r_step[j])
+            relative_trans_signals.append(t_step[j])
+            rot_predictors.append(r_pred)
+            trans_predictors.append(t_pred)
             rot_residuals.append(r_res)
-            trans_residuals.append(trans_res)
-            rot_recon_errors.append(r_recon_error)
-            trans_recon_errors.append(trans_recon_error)
+            trans_residuals.append(t_res)
 
-            # Use detached hard-bin centers so this term has a real gradient
-            # that attracts each stored residual component to a quantizer bin.
-            # A naive (x - STE_quantize(x)) loss would have zero gradient.
-            rot_symbol_quant_errors.append(r_res - r_res_hard.detach())
-            trans_symbol_quant_errors.append(trans_res - trans_res_hard.detach())
+            # Signal-domain reconstruction error.  For rotation, use the
+            # physically meaningful matrix composition error rather than only
+            # the component-wise rvec difference.
+            R_signal_error = R_step[j] @ R_hat.transpose(0, 1)
+            rot_recon_errors.append(
+                torch_matrix_to_rotvec(R_signal_error)
+            )
+            trans_recon_errors.append(t_step[j] - t_hat)
 
-            R_rec_prev = R_rec
-            trans_rec_prev = trans_rec
+            # Quantizer-bin attraction with real gradients.
+            rot_symbol_quant_errors.append(
+                r_res - r_res_hard.detach()
+            )
+            trans_symbol_quant_errors.append(
+                t_res - t_res_hard.detach()
+            )
 
+            reconstructed_step_R.append(R_hat)
+            reconstructed_step_t.append(t_hat)
+
+            prev2_r_hat = prev_r_hat
+            prev2_t_hat = prev_t_hat
+            prev_r_hat = r_hat
+            prev_t_hat = t_hat
+
+        relative_rot_signal = torch.stack(relative_rot_signals, dim=0)
+        relative_trans_signal = torch.stack(relative_trans_signals, dim=0)
+        rot_predictor = torch.stack(rot_predictors, dim=0)
+        trans_predictor = torch.stack(trans_predictors, dim=0)
         rot_residual = torch.stack(rot_residuals, dim=0)
         trans_residual = torch.stack(trans_residuals, dim=0)
         rot_recon_error = torch.stack(rot_recon_errors, dim=0)
         trans_recon_error = torch.stack(trans_recon_errors, dim=0)
-        rot_symbol_quant_error = torch.stack(rot_symbol_quant_errors, dim=0)
-        trans_symbol_quant_error = torch.stack(trans_symbol_quant_errors, dim=0)
+        rot_symbol_quant_error = torch.stack(
+            rot_symbol_quant_errors,
+            dim=0,
+        )
+        trans_symbol_quant_error = torch.stack(
+            trans_symbol_quant_errors,
+            dim=0,
+        )
+
+        # Reconstruct GOP-local absolute poses from quantized adjacent
+        # current-to-previous transforms:
+        #
+        #   T_step_i = T_{i-1} inverse(T_i)
+        #   T_i      = inverse(T_step_i) T_{i-1}
+        #
+        R_abs_rec_prev = torch.eye(3, dtype=dtype, device=device)
+        t_abs_rec_prev = torch.zeros(3, dtype=dtype, device=device)
+
+        absolute_rot_errors: list[torch.Tensor] = []
+        absolute_trans_errors: list[torch.Tensor] = []
+
+        for j in range(n_frames - 1):
+            R_s = reconstructed_step_R[j]
+            t_s = reconstructed_step_t[j]
+
+            R_abs_rec = R_s.transpose(0, 1) @ R_abs_rec_prev
+            t_abs_rec = R_s.transpose(0, 1) @ (
+                t_abs_rec_prev - t_s
+            )
+
+            R_abs_error = (
+                R_local[j + 1]
+                @ R_abs_rec.transpose(0, 1)
+            )
+            absolute_rot_errors.append(
+                torch_matrix_to_rotvec(R_abs_error)
+            )
+            absolute_trans_errors.append(
+                t_local[j + 1] - t_abs_rec
+            )
+
+            R_abs_rec_prev = R_abs_rec
+            t_abs_rec_prev = t_abs_rec
+
+        absolute_rot_recon_error = torch.stack(
+            absolute_rot_errors,
+            dim=0,
+        )
+        absolute_trans_recon_error = torch.stack(
+            absolute_trans_errors,
+            dim=0,
+        )
 
         rot_rate_proxy = pose_symbol_rate_proxy(
             rot_residual / float(args.pose_code_rot_qstep),
@@ -1541,17 +1696,31 @@ def fit_rf_tiny_t_w2c(
             trans_residual / float(args.pose_code_trans_qstep),
             args.pose_code_rate_mode,
         )
-        # Dimensionless distance from the actual stored residual values to
-        # their nearest quantizer reconstruction levels. Unlike an STE-only
-        # reconstruction loss, this provides a non-zero bin-attraction gradient.
-        rot_quant_mse = torch.mean((rot_symbol_quant_error / float(args.pose_code_rot_qstep)) ** 2)
-        trans_quant_mse = torch.mean((trans_symbol_quant_error / float(args.pose_code_trans_qstep)) ** 2)
+
+        rot_quant_mse = torch.mean(
+            (
+                rot_symbol_quant_error
+                / float(args.pose_code_rot_qstep)
+            ) ** 2
+        )
+        trans_quant_mse = torch.mean(
+            (
+                trans_symbol_quant_error
+                / float(args.pose_code_trans_qstep)
+            ) ** 2
+        )
 
         return {
+            "relative_rot_signal": relative_rot_signal,
+            "relative_trans_signal": relative_trans_signal,
+            "rot_predictor": rot_predictor,
+            "trans_predictor": trans_predictor,
             "rot_residual": rot_residual,
             "trans_residual": trans_residual,
             "rot_recon_error": rot_recon_error,
             "trans_recon_error": trans_recon_error,
+            "absolute_rot_recon_error": absolute_rot_recon_error,
+            "absolute_trans_recon_error": absolute_trans_recon_error,
             "rot_rate_proxy": rot_rate_proxy,
             "trans_rate_proxy": trans_rate_proxy,
             "rot_quant_mse": rot_quant_mse,
@@ -1646,40 +1815,198 @@ def fit_rf_tiny_t_w2c(
         r_cur, t_cur, _, _ = current_params()
         coding = predictive_pose_coding_terms(r_cur, t_cur)
 
-        rot_residual = coding["rot_residual"].detach().cpu().numpy().astype(np.float64)
-        trans_residual = coding["trans_residual"].detach().cpu().numpy().astype(np.float64)
-        rot_recon_error = coding["rot_recon_error"].detach().cpu().numpy().astype(np.float64)
-        trans_recon_error = coding["trans_recon_error"].detach().cpu().numpy().astype(np.float64)
+        relative_rot_signal = (
+            coding["relative_rot_signal"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        relative_trans_signal = (
+            coding["relative_trans_signal"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        rot_predictor = (
+            coding["rot_predictor"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        trans_predictor = (
+            coding["trans_predictor"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        rot_residual = (
+            coding["rot_residual"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        trans_residual = (
+            coding["trans_residual"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        rot_recon_error = (
+            coding["rot_recon_error"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        trans_recon_error = (
+            coding["trans_recon_error"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        absolute_rot_recon_error = (
+            coding["absolute_rot_recon_error"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        absolute_trans_recon_error = (
+            coding["absolute_trans_recon_error"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
 
-        rot_qindex = np.rint(rot_residual / float(args.pose_code_rot_qstep)).astype(np.int64)
-        trans_qindex = np.rint(trans_residual / float(args.pose_code_trans_qstep)).astype(np.int64)
+        rot_qindex = np.rint(
+            rot_residual / float(args.pose_code_rot_qstep)
+        ).astype(np.int64)
+        trans_qindex = np.rint(
+            trans_residual / float(args.pose_code_trans_qstep)
+        ).astype(np.int64)
+
+        abs_rot_error_norm = (
+            np.linalg.norm(absolute_rot_recon_error, axis=1)
+            if absolute_rot_recon_error.size
+            else np.empty(0, np.float64)
+        )
+        abs_trans_error_norm = (
+            np.linalg.norm(absolute_trans_recon_error, axis=1)
+            if absolute_trans_recon_error.size
+            else np.empty(0, np.float64)
+        )
 
         return {
-            "model": "first frame implicit I/0; closed-loop previous reconstructed absolute pose prediction",
+            "model": (
+                "adjacent current-to-previous relative pose; "
+                "closed-loop DPCM over relative rvec/tvec"
+            ),
+            "predictor": str(args.pose_code_predictor),
             "coded_frame_count": int(max(0, n_frames - 1)),
             "first_frame_signaled": False,
-            "rotation_representation": "Rodrigues vector of R_local_i @ R_reconstructed_previous.T",
-            "translation_domain": str(args.pose_code_trans_domain),
+            "first_relative_pose_predictor": "zero",
+            "rotation_signal": (
+                "Rodrigues(R_{i-1} @ R_i.T), where "
+                "X_{i-1}=R_step_i X_i+t_step_i"
+            ),
+            "translation_signal": (
+                "t_{i-1} - R_step_i @ t_i"
+            ),
+            "rotation_residual": (
+                "relative_rvec_i - predicted_reconstructed_relative_rvec_i"
+            ),
+            "translation_residual": (
+                "relative_tvec_i - predicted_reconstructed_relative_tvec_i"
+            ),
             "rotation_qstep": float(args.pose_code_rot_qstep),
             "translation_qstep": float(args.pose_code_trans_qstep),
             "rate_mode": str(args.pose_code_rate_mode),
-            "rot_rate_proxy": float(coding["rot_rate_proxy"].detach().cpu()),
-            "trans_rate_proxy": float(coding["trans_rate_proxy"].detach().cpu()),
-            "rot_quant_mse": float(coding["rot_quant_mse"].detach().cpu()),
-            "trans_quant_mse": float(coding["trans_quant_mse"].detach().cpu()),
-            "quant_loss_semantics": "dimensionless squared distance of each stored residual component to its nearest quantizer reconstruction level",
-            "rot_residual_mean_abs": float(np.mean(np.abs(rot_residual))) if rot_residual.size else 0.0,
-            "trans_residual_mean_abs": float(np.mean(np.abs(trans_residual))) if trans_residual.size else 0.0,
-            "rot_quant_index_mean_abs": float(np.mean(np.abs(rot_qindex))) if rot_qindex.size else 0.0,
-            "trans_quant_index_mean_abs": float(np.mean(np.abs(trans_qindex))) if trans_qindex.size else 0.0,
-            "rot_zero_ratio": float(np.mean(rot_qindex == 0)) if rot_qindex.size else 1.0,
-            "trans_zero_ratio": float(np.mean(trans_qindex == 0)) if trans_qindex.size else 1.0,
+            "rot_rate_proxy": float(
+                coding["rot_rate_proxy"].detach().cpu()
+            ),
+            "trans_rate_proxy": float(
+                coding["trans_rate_proxy"].detach().cpu()
+            ),
+            "rot_quant_mse": float(
+                coding["rot_quant_mse"].detach().cpu()
+            ),
+            "trans_quant_mse": float(
+                coding["trans_quant_mse"].detach().cpu()
+            ),
+            "rot_residual_mean_abs": (
+                float(np.mean(np.abs(rot_residual)))
+                if rot_residual.size
+                else 0.0
+            ),
+            "trans_residual_mean_abs": (
+                float(np.mean(np.abs(trans_residual)))
+                if trans_residual.size
+                else 0.0
+            ),
+            "rot_quant_index_mean_abs": (
+                float(np.mean(np.abs(rot_qindex)))
+                if rot_qindex.size
+                else 0.0
+            ),
+            "trans_quant_index_mean_abs": (
+                float(np.mean(np.abs(trans_qindex)))
+                if trans_qindex.size
+                else 0.0
+            ),
+            "rot_zero_ratio": (
+                float(np.mean(rot_qindex == 0))
+                if rot_qindex.size
+                else 1.0
+            ),
+            "trans_zero_ratio": (
+                float(np.mean(trans_qindex == 0))
+                if trans_qindex.size
+                else 1.0
+            ),
+            "absolute_rot_recon_error_mean_rad": (
+                float(np.mean(abs_rot_error_norm))
+                if abs_rot_error_norm.size
+                else 0.0
+            ),
+            "absolute_rot_recon_error_max_rad": (
+                float(np.max(abs_rot_error_norm))
+                if abs_rot_error_norm.size
+                else 0.0
+            ),
+            "absolute_trans_recon_error_mean": (
+                float(np.mean(abs_trans_error_norm))
+                if abs_trans_error_norm.size
+                else 0.0
+            ),
+            "absolute_trans_recon_error_max": (
+                float(np.max(abs_trans_error_norm))
+                if abs_trans_error_norm.size
+                else 0.0
+            ),
+            "relative_rot_signal_rvec": relative_rot_signal.tolist(),
+            "relative_trans_signal": relative_trans_signal.tolist(),
+            "rot_predictor": rot_predictor.tolist(),
+            "trans_predictor": trans_predictor.tolist(),
             "rot_residual_rvec": rot_residual.tolist(),
             "trans_residual": trans_residual.tolist(),
             "rot_quant_index": rot_qindex.tolist(),
             "trans_quant_index": trans_qindex.tolist(),
-            "rot_recon_error_rvec": rot_recon_error.tolist(),
-            "trans_recon_error": trans_recon_error.tolist(),
+            "relative_rot_recon_error_rvec": rot_recon_error.tolist(),
+            "relative_trans_recon_error": trans_recon_error.tolist(),
+            "absolute_rot_recon_error_rvec": (
+                absolute_rot_recon_error.tolist()
+            ),
+            "absolute_trans_recon_error": (
+                absolute_trans_recon_error.tolist()
+            ),
         }
 
     report: dict[str, Any] = {
@@ -1694,7 +2021,7 @@ def fit_rf_tiny_t_w2c(
         "pose_predictive_coding_options": {
             "rotation_qstep": float(args.pose_code_rot_qstep),
             "translation_qstep": float(args.pose_code_trans_qstep),
-            "translation_domain": str(args.pose_code_trans_domain),
+            "predictor": str(args.pose_code_predictor),
             "rate_mode": str(args.pose_code_rate_mode),
             "rotation_rate_weight": float(args.pose_code_rot_rate_weight),
             "translation_rate_weight": float(args.pose_code_trans_rate_weight),
@@ -1806,7 +2133,7 @@ def write_camera_jsonl_canonical(
     depth_output = depth_yuv_meta if depth_yuv_meta is not None else copied_depth
     header = {
         "type": "header",
-        "format": "fixedK_gop_nn_affine_cp_rf_pose_coding_refine_v1",
+        "format": "fixedK_gop_nn_affine_cp_rf_relative_dpcm_refine_v1",
         "source_npz": os.path.abspath(source_npz),
         "source_camera_jsonl": os.path.abspath(source_camera_jsonl) if source_camera_jsonl else None,
         "frame_count": int(len(frame_indices)),
@@ -1825,7 +2152,7 @@ def write_camera_jsonl_canonical(
             "absolute_pose": "camera_from_world / W2C in fixed-K canonical camera coordinates",
             "relative_pair_formula": "R_rel=R_ref@R_target.T; t_rel=t_ref-R_rel@t_target; X_ref=R_rel*X_target+t_rel",
             "adjacent_current_to_previous_fields": "also written for compatibility",
-            "future_codec_model": "first GOP frame implicit I/0; rotation uses 3-component Rodrigues residual against previous reconstructed rotation; translation uses previous reconstructed local absolute tvec residual",
+            "future_codec_model": "first frame implicit; adjacent current-to-previous rvec/tvec are predicted from previously reconstructed adjacent relative pose and only DPCM residuals are coded",
         },
         "depth_output": depth_output,
         "refinement": refine_report_summary,
@@ -1909,7 +2236,7 @@ def write_refined_geometry_npz(
     payload["tvec_abs_refined"] = t_final.astype(np.float32)
     payload["rvec_abs_final"] = r_final.astype(np.float32)
     payload["tvec_abs_final"] = t_final.astype(np.float32)
-    payload["affine_cp_rf_pose_coding_refine_result_json"] = np.asarray(
+    payload["affine_cp_rf_relative_dpcm_refine_result_json"] = np.asarray(
         json.dumps(to_jsonable(result), ensure_ascii=False),
         dtype=object,
     )
@@ -1941,7 +2268,7 @@ def write_manifest(
         "K_before_affine_cp_rf": stage["K"].astype(float).tolist(),
         "K_final": K_final.astype(float).tolist(),
         "depth_yuv": depth_meta,
-        "affine_cp_rf_pose_coding_refine": result,
+        "affine_cp_rf_relative_dpcm_refine": result,
         "options": vars(args),
     }
     with open(out_manifest, "w", encoding="utf-8") as f:
@@ -2049,7 +2376,7 @@ def run_one(
     log(
         "Pose coding model: first frame implicit I/0, "
         f"rot_qstep={args.pose_code_rot_qstep:g}, trans_qstep={args.pose_code_trans_qstep:g}, "
-        f"trans_domain={args.pose_code_trans_domain}"
+        f"predictor={args.pose_code_predictor}"
     )
 
     pair_info: list[dict[str, Any]] = []
@@ -2117,9 +2444,9 @@ def run_one(
             "relative_formula": "R_rel=R_ref@R_target.T; t_rel=t_ref-R_rel@t_target",
             "coordinate": "target pixel -> ref pixel",
             "pose_coding_loss": (
-                "First GOP frame is implicit I/0. Each following absolute local pose is predicted from the previous "
-                "quantized reconstructed pose. Rotation stores three Rodrigues residual components; translation stores "
-                "three previous-reconstructed local absolute translation residual components."
+                "First frame is implicit. Absolute poses are first converted to adjacent current-to-previous relative rvec/tvec. "
+                "Those six relative-pose components are predicted from the previous reconstructed relative pose, and "
+                "only the DPCM residual components are regularized for coding rate."
             ),
         },
         "input": {
@@ -2212,7 +2539,7 @@ def run_one(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Batch affine-CP R|t/focal refinement with codec-aware predictive-pose residual loss."
+        description="Batch affine-CP R|t/focal refinement with adjacent-relative-pose DPCM coding loss."
     )
 
     # Batch I/O.
@@ -2315,10 +2642,14 @@ def parse_args() -> argparse.Namespace:
         help="Future codec translation qstep for each predictive translation residual component.",
     )
     ap.add_argument(
-        "--pose-code-trans-domain",
-        choices=["tvec", "center"],
-        default="tvec",
-        help="tvec matches the discussed design; center codes camera-center differences instead.",
+        "--pose-code-predictor",
+        choices=["previous", "linear", "zero"],
+        default="previous",
+        help=(
+            "Predictor for adjacent current-to-previous relative rvec/tvec. "
+            "previous is the recommended/default old method; linear uses "
+            "2*previous-previous2; zero disables prediction."
+        ),
     )
     ap.add_argument(
         "--pose-code-rate-mode",
