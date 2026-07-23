@@ -1,23 +1,226 @@
-제2 종래기술: 전역 움직임 모델을 이용한 영상 부호화 기술
+Analyze the uploaded codec source and create a concrete implementation plan for the following three independent GlobalMotion optimizations.
 
-[기술 설명]
+Do not modify the code yet. First inspect the actual source, identify the relevant files, functions, data structures, and encoder/decoder call paths, then provide a concise file-by-file modification plan.
 
-종래의 영상 부호화 기술 중에는 현재 영상과 참조 영상 사이에서 영상 전반에 공통적으로 나타나는 움직임을 소수의 이차원 변환 파라미터로 표현하는 전역 움직임 보상 기술이 존재한다.
+All changes must be under #if GlobalMotion.
 
-예를 들어, AV1 영상 부호화 기술에서는 현재 영상과 각각의 참조 영상 사이의 전역적인 움직임을 추정하고, 이를 평행 이동, 회전, 확대·축소 또는 아핀 변환과 같은 이차원 변환 모델로 나타낼 수 있다. 인코더는 현재 영상과 참조 영상 사이의 대응 관계를 이용하여 전역 움직임 모델의 후보를 추정하고, 추정된 후보를 정해진 정밀도의 변환 파라미터로 변환한다. 이후 해당 변환을 참조 영상에 적용하여 얻은 예측 오차와 변환 파라미터의 전달 비용 등을 고려하여 전역 움직임 모델의 사용 여부를 결정할 수 있다.
+Add three compile-time switches as simple #defines in TypeDef.h:
 
-선택된 전역 움직임 모델은 참조 영상별로 프레임 단위에서 전달될 수 있다. 디코더는 비트스트림으로부터 참조 영상별 전역 움직임 모델의 종류와 변환 파라미터를 획득하고, 현재 블록의 위치에 해당 변환 모델을 적용하여 위치별 움직임 정보 또는 예측 신호를 생성할 수 있다. 각 블록은 일반적인 움직임 벡터를 이용한 예측 대신 해당 참조 영상의 전역 움직임 모델을 이용하는 예측 모드를 선택할 수 있다.
+#if GlobalMotion
+#define GM_DEPTH_PLANE_2X2_AVG        0
+#define GM_HOMOGRAPHY_SUBBLOCK_MV     0
+#define GM_EXISTING_SUBBLOCK_MC       0
+#endif
 
-이에 따라 영상 내 각 블록의 움직임을 모두 개별적으로 전달하지 않고도, 영상 전반에 걸쳐 공통적으로 발생하는 움직임을 적은 수의 변환 파라미터로 표현할 수 있다.
+Each switch must be independently configurable. When a switch is 0, the corresponding legacy behavior must remain unchanged.
 
-[문제점]
+All eight combinations from 000 to 111 must build and run.
 
-그러나 종래의 전역 움직임 기술은 현재 영상과 특정 참조 영상 사이의 관계를 해당 영상 쌍에 종속된 이차원 변환 파라미터로 표현한다. 따라서 하나의 현재 영상이 복수의 참조 영상을 사용하는 경우에는 각 참조 영상과의 관계를 나타내는 별도의 전역 움직임 모델 및 변환 파라미터가 필요하다. 특정 참조 영상에 대해서만 전역 움직임 정보가 제공되는 경우에는, 해당 정보를 다른 참조 영상에 직접 재사용하기 어렵다.
+Do not add new bitstream syntax.
 
-또한 종래의 전역 움직임 모델은 영상 내 좌표 사이의 관계를 하나의 이차원 변환으로 근사한다. 따라서 카메라의 이동으로 인해 영상 전반에 움직임이 발생하더라도, 장면 내 객체 또는 영역의 깊이가 서로 다른 경우에 발생하는 깊이 의존적인 시차를 정확하게 표현하기 어렵다. 특히 서로 다른 깊이에 위치한 영역은 동일한 카메라 이동에 대해서도 서로 다른 크기와 방향의 움직임을 가질 수 있으므로, 하나의 평행 이동, 회전·확대·축소 또는 아핀 변환만으로 영상 전체의 움직임을 정확하게 나타내는 데 한계가 있다.
+⸻
 
-나아가 종래 기술은 각 영상의 카메라 위치 및 자세를 독립적인 공통 정보로 구성하지 않고, 현재 영상과 참조 영상의 쌍마다 직접적인 이차원 변환 관계를 생성한다. 이에 따라 참조 가능한 영상의 수가 증가하거나 다양한 영상 간 참조 관계를 지원하는 경우, 동일한 카메라 움직임과 관련된 정보가 복수의 영상 쌍에 걸쳐 중복하여 표현될 수 있다.
+1. GM_DEPTH_PLANE_2X2_AVG
 
-반면 각 영상에 대응하는 카메라 위치 및 자세 정보가 존재하면, 임의의 현재 영상과 참조 영상 사이의 상대적인 카메라 관계를 두 영상의 카메라 정보로부터 유도할 수 있다. 즉, 영상 쌍마다 별도의 전역 변환 파라미터를 제공하는 대신 프레임 단위의 카메라 정보를 복수의 참조 관계에서 공통으로 재사용할 수 있다.
+Current inverse-depth plane:
 
-따라서 종래 기술은 영상 전반에 공간적으로 분포된 움직임 정보를 카메라의 위치 및 자세를 나타내는 공통 정보와 단순화된 위치별 깊이 정보의 조합으로 표현하지 못하며, 복수의 영상 및 참조 관계에서 기하학적 정보를 효율적으로 압축하고 재사용하는 데 한계가 있다.
+\rho(x,y)=\frac{1}{Z(x,y)}=ax+by+c
+
+Keep the existing centered least-squares plane model, but replace pixel-wise fitting samples with one averaged sample per 2×2 region.
+
+Requirements:
+
+* Average only valid inverse-depth samples inside each 2×2 region.
+* Skip a 2×2 region if it contains no valid samples.
+* Use the mean coordinate of the valid samples as the sample position.
+* Handle odd CU width or height correctly.
+* Do not allocate a temporary downsampled depth map.
+* Accumulate directly into the existing fitting statistics.
+* Preserve all existing validity checks, fallback behavior, clipping, and quantization.
+* If subsampling breaks assumptions such as symmetric coordinates or zero cross terms, use the existing general centered-LS handling or a fixed-size 3×3 solver. Do not introduce SVD, dynamic matrices, OpenCV, or heap allocation.
+
+Macro behavior:
+
+#if GM_DEPTH_PLANE_2X2_AVG
+  // 2x2 averaged fitting
+#else
+  // exact legacy pixel-wise fitting
+#endif
+
+Measure:
+
+* Plane-fitting time
+* Number of original pixels and averaged samples
+* Difference in a, b, and c
+* Reconstructed inverse-depth error
+* Final coding impact
+
+⸻
+
+2. GM_HOMOGRAPHY_SUBBLOCK_MV
+
+The current method derives one MV per 4×4 subblock by projecting the four corners and averaging the four MVs.
+
+Replace this optionally with:
+
+CU inverse-depth plane + K/R/t
+→ build one CU homography
+→ evaluate the homography once at each 4×4 center
+→ derive one MV per 4×4
+
+Expected complexity change:
+
+4N camera projections
+→ 1 homography build + N homography evaluations
+
+Requirements:
+
+* Derive the homography from the exact camera and depth conventions used by the current code.
+* Confirm pose direction, K convention, depth definition, pixel-center convention, MV direction, and internal MV precision.
+* Support each used L0/L1 reference independently.
+* Use a fixed-size 3×3 representation without dynamic matrix libraries.
+* Evaluate the homography at the proper 4×4 center.
+* Reuse the existing MV rounding, clipping, precision conversion, and boundary handling.
+* Handle invalid denominator, NaN, infinity, invalid plane, and projection failure.
+* Use the legacy corner-projection path as fallback where appropriate.
+
+Macro behavior:
+
+#if GM_HOMOGRAPHY_SUBBLOCK_MV
+  // CU homography + 4x4 center evaluation
+#else
+  // exact legacy four-corner projection and MV averaging
+#endif
+
+Validation must compare:
+
+A: legacy average of four corner MVs
+B: direct camera projection at the 4x4 center
+C: homography evaluation at the 4x4 center
+
+B and C should match within numerical tolerance.
+
+Measure:
+
+* Legacy projection time
+* Homography build time
+* Homography evaluation time
+* MV error
+* Prediction SAD/SATD
+* Coding impact
+
+⸻
+
+3. GM_EXISTING_SUBBLOCK_MC
+
+Reuse the codec’s existing 4×4 subblock motion-compensation path instead of the current GlobalMotion-specific interpolation path.
+
+Inspect and verify the actual path, expected to be similar to:
+
+xSubPuMC()
+→ motionCompensation()
+→ xPredInterUni() / xPredInterBi()
+→ xPredInterBlk()
+→ InterpolationFilter
+
+Confirm from the source that this path uses:
+
+* 4×4 MotionInfo
+* Existing SIMD dispatch
+* Luma 12-tap interpolation
+* Chroma 6-tap interpolation
+
+Requirements:
+
+* Fill the CU MotionBuf with one MotionInfo per 4×4 subblock.
+* Correctly set interDir, refIdx, MV, slice information, BCW, LIC, and all required fields.
+* Support L0, L1, and bi-prediction.
+* Add an explicit GlobalMotion branch instead of pretending the CU is SUBPU_ATMVP.
+* Prevent later spanMotionInfo() or similar code from overwriting the custom 4×4 MotionBuf.
+* Preserve existing prediction buffers, intermediate precision, weighted prediction, clipping, chroma scaling, and reference boundary handling.
+* Apply the same path in encoder mode evaluation, encoder final reconstruction, and decoder reconstruction.
+
+Macro behavior:
+
+#if GM_EXISTING_SUBBLOCK_MC
+  // fill 4x4 MotionBuf and use existing subblock MC
+#else
+  // exact legacy GlobalMotion interpolation
+#endif
+
+Measure:
+
+* MotionBuf fill time
+* Legacy GlobalMotion interpolation time
+* Existing subblock MC time
+* Number of 4×4 calls
+* Number of merged adjacent subblocks
+* Prediction mismatches
+* Coding impact
+
+⸻
+
+Compatibility requirements
+
+The following configurations must all work:
+
+000: legacy baseline
+100: 2x2 fitting only
+010: homography MV only
+001: existing subblock MC only
+110: 2x2 fitting + homography
+101: 2x2 fitting + existing subblock MC
+011: homography + existing subblock MC
+111: all optimizations
+
+When all macros are 0, results must remain bit-exact with the current baseline.
+
+No new signaling is allowed.
+
+Encoder and decoder must generate identical predictions for every enabled combination.
+
+Avoid dynamic allocation in the CU hot path.
+
+⸻
+
+Profiling
+
+Optionally add:
+
+#if GlobalMotion
+#define GM_OPT_PROFILE 0
+#endif
+
+When enabled, measure at least:
+
+GlobalMotion total time
+Plane-fitting time
+Corner-projection time
+Homography-build time
+Homography-evaluation time
+MotionBuf-fill time
+Legacy interpolation time
+Existing subblock-MC time
+Processed CU count
+Processed 4x4 subblock count
+
+Use thread-local or worker-local profiling storage. Avoid atomics in the hot path.
+
+⸻
+
+Required output
+
+Provide a concise implementation plan containing:
+
+1. Current GlobalMotion call flow
+2. Relevant files, classes, and functions
+3. Exact location for the TypeDef.h macros
+4. Modification plan for each optimization
+5. Encoder and decoder changes
+6. Interaction between the three macros
+7. Profiling insertion points
+8. Bit-exact and mismatch validation
+9. Main implementation risks
+10. Recommended implementation order
+
+Use actual source names found in the uploaded code. Do not guess file or function names.
